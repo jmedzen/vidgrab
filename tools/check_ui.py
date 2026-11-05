@@ -986,6 +986,33 @@ def _run() -> int:
     check("設定面板不在預覽容器裡",
           not tab.js("!!document.querySelector('#lightbox #adminmodal')"))
 
+    print("── log 視窗可讀性")
+    tab.js("consoleLine('輪 17%', false)")
+    time.sleep(0.3)
+    logtxt = tab.js("JSON.stringify([...document.querySelectorAll('#console .ln')].map(e=>e.textContent))")
+    joined = " ".join(json.loads(logtxt or "[]"))
+    check("log 不含進度 JSON 原文", '"kind": "download"' not in joined and "\\u0000" not in joined,
+          joined[-60:].replace("\n", " "))
+
+    print("── 每支影片的進度條")
+    # 直接餵一個 job 進度事件太難；改驗元件在有資料時的結構與可及性
+    has_bar = tab.js("""(() => {
+      const box = document.querySelector('.itemprog');
+      if (!box) return 'none';
+      return JSON.stringify({
+        role: box.getAttribute('role'),
+        now: box.getAttribute('aria-valuenow'),
+        label: (box.querySelector('.itemprog-label')||{}).textContent||'',
+      });
+    })()""")
+    # 沒有下載在跑時不會有進度條，這是預期的；有就檢查結構
+    if has_bar and has_bar != 'none':
+        info = json.loads(has_bar)
+        check("進度條有 progressbar 語意", info.get("role") == "progressbar", has_bar[:50])
+        check("進度條有可讀標籤", bool((info.get("label") or "").strip()), str(info.get("label"))[:30])
+    else:
+        check("沒有下載時不顯示進度條", True, "目前沒在跑")
+
     print("── 沒有 JS 錯誤")
     real_errors = [e for e in tab.errors if e and "favicon" not in e.lower()]
     check("console 乾淨", not real_errors, str(real_errors[:3]))

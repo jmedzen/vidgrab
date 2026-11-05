@@ -1,4 +1,5 @@
 import ItemCard from './ItemCard'
+import type { ItemProgress } from './ItemCard'
 import { LIC_CLASS, LIC_LABEL } from '../lib/format'
 import type { Project } from '../types'
 
@@ -24,6 +25,7 @@ interface Props {
   onSelectAll: (on: boolean) => void
   onPlay: (rel: string, name: string) => void
   onLightbox: (kind: 'img' | 'video', src: string) => void
+  progress?: Record<number, ItemProgress>
   onGrab: () => void
   onRefresh: () => void
   onOpenList: () => void
@@ -32,7 +34,7 @@ interface Props {
 
 export default function ProjectView({
   project, selected, options, onOptions, onToggle, onSelectAll,
-  onPlay, onLightbox, onGrab, onRefresh, onOpenList, busy,
+  onPlay, onLightbox, onGrab, onRefresh, onOpenList, busy, progress,
 }: Props) {
   const items = project.items ?? []
   const stats = project.stats ?? {}
@@ -144,6 +146,7 @@ export default function ProjectView({
             onToggle={onToggle}
             onPlay={onPlay}
             onLightbox={onLightbox}
+            progress={progress?.[it.index]}
           />
         ))}
     </>

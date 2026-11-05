@@ -2394,3 +2394,82 @@ def test_retry_recovers_from_transient_failure_for_real_binary(tmp_path, monkeyp
     assert seen["n"] == media.MAX_DOWNLOAD_RETRIES, \
         f"應該試滿 {media.MAX_DOWNLOAD_RETRIES} 次，實際 {seen['n']}"
     assert seen["cmds"][0] == seen["cmds"][-1], "重試要用同一組參數"
+
+
+# ---------------------------------------------------------------- 自動更新／進度
+
+
+def test_progress_line_is_split_into_spoken_and_json():
+    """進度行要拆成「人話」與「JSON」兩半。
+
+    實際踩到：整包 {"kind": "download", ...} 被當成日誌文字印在
+    log 視窗裡，使用者看到的是 `\r 17%\u0000{"kind": ...`。
+    這裡直接驗後端的拆解：人話走 log、JSON 走 progress。
+    """
+    import json as _json
+
+    from vidgrab import web as web_mod
+
+    sent: list[tuple[str, object]] = []
+
+    class FakeHandler(web_mod.Handler):  # type: ignore[misc]
+        def __init__(self) -> None:   # 不呼叫父類別，只借用 _log_event
+            pass
+
+        def _event(self, kind: str, payload: object) -> None:
+            sent.append((kind, payload))
+
+    FakeHandler()._log_event(
+        '\r       50% 下載中\x00'
+        + _json.dumps({"kind": "download", "index": 0, "percent": 50})
+    )
+
+    assert [k for k, _ in sent] == ["log", "progress"]
+    text = str(sent[0][1])
+    assert "下載中" in text
+    assert "\x00" not in text, "分隔符不該留在人話裡"
+    assert "kind" not in text, "JSON 漏進 log"
+    assert isinstance(sent[1][1], dict) and sent[1][1]["percent"] == 50
+
+
+def test_plain_log_line_emits_only_log():
+    """沒有 payload 的普通訊息只送 log，不要多送一個空的 progress。"""
+    from vidgrab import web as web_mod
+
+    sent: list[tuple[str, object]] = []
+
+    class FakeHandler(web_mod.Handler):  # type: ignore[misc]
+        def __init__(self) -> None:
+            pass
+
+        def _event(self, kind: str, payload: object) -> None:
+            sent.append((kind, payload))
+
+    FakeHandler()._log_event("✔ 完成：1 段")
+    assert [k for k, _ in sent] == ["log"]
+
+
+def test_clip_event_carries_index():
+    """每抓到一段就要送出結構化的 clip 事件，前端才能即時掛上去。
+
+    只送文字的話，使用者要等整批跑完才看得到已抓好的片段。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "tasks.py").read_text()
+    assert '"kind": "clip"' in src, "沒有 clip 事件"
+    assert '"grabbed": grabbed' in src, "clip 事件沒帶進度"
+
+
+def test_search_and_frame_failures_are_retried():
+    """搜尋與抓畫面失敗要自動重試，不是一次失敗就放棄。"""
+    from pathlib import Path
+
+    from vidgrab import tasks
+
+    assert tasks.SEARCH_RETRIES >= 2
+    assert tasks.FRAME_RETRIES >= 2
+
+    src = (Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "tasks.py").read_text()
+    assert "for attempt in range(1, SEARCH_RETRIES + 1)" in src, "搜尋沒有重試迴圈"
+    assert "for attempt in range(1, FRAME_RETRIES + 1)" in src, "抓畫面沒有重試迴圈"

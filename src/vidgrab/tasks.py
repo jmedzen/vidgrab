@@ -9,6 +9,11 @@ from typing import Any, Callable
 
 from . import media, report
 from .version import full_version
+# 搜尋／抓畫面的重試次數。下載有自己的（media.MAX_DOWNLOAD_RETRIES = 10），
+# 這裡是「抓清單」這種輕量請求，重試 3 次就夠，再多只是讓使用者乾等。
+SEARCH_RETRIES = 3
+FRAME_RETRIES = 2
+
 from .models import (
     Item,
     fmt_duration,
@@ -107,8 +112,32 @@ def run_search(
                         max_seconds=max_duration * 60 if max_duration else 0,
                     )
                 except SourceError as exc:
-                    emit(f"! {src.name} 搜「{form}」失敗：{exc}")
-                    continue
+                    # 搜尋失敗多半是網路抽動或對方暫時限流 —— 這種重試有用。
+                    # 一次失敗就跳過整個關鍵字，使用者會拿到一份莫名其妙少一半的清單。
+                    last = exc
+                    for attempt in range(1, SEARCH_RETRIES + 1):
+                        wait = min(20.0, 2.0 ** (attempt - 1))
+                        emit(f"    ↻ {src.name} 搜「{form}」失敗，{wait:.0f} 秒後重試"
+                             f"（{attempt}/{SEARCH_RETRIES}）：{last}")
+                        time.sleep(wait)
+                        try:
+                            found = src.search(
+                                form,
+                                limit=per_keyword,
+                                order=order,
+                                duration=duration,
+                                exclude=exclude,
+                                min_seconds=min_duration * 60 if min_duration else 0,
+                                max_seconds=max_duration * 60 if max_duration else 0,
+                            )
+                            last = None
+                            break
+                        except SourceError as exc2:
+                            last = exc2
+                    if last is not None:
+                        emit(f"! {src.name} 搜「{form}」重試 {SEARCH_RETRIES} 次仍失敗：{last}")
+                        continue
+                    emit(f"· {src.name} 「{form}」→ {len(found)} 支（重試後成功）")
                 emit(f"· {src.name} 「{form}」→ {len(found)} 支")
                 merged.extend(found)
 
@@ -271,11 +300,20 @@ def run_pick(
             # 抽畫面只是輔助：抓不到就算了，不能讓它把整個作業帶走。
             # 真的發生過：YouTube 長片抽幀逾時 → 整批 batch 回 internal，
             # 明明片段已經下載成功，使用者卻收到失敗。
-            try:
-                got = media.probe_frames(item, frames_dir, n=frame_count, opts=opts)
-            except Exception as exc:  # noqa: BLE001
-                got = []
-                emit(f"     ▣ 抓畫面失敗（{type(exc).__name__}）：略過，不影響已下載的片段")
+            got: list = []
+            for attempt in range(1, FRAME_RETRIES + 1):
+                try:
+                    got = media.probe_frames(item, frames_dir, n=frame_count, opts=opts)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    got = []
+                    if attempt < FRAME_RETRIES:
+                        emit(f"     ↻ 抓畫面失敗（{type(exc).__name__}），重試"
+                             f"（{attempt}/{FRAME_RETRIES}）")
+                        time.sleep(1.0 * attempt)
+                    else:
+                        emit(f"     ▣ 抓畫面失敗（{type(exc).__name__}）："
+                             "略過，不影響已下載的片段")
             if got:
                 try:
                     media.contact_sheet(got, frames_dir / f"{item.platform}_{item.vid}_sheet.jpg")
@@ -421,7 +459,21 @@ def run_pick(
             # 先存檔再回報：emit 可能拋錯（例如批次逾時），
             # 但抓到的片段一定要先落地，否則檔案在、清單卻沒有。
             save_project(project, manifest, items)
-            emit(f"     ✓ {what} → {Path(info['path']).name} {dims} {human_size(info.get('size_bytes', 0))}")
+            # 帶一份結構化事件：前端收到就立刻把這支片段掛上去。
+            # 只送文字的話，使用者要等整批跑完才看得到已經抓好的片段
+            # （真的發生過：batch 10 支，前 9 支都好了，畫面卻整片空白）。
+            _emit_over(
+                emit,
+                f"     ✓ {what} → {Path(info['path']).name} {dims} {human_size(info.get('size_bytes', 0))}",
+                {
+                    "kind": "clip",
+                    "index": n,
+                    "title": item.title,
+                    "name": Path(info["path"]).name,
+                    "grabbed": grabbed,
+                    "total": len(indexes),
+                },
+            )
 
     save_project(project, manifest, items)
     emit(f"✔ 完成：{grabbed} 段 → {clips_dir}")

@@ -22,6 +22,7 @@ import { tsToSec } from './lib/format'
 import { installDevBridge } from './lib/devtools'
 import { useSidebarResizer } from './lib/useSidebarResizer'
 import type { LibraryProject, Project, VersionInfo } from './types'
+import type { ItemProgress } from './components/ItemCard'
 
 const DEFAULT_GRAB: GrabOptions = {
   mode: 'auto', per: 15, starts: '', ranges: '',
@@ -69,6 +70,10 @@ export default function App() {
   const [busy, setBusy] = useState('')
   const [download, setDownload] = useState<Download>(NO_DOWNLOAD)
   const [lines, setLines] = useState<LogLine[]>([])
+  const [itemProgress, setItemProgress] = useState<Record<number, ItemProgress>>({})
+
+  // 目前在看的專案。輪詢與 SSE 回呼都要用，所以宣告在所有 effect 之前。
+  const projectRef = useRef<string | null>(null)
   const [toastMsg, setToastMsg] = useState('')
   const [authWho, setAuthWho] = useState('檢查 B 站登入…')
   const [authOk, setAuthOk] = useState(false)
@@ -98,6 +103,93 @@ export default function App() {
       return next.length > 2000 ? next.slice(-2000) : next
     })
   }, [])
+
+  useEffect(() => {
+    projectRef.current = project?.name ?? null
+  }, [project?.name])
+
+  // ---- 自動更新 ----------------------------------------------------
+  //
+  // 專案清單會因為很多原因變動：這一個視窗下載完、另一個視窗在操作、
+  // 或使用者自己在終端機跑了指令。只在「按鈕按完」才刷新，
+  // 側欄就會停在舊的狀態（踩過：下載完了左邊還是舊數字）。
+  //
+  // 用輪詢而不是 SSE：這是「有沒有變」而不是「正在發生什麼」，
+  // 而且要多視窗、多來源都看得到。3 秒一次、且內容沒變就不動 state。
+  const libraryKey = useCallback((list: LibraryProject[]) => (
+    list.map((p) => `${p.name}:${p.count}:${p.clips}:${p.pinned ? 1 : 0}:${p.title}`).join('|')
+  ), [])
+
+  useEffect(() => {
+    let stopped = false
+    let lastKey = ''
+    const tick = async () => {
+      if (stopped) return
+      try {
+        const data = await api.projects()
+        if (stopped) return
+        const list = Array.isArray(data) ? data : []
+        const key = libraryKey(list)
+        if (key !== lastKey) {
+          lastKey = key
+          setLibrary(list)
+        }
+      } catch {
+        /* 連不上就等下一輪，不要洗版 */
+      }
+    }
+    // 分頁在背景時降頻（省電、也少打伺服器），但不能停 ——
+    // 停了就代表「切回來還看到舊資料」，而且 headless 環境永遠是 hidden，
+    // 測試與自動化會直接失去自動更新（實際踩過）。
+    let lastVisible = Date.now()
+    const id = window.setInterval(() => {
+      if (document.hidden) {
+        if (Date.now() - lastVisible < 9000) return
+      } else {
+        lastVisible = Date.now()
+      }
+      void tick()
+    }, 3000)
+    // 同一個邏輯也套在「目前打開的專案」：切片可能來自另一個視窗、
+    // 或使用者自己在終端機跑了 pick。只靠 job 事件的話，
+    // 別處抓好的片段要手動重整才看得到。
+    const tickProject = async () => {
+      if (stopped) return
+      const name = projectRef.current
+      if (!name) return
+      try {
+        const data = await api.project(name)
+        if (stopped) return
+        setProject((prev) => {
+          if (!prev || prev.name !== name) return prev
+          // 內容一模一樣就不要換物件，否則每 3 秒整個列表重繪一次
+          const a = JSON.stringify(prev.items)
+          const b = JSON.stringify(data.items)
+          return a === b ? prev : data
+        })
+      } catch {
+        /* 專案可能剛被刪 */
+      }
+    }
+    const pid = window.setInterval(() => {
+      if (document.hidden && Date.now() - lastVisible < 9000) return
+      void tickProject()
+    }, 2500)
+    // 切回分頁時立刻補一次，不然要等最多 3 秒
+    const onVisible = () => {
+      if (document.hidden) return
+      lastVisible = Date.now()
+      void tick()
+      void tickProject()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      stopped = true
+      window.clearInterval(id)
+      window.clearInterval(pid)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [libraryKey])
 
   // ---- 主題 ------------------------------------------------------
 
@@ -206,6 +298,24 @@ export default function App() {
     }
   }, [toast])
 
+  /** 只更新內容，不動勾選／播放器狀態。
+   *
+   * 下載過程中每抓到一段就呼叫一次；如果用 openProject，
+   * 勾選會被清掉、播放器會被關掉，等於把使用者的操作打斷。
+   */
+  const refreshProject = useCallback(async (name: string) => {
+    try {
+      const data = await api.project(name)
+      setProject((prev) => {
+        // 已經換到別的專案就不要硬塞回去
+        if (prev && prev.name !== name) return prev
+        return data
+      })
+    } catch {
+      /* 專案可能剛被刪；下一輪輪詢會處理 */
+    }
+  }, [])
+
   // check_ui.py 需要能主動切主題／印 log 才能量對比
   useEffect(() => {
     installDevBridge({
@@ -227,6 +337,32 @@ export default function App() {
     const cancel = followJob(jobId, (ev: JobEvent) => {
       if (ev.kind === 'log') {
         log(ev.text ?? '')
+        return
+      }
+      if (ev.kind === 'progress') {
+        // 每個 item 自己的進度條：payload 帶著 index，就畫在那一張卡片上
+        const p = (ev.payload ?? {}) as Record<string, unknown>
+        const idx = Number(p.index)
+        // 有片段落地了：立刻重抓這個專案，切片視窗才不會等到整批跑完才更新
+        if (p.kind === 'clip') {
+          const name = projectRef.current
+          if (name) void refreshProject(name)
+        }
+        if (Number.isFinite(idx)) {
+          const pct = p.percent === null || p.percent === undefined
+            ? null : Number(p.percent)
+          const retry = Number(p.retry ?? 0)
+          const maxRetry = Number(p.max_retries ?? 0)
+          setItemProgress((prev) => ({
+            ...prev,
+            [idx]: {
+              percent: pct,
+              stage: retry > 0 ? `重試 ${retry}/${maxRetry}` : '下載中',
+              done: false,
+              failed: false,
+            },
+          }))
+        }
         return
       }
       if (ev.kind === 'error') {
@@ -261,7 +397,7 @@ export default function App() {
     })
     cancelJob.current = cancel
     void stamp
-  }, [log, toast])
+  }, [log, toast, refreshProject])
 
   // ---- 動作 ------------------------------------------------------
 
@@ -332,6 +468,8 @@ export default function App() {
       save_settings: grab.saveSettings,
     }
     setBusy('下載中')
+    // 新的一輪：先清掉上一輪的進度，不然會看到舊的進度條停在那
+    setItemProgress({})
     log(grab.mode === 'full'
       ? `▶ 整支下載 ${body.indexes.length} 支（${body.height}p）`
       : `▶ 下載 ${body.indexes.length} 支，${grab.mode === 'range' ? `${ranges.length} 個區段` : `每段 ${body.per} 秒`}`)
@@ -341,6 +479,14 @@ export default function App() {
       await new Promise<void>((resolve) => {
         runJob(job, (payload) => {
           const p = payload as { grabbed?: number }
+          // 有畫過進度的卡片，收尾時統一補成 100%
+          setItemProgress((prev) => {
+            const next: Record<number, ItemProgress> = {}
+            for (const [k, v] of Object.entries(prev)) {
+              next[Number(k)] = { ...v, percent: 100, stage: '完成', done: true, failed: false }
+            }
+            return next
+          })
           toast(`完成 ${String(p.grabbed ?? 0)} 段`)
           setDownload((d) => ({ ...d, done: true }))
           void loadLibrary()
@@ -350,7 +496,16 @@ export default function App() {
         window.setTimeout(resolve, 1000 * 60 * 30)
       })
     } catch (e) {
-      toast(e instanceof Error ? e.message : '下載失敗', 4000)
+      const msg = e instanceof Error ? e.message : '下載失敗'
+      toast(msg, 4000)
+      setItemProgress((prev) => {
+        const next: Record<number, ItemProgress> = {}
+        for (const [k, v] of Object.entries(prev)) {
+          next[Number(k)] = v.done ? v
+            : { ...v, stage: '失敗', done: true, failed: true }
+        }
+        return next
+      })
     } finally {
       setBusy('')
       window.setTimeout(() => setDownload(NO_DOWNLOAD), 2500)
@@ -590,6 +745,7 @@ export default function App() {
                   )}
                   onPlay={(rel, name) => setPlaying({ rel, name })}
                   onLightbox={(kind, src) => setLightbox({ kind, src })}
+                  progress={itemProgress}
                   onGrab={() => { void doGrab() }}
                   onRefresh={() => { void doRefresh() }}
                   onOpenList={doOpenList}

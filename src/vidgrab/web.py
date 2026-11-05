@@ -1068,7 +1068,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             for message in job.messages:
-                self._event("log", message)
+                self._log_event(message)
             # 歷史已經重播過，佇列裡同一批 log 丟掉，只留結尾事件
             while True:
                 try:
@@ -1090,7 +1090,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
                     continue
-                self._event(kind, payload)
+                if kind == "log":
+                    self._log_event(payload)
+                else:
+                    self._event(kind, payload)
                 if kind in ("done", "error"):
                     break
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
@@ -1114,6 +1117,25 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(_jsonable(payload), ensure_ascii=False)
         self.wfile.write(f"event: {kind}\ndata: {data}\n\n".encode())
         self.wfile.flush()
+
+    def _log_event(self, message: Any) -> None:
+        """送一則日誌。
+
+        進度行是「<給人看的>\x00<JSON>」：人話走 log 事件，
+        JSON 另外包成 progress 事件。前端才不必自己去切字串 ——
+        以前沒切，log 視窗裡直接印出整包 {"kind": "download", ...}。
+        """
+        text = str(message)
+        spoken, _, raw = text.partition("\x00")
+        self._event("log", spoken.lstrip("\r"))
+        if not raw:
+            return
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        if isinstance(payload, dict):
+            self._event("progress", payload)
 
     # -- 檔案 ---------------------------------------------------------
 

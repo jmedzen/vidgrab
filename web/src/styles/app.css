@@ -438,3 +438,26 @@
   #console { left:0; }
     main { padding:18px 14px 120px; }
   }
+
+  /* ---------------------------------------------------- 單支影片的進度條
+     每一張候選卡片自己的進度，跟畫面上的總進度條是兩件事：
+     總進度條說「這批做完幾成」，這裡說「這一支現在到哪」。 */
+  .itemprog { display:flex; align-items:center; gap:8px; margin:6px 0 8px; }
+  .itemprog-track {
+    flex:1; height:4px; border-radius:2px; overflow:hidden;
+    background:var(--panel2); border:1px solid var(--line); min-width:60px;
+  }
+  .itemprog-fill {
+    height:100%; width:0; background:var(--accent);
+    transition:width .25s ease;
+  }
+  .itemprog-label {
+    font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums;
+    white-space:nowrap; flex:none;
+  }
+  .itemprog.ok .itemprog-fill { background:var(--ok); }
+  .itemprog.ok .itemprog-label { color:var(--ok); }
+  .itemprog.bad .itemprog-fill { background:var(--bad); }
+  .itemprog.bad .itemprog-label { color:var(--bad); }
+  /* 正在處理的那張卡片給一點存在感，但不要閃到讓人分心 */
+  .card.working { border-color:var(--accent); }

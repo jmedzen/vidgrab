@@ -120,7 +120,7 @@ export async function rawApi(path: string, opts?: RequestInit): Promise<unknown>
 }
 
 export interface JobEvent {
-  kind: 'log' | 'done' | 'error'
+  kind: 'log' | 'progress' | 'done' | 'error'
   text?: string
   payload?: unknown
 }
@@ -133,7 +133,23 @@ export function followJob(
   const es = new EventSource(`/api/stream/${encodeURIComponent(jobId)}`)
 
   es.addEventListener('log', (e) => {
-    onEvent({ kind: 'log', text: (e as MessageEvent<string>).data })
+    // SSE 的 data 一律是 JSON 字串，直接拿會連引號一起顯示。
+    // 後端有時送純字串、有時送物件，兩種都吃。
+    const raw = (e as MessageEvent<string>).data
+    let text = raw
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed === 'string') text = parsed
+      else if (parsed && typeof parsed === 'object' && 'text' in parsed) {
+        text = String((parsed as { text: unknown }).text)
+      }
+    } catch {
+      /* 不是 JSON 就照原樣用 */
+    }
+    onEvent({ kind: 'log', text })
+  })
+  es.addEventListener('progress', (e) => {
+    onEvent({ kind: 'progress', payload: safeParse((e as MessageEvent<string>).data) })
   })
   es.addEventListener('done', (e) => {
     onEvent({ kind: 'done', payload: safeParse((e as MessageEvent<string>).data) })
