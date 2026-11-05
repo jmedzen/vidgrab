@@ -1587,9 +1587,15 @@ def test_thumb_comes_from_the_clip_itself(tmp_path):
     以前是到整支影片的均勻位置抓 3 格（片段在 30–75 秒，
     抓的卻是 914／1827／2740 秒），那些圖跟片段毫無關係。
     """
+    import shutil
     import subprocess
 
+    import pytest
+
     from vidgrab.media import thumb_from_clip
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("這條測真的用 ffmpeg 抽圖；CI 沒有裝 ffmpeg")
 
     src = tmp_path / "clip.mp4"
     subprocess.run(
@@ -1612,9 +1618,15 @@ def test_thumb_comes_from_the_clip_itself(tmp_path):
 
 def test_backfill_thumbs_fills_every_clip(tmp_path, monkeypatch):
     """既有片段要能補縮圖，而且補完每個片段都有。"""
+    import shutil
     import subprocess
 
+    import pytest
+
     from vidgrab import tasks
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("這條測真的用 ffmpeg 抽圖；CI 沒有裝 ffmpeg")
 
     monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
     proj = _make_project(tmp_path, "p1", items=[
