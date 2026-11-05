@@ -294,6 +294,91 @@ def _run() -> int:
     dark_bg = tab.js("getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()")
     check("淺色與深色底色不同", light_bg != dark_bg, f"{light_bg} vs {dark_bg}")
 
+    # 選單尺寸：曾經被 `aside * {max-width:100%}` 壓成 32px 的一條縫
+    tab.js("$('#themebtn').click()")
+    time.sleep(0.4)
+    menu = tab.js("""JSON.stringify((() => {
+      const m = document.querySelector('#thememenu');
+      const r = m.getBoundingClientRect();
+      const btns = [...m.querySelectorAll('button')].map(b => b.getBoundingClientRect());
+      return {
+        w: Math.round(r.width), h: Math.round(r.height),
+        open: m.classList.contains('open'),
+        n: btns.length,
+        minBtnW: btns.length ? Math.round(Math.min(...btns.map(b => b.width))) : 0,
+        labels: [...m.querySelectorAll('button')].map(b => b.textContent.trim()),
+      };
+    })())""")
+    md = json.loads(menu) if menu else {}
+    check("選單有打開", md.get("open") is True)
+    check("選單寬度正常（不是被壓成一條縫）", (md.get("w") or 0) >= 180, f"{md.get('w')}px")
+    check("選單列出六個主題", md.get("n") == 6, str(md.get("n")))
+    check("每個選項都夠寬可點", (md.get("minBtnW") or 0) >= 150, f"最窄 {md.get('minBtnW')}px")
+    # 選單不要超出視窗（右緣對齊是刻意的，但不該跑出去）
+    overflow = tab.js("""(() => {
+      const r = document.querySelector('#thememenu').getBoundingClientRect();
+      return r.left >= 0 && r.right <= window.innerWidth + 1;
+    })()""")
+    check("選單沒有跑出視窗", overflow)
+
+    # 每個選項的文字都要看得見：切到淺色主題時，深字配深底會隱形
+    for tid in ("paper", "mist", "sakura"):
+        tab.js(f"applyTheme('{tid}')")
+        time.sleep(0.2)
+        tab.js("$('#themebtn').click()")
+        time.sleep(0.35)
+        lum = tab.js("""(() => {
+          // 選單是深色浮層；用實際背景與文字色算亮度差
+          const m = document.querySelector('#thememenu');
+          const b = [...m.querySelectorAll('button')].find(x => !x.getAttribute('aria-checked')
+            || x.getAttribute('aria-checked') === 'false');
+          if (!b) return -1;
+          const cs = getComputedStyle(b);
+          const ctx = document.createElement('canvas').getContext('2d');
+          const toRGB = (c) => {
+            ctx.fillStyle = c;
+            const s = ctx.fillStyle;
+            if (s.startsWith('#')) {
+              return [parseInt(s.slice(1,3),16), parseInt(s.slice(3,5),16), parseInt(s.slice(5,7),16)];
+            }
+            return (s.match(/[0-9]+/g) || []).slice(0, 3).map(Number);
+          };
+          const rel = (rgb) => {
+            const [r,g,bl] = rgb.map(v => {
+              v /= 255;
+              return v <= 0.03928 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4);
+            });
+            return 0.2126*r + 0.7152*g + 0.0722*bl;
+          };
+          const fg = rel(toRGB(cs.color));
+          const bg = rel([11,13,18]);  // 選單底色（深色浮層）
+          const hi = Math.max(fg,bg), lo = Math.min(fg,bg);
+          return (hi + 0.05) / (lo + 0.05);
+        })()""")
+        check(f"{tid} 主題下選單文字看得見", (lum or 0) >= 4.5, f"對比 {round(lum,2) if lum else lum}:1")
+        tab.js("$('#themebtn').click()")
+        time.sleep(0.2)
+
+    tab.js("applyTheme('midnight')")
+    time.sleep(0.2)
+    tab.js("$('#themebtn').click()")
+    time.sleep(0.35)
+
+    # 分深淺兩組，且標籤看得懂
+    groups = tab.js("JSON.stringify([...document.querySelectorAll('#thememenu .group')].map(e=>e.textContent.trim()))")
+    check("分成深色／淺色兩組", len(json.loads(groups or "[]")) == 2, str(groups))
+
+    # 點選項要真的換主題並關閉選單
+    tab.js("""(() => {
+      const b = [...document.querySelectorAll('#thememenu button')].find(x => x.dataset.theme === 'sakura');
+      if (b) b.click();
+    })()""")
+    time.sleep(0.4)
+    picked = tab.js("document.documentElement.dataset.theme")
+    closed = tab.js("!document.querySelector('#thememenu').classList.contains('open')")
+    check("點選項會換主題", picked == "sakura", str(picked))
+    check("選完自動關閉選單", closed)
+
     # 主題要能記住
     tab.js("applyTheme('forest')")
     tab.js("location.reload()")

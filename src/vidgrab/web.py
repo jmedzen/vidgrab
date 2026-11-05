@@ -1192,7 +1192,9 @@ PAGE = r"""<!doctype html>
     font-size:15px; line-height:1; border-radius:9px;
   }
   .theme-menu {
-    position:absolute; right:0; top:38px; z-index:60; width:206px; display:none;
+    position:absolute; right:0; top:38px; z-index:60;
+    /* aside *{max-width:100%} 會把這個浮層壓成 32px，要明確解除 */
+    width:206px; min-width:206px; max-width:206px; display:none;
     background:var(--panel); border:1px solid var(--line); border-radius:12px;
     padding:6px; box-shadow:var(--shadow);
   }
@@ -1204,8 +1206,12 @@ PAGE = r"""<!doctype html>
   .theme-menu button {
     width:100%; display:flex; align-items:center; gap:9px; justify-content:flex-start;
     background:transparent; border:none; padding:7px 9px; border-radius:8px;
-    color:var(--text); font-size:13px;
+    /* 刻意用固定的淺色字：選單在深色浮層上，
+       若跟著 --text 走，切到淺色主題時會變成深字配深底、看不見 */
+    color:#e6e8ee; font-size:13px;
   }
+  /* 目前套用的那個選項，沿用當前主題的文字色（它本來就在強調底色上） */
+  .theme-menu button[aria-checked="true"] { color:var(--text); }
   .theme-menu button:hover { background:var(--panel2); border:none; }
   .theme-menu button[aria-checked="true"] { background:var(--accent-soft); }
   .swatch { width:14px; height:14px; border-radius:50%; flex:none; border:1px solid rgba(128,128,128,.35); }

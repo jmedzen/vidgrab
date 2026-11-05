@@ -779,3 +779,84 @@ def test_scrub_metadata_cleans_existing(tmp_path, monkeypatch):
 
     _, items = tasks.load_project(tmp_path / "projects" / "p1")
     assert items[0].tags == ["vegan"]
+
+
+# ---------------------------------------------------------------- 主題選單
+
+
+def _page_css() -> str:
+    """把 web.py 裡那一大段 PAGE 字串抽出來，方便對 CSS 做靜態檢查。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "web.py").read_text(
+        encoding="utf-8"
+    )
+    return src
+
+
+def test_theme_menu_has_explicit_width():
+    """主題浮層要寫死寬度，否則會被 `aside * {max-width:100%}` 壓成一條縫。
+
+    這是真實踩到的 bug：選單在畫面上只剩 32px，等於不能用。
+    """
+    import re
+
+    src = _page_css()
+    m = re.search(r"\.theme-menu\s*\{", src)
+    assert m, "找不到 .theme-menu 的樣式"
+    block = src[m.end(): m.end() + 500]
+    flat = block.replace(" ", "").replace("\n", "")
+    assert "width:206px" in flat, "浮層要有明確寬度"
+    assert "min-width" in flat, "要寫 min-width 才不會被繼承的 max-width 壓掉"
+    assert "max-width" in flat, "要寫 max-width 覆蓋掉 aside * 的 100%"
+
+
+def test_theme_menu_is_absolute_overlay():
+    """浮層不可以佔到版面，否則會把側欄其他東西往下擠。"""
+    import re
+
+    src = _page_css()
+    m = re.search(r"\.theme-menu\s*\{", src)
+    assert m, "找不到 .theme-menu 的樣式"
+    block = src[m.end(): m.end() + 500].replace(" ", "")
+    assert "position:absolute" in block
+    assert "z-index" in block, "浮層要蓋在內容之上"
+
+
+def test_six_themes_defined_with_all_vars():
+    """六組主題都要定義完整，少一個變數就會出現透明或錯色。"""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "web.py").read_text(
+        encoding="utf-8"
+    )
+    themes = re.findall(r'\[data-theme="([a-z]+)"\]\s*\{(.*?)\}', src, re.S)
+    ids = [t[0] for t in themes]
+    for want in ("midnight", "ink", "forest", "paper", "mist", "sakura"):
+        assert want in ids, f"缺少主題：{want}"
+
+    required = ("--bg", "--panel", "--text", "--muted", "--accent", "--on-accent")
+    for tid, block in themes:
+        for var in required:
+            assert var in block, f"{tid} 缺變數 {var}"
+
+
+def test_theme_menu_labels_use_fixed_light_color():
+    """選單在深色浮層上，字色不能用跟著主題跑的 --text。
+
+    否則切到 Paper／Mist／Sakura 時，深色文字配深色浮層 → 幾乎看不見。
+    修好前對比只有 1.2:1，修好後 15.86:1。
+    """
+    import re
+
+    src = _page_css()
+    m = re.search(r"\.theme-menu button\s*\{", src)
+    assert m, "找不到 .theme-menu button 的樣式"
+    block = src[m.end(): m.end() + 600]
+    head = block.split("}")[0]
+    flat = head.replace(" ", "").replace("\n", "")
+    assert "color:#e6e8ee" in flat, "選單文字要用固定的淺色"
+    assert "color:var(--text)" not in flat, (
+        "選單文字不可以跟著目前主題的 --text 走，會在淺色主題下隱形"
+    )
