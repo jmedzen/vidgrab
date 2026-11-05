@@ -77,6 +77,7 @@ export default function App() {
   const [loginStat, setLoginStat] = useState('等待掃碼…')
 
   const openedOnBoot = useRef(false)
+  const lbVideoRef = useRef<HTMLVideoElement>(null)
   const lineId = useRef(0)
   const toastTimer = useRef<number | undefined>(undefined)
   const cancelJob = useRef<null | (() => void)>(null)
@@ -129,19 +130,42 @@ export default function App() {
     return () => document.removeEventListener('keydown', onKey)
   }, [lightbox, playing, loginOpen])
 
+  // 放大預覽自動播放：先試「有聲音」，被瀏覽器擋下才退成靜音。
+  // 不寫死在 <video muted> 上，因為使用者預設要聽得到聲音。
+  useEffect(() => {
+    const v = lbVideoRef.current
+    if (!v || lightbox?.kind !== 'video') return
+    let cancelled = false
+    v.muted = false
+    const p = v.play()
+    if (p && typeof p.catch === 'function') {
+      p.catch(() => {
+        if (cancelled) return
+        // 瀏覽器不讓有聲音的自動播放：改成靜音並標示，使用者按音量就有聲音
+        v.muted = true
+        void v.play().catch(() => { /* 連靜音都不給播就維持暫停 */ })
+      })
+    }
+    return () => { cancelled = true }
+  }, [lightbox])
+
   // ---- 播放器：點外面就關 ------------------------------------------
 
   useEffect(() => {
     if (!playing) return
     const onDown = (e: MouseEvent) => {
       const target = e.target as HTMLElement
+      // 點播放器本身、或點開預覽，都不算「點外面」
       if (target.closest('#player') || target.closest('#lightbox')) return
       const sel = window.getSelection()
       if (sel && sel.toString().length > 0) return
       setPlaying(null)
     }
-    document.addEventListener('click', onDown)
-    return () => document.removeEventListener('click', onDown)
+    // 用 pointerdown 而不是 click：click 註冊的當下，
+    // 觸發播放的那一次點擊還在往上冒泡，會立刻把剛打開的播放器關掉。
+    // 實際症狀：按鈕看起來沒反應（用程式呼叫 .click() 反而正常）。
+    document.addEventListener('pointerdown', onDown)
+    return () => document.removeEventListener('pointerdown', onDown)
   }, [playing])
 
   // ---- 資料 ------------------------------------------------------
@@ -629,8 +653,16 @@ export default function App() {
            onClick={() => setLightbox(null)}>
         {lightbox ? (
           lightbox.kind === 'video' ? (
-            <video src={lightbox.src} controls autoPlay playsInline muted
-                   onClick={(e) => e.stopPropagation()} />
+            <video
+              src={lightbox.src}
+              controls
+              playsInline
+              /* 預設不靜音（使用者要的）。瀏覽器會擋帶聲音的自動播放，
+                 所以不靠 autoplay 屬性，改成下面那個 effect 用 play() 去試；
+                 被擋就保持暫停，讓使用者自己按 —— 至少不要偷偷把聲音關掉。 */
+              ref={lbVideoRef}
+              onClick={(e) => e.stopPropagation()}
+            />
           ) : (
             <img src={lightbox.src} alt="放大檢視" />
           )

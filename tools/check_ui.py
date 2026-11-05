@@ -595,22 +595,49 @@ def _run() -> int:
                 "getComputedStyle(document.querySelector('#player')).display"
             ) != "none"
 
+        def _real_click(sel_or_xy):
+            """用真的滑鼠事件點。
+
+            播放器的「點外面關閉」聽的是 pointerdown，程式呼叫 .click()
+            不會產生那個事件 —— 用合成的 click 測會得到假通過/假失敗。
+            """
+            if isinstance(sel_or_xy, str):
+                box = tab.js("""(() => {
+                  const el = document.querySelector(%s);
+                  if (!el) return '';
+                  el.scrollIntoView({block: 'center'});
+                  const r = el.getBoundingClientRect();
+                  return JSON.stringify({x: Math.round(r.x+r.width/2),
+                                         y: Math.round(r.y+r.height/2)});
+                })()""" % json.dumps(sel_or_xy))
+                if not box:
+                    return False
+                xy = json.loads(box)
+            else:
+                xy = sel_or_xy
+            for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
+                tab.send("Input.dispatchMouseEvent", type=kind,
+                         x=xy["x"], y=xy["y"], button="left", clickCount=1)
+                time.sleep(0.12)
+            return True
+
         def _open_player():
             if _is_open():
                 tab.js("closePlayer()")
                 time.sleep(0.3)
-            tab.js("document.querySelector('[data-play]').click()")
-            time.sleep(1.2)
+            if not _real_click('.clip-actions button[data-play]'):
+                tab.js("document.querySelector('[data-play]').click()")
+            time.sleep(1.4)
             return _is_open()
 
         assert _open_player(), "播放器沒開起來，後面的斷言就沒意義了"
-        tab.js("document.querySelector('#view').click()")
-        time.sleep(0.6)
+        _real_click({"x": 60, "y": 120})   # 側欄空白處 = 播放器外面
+        time.sleep(0.7)
         check("點播放器外面會關閉", not _is_open())
 
         assert _open_player(), "播放器沒開起來"
-        tab.js("document.querySelector('#player .ptitle').click()")
-        time.sleep(0.6)
+        _real_click('#player .ptitle')
+        time.sleep(0.7)
         check("點播放器內部不會關閉", _is_open())
 
         assert _open_player(), "播放器沒開起來，Esc 那條會變成假測試"
@@ -835,6 +862,54 @@ def _run() -> int:
         check("設定面板關閉",
               tab.js("getComputedStyle(document.querySelector('#adminmodal')).display === 'none'"))
 
+    print("── ▶ 播放（真滑鼠點擊）")
+    # 先確定播放器是關的
+    tab.js("document.querySelector('#playerclose') && document.querySelector('#playerclose').click()")
+    time.sleep(0.8)
+    play_btn = tab.js("""(() => {
+      const b = document.querySelector('.clip-actions button[data-play]');
+      if (!b) return '';
+      b.scrollIntoView({block: 'center'});
+      const r = b.getBoundingClientRect();
+      return JSON.stringify({x: Math.round(r.x+r.width/2), y: Math.round(r.y+r.height/2),
+                             inView: r.top>=0 && r.bottom<=innerHeight});
+    })()""")
+    check("有 ▶ 播放按鈕", bool(play_btn), str(play_btn)[:40])
+    if play_btn:
+        ppos = json.loads(play_btn)
+        check("播放鈕在可視範圍內", ppos.get("inView") is True)
+        # 用 __CDP__ 派的真滑鼠事件：程式呼叫 .click() 測不出
+        # 「剛註冊的 click 監聽把這次點擊當成點外面」這個競態。
+        for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
+            tab.send("Input.dispatchMouseEvent", type=kind, x=ppos["x"], y=ppos["y"],
+                     button="left", clickCount=1)
+            time.sleep(0.12)
+        time.sleep(2.2)
+        check("點 ▶ 播放會打開播放器",
+              tab.js("(() => { const p=document.querySelector('#player');"
+                     " return !!p && getComputedStyle(p).display !== 'none'; })()"))
+        pv = tab.js("""(async () => {
+          const v = document.querySelector('#videoplayer');
+          if (!v) return 'no-video';
+          if (v.readyState < 2) {
+            await new Promise(r => {
+              v.addEventListener('loadedmetadata', r, {once:true});
+              v.addEventListener('error', r, {once:true});
+              setTimeout(r, 9000);
+            });
+          }
+          return JSON.stringify({rs: v.readyState,
+            dur: Math.round(v.duration*100)/100, muted: v.muted});
+        })()""", await_promise=True)
+        try:
+            pvi = json.loads(pv)
+            check("播放器影片載入成功", pvi["rs"] >= 2 and pvi["dur"] > 0, pv[:60])
+            check("播放器不預設靜音", pvi.get("muted") is False, f"muted={pvi.get('muted')}")
+        except Exception:  # noqa: BLE001
+            check("播放器影片載入成功", False, str(pv)[:60])
+        tab.js("document.querySelector('#playerclose') && document.querySelector('#playerclose').click()")
+        time.sleep(0.6)
+
     print("── 大圖／影片預覽")
     thumb = tab.js("!!document.querySelector('.clip-thumb')")
     check("片段有縮圖可點", thumb)
@@ -865,6 +940,7 @@ def _run() -> int:
             rs: v.readyState, dur: Math.round(v.duration*100)/100,
             w: v.videoWidth, h: v.videoHeight,
             advancing: v.currentTime > t0,
+            muted: v.muted,
           });
         })()""", await_promise=True)
         ok_play = False
@@ -874,6 +950,11 @@ def _run() -> int:
         except Exception:  # noqa: BLE001
             info = played
         check("放大後影片真的在播", ok_play, str(played)[:70])
+        try:
+            check("放大預覽不預設靜音", info.get("muted") is False,
+                  f"muted={info.get('muted')}")
+        except Exception:  # noqa: BLE001
+            check("放大預覽不預設靜音", False, str(played)[:60])
 
         # 點影片本身不該關掉（才拉得到進度條）
         before = tab.js("document.querySelector('#lightbox').classList.contains('show')")
