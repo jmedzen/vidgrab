@@ -537,6 +537,6 @@ def looks_like_tutorial(item: "Item") -> bool:
 # 之前就是這樣讓 CI 的 `vidgrab build --json` 掛掉。
 NEEDS_NO_FFMPEG = frozenset({
     "build", "list", "vault", "find", "config", "show",
-    "purge", "prune", "scrub", "login", "logout", "test",
+    "purge", "prune", "forget", "scrub", "login", "logout", "test",
     "web",  # web 本身不處理影片，是背景工作才需要
 })

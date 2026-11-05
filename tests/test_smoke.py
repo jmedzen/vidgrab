@@ -1325,9 +1325,21 @@ def test_launcher_and_cli_share_ffmpeg_list():
 
     之前分成兩份，導致 CI 掛掉。
     """
-    src = (_ROOT / "vidgrab").read_text(encoding="utf-8")
     from vidgrab.models import NEEDS_NO_FFMPEG
 
+    launcher = _ROOT / "vidgrab"
+    if not launcher.exists():
+        # CI 用 pip 安裝，沒有這個啟動腳本。
+        # 這時仍然要驗清單本身：每個指令都要是 CLI 真的有的子命令，
+        # 打錯字的豁免等於沒豁免。
+        from vidgrab.cli import build_parser
+
+        names = set(build_parser()._subparsers._group_actions[0].choices)
+        missing = NEEDS_NO_FFMPEG - names
+        assert not missing, f"豁免清單裡有 CLI 沒有的指令：{sorted(missing)}"
+        return
+
+    src = launcher.read_text(encoding="utf-8")
     assert "needs_ffmpeg" in src, "啟動腳本要有這個判斷"
     # 腳本裡的 case 清單要涵蓋 Python 清單裡的每個指令
     for cmd in NEEDS_NO_FFMPEG:
