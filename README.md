@@ -603,6 +603,59 @@ docker exec vidgrab vidgrab build                 # 確認跑的是哪次建置
 
 ---
 
+## 為什麼是 yt-dlp
+
+B 站下載器有很多選擇，這裡記下評估結果，免得每次都要重查一遍。
+
+**結論：vidgrab 需要的是 video／audio／metadata，yt-dlp 三件都做得好，而且只有它能切片段。**
+
+### 實測對照
+
+同一支影片（`BV1EE411k75J`，29 分鐘）：
+
+| 做法 | 拿到什麼 | 耗時 | 大小 |
+|---|---|---|---|
+| **yt-dlp `--download-sections`** | 20 秒片段 | **5.2 秒** | **2.9 MB** |
+| yutto（整支） | 整支 | 1 分 52 秒 | 147 MB |
+
+差 21 倍時間、50 倍容量。原因是 yutto 與 BBDown **都沒有「只抓影片內某幾秒」的功能**
+（yutto 的 `--batch-filter-start-time` 篩的是**發佈時間**，不是影片內秒數）。
+
+切片段是 vidgrab 的立命之本——沒有這個能力，工具就退化成一般下載器了。
+
+### 各個專案的實際狀況
+
+| 專案 | 能不能切片 | 對 vidgrab 的價值 |
+|---|---|---|
+| **yt-dlp** | **能**（`--download-sections` + `--force-keyframes-at-cuts`） | 現用；下載、探測、抽畫面全交給它 |
+| yutto | 不能 | 整檔歸檔、收藏夾、UP 主全量很強，另一個需求 |
+| BBDown | 不能 | 畫質選項最細（8K／HDR／杜比），但要另裝 .NET runtime |
+| bili_downloader (Rust) | 不能 | 單檔案啟動快，功能陽春 |
+| Nemo2011/bilibili-api | 不涉及下載 | 400+ 介面（評論樹、彈幕解碼、UP 主），但要求 Python ≥3.10 且全異步 |
+
+### yutto 的兩個實際摩擦
+
+- **沒登入拿不到字幕**：`未提供登录认证信息，无法下载高清视频、字幕等资源`，
+  要額外跑 `yutto auth login`。yt-dlp 直接吃 cookie 檔，vidgrab 已經在用了。
+- **用中文標題當檔名**：人看著舒服，但素材庫要的是穩定 id。
+  vidgrab 用 `bilibili_BV1EE411k75J_500-520_作者.mp4`，agent 靠這個引用。
+
+### yt-dlp 也拿得到彈幕
+
+不必為了彈幕換工具：
+
+```bash
+yt-dlp --write-subs --sub-langs danmaku --skip-download <url>
+→ 得到 .danmaku.xml（原始 XML，含時間戳）
+```
+
+yutto 給的是 `.ass`（給人看的歌詞樣式），程式要處理反而得再解析一次。
+
+> **什麼時候該考慮 yutto**
+>
+> 需求換成「把某個 UP 主整個存下來」而不是「從長片裡取出幾秒」時，
+> 那時該**加一條路徑**，不是把 yt-dlp 換掉。兩者解決不同問題。
+
 ## 版本與 build number
 
 ```bash
