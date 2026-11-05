@@ -518,21 +518,39 @@ def cmd_prune(args: argparse.Namespace) -> int:
                 orphans.append(p)
 
     freed = sum(p.stat().st_size for p in orphans)
+
+    # 另一種孤兒：清單裡有紀錄、磁碟上卻沒有檔案。
+    # 卡片會顯示成「看得到、點不開」，比檔案孤兒更煩人。
+    stale: list[tuple[int, str]] = []
+    for idx, it in enumerate(items):
+        keep = []
+        for c in it.clips:
+            path = Path(c.get("path") or (clips_dir / Path(str(c.get("name") or "")).name))
+            if path.exists():
+                keep.append(c)
+            else:
+                stale.append((idx, path.name))
+        it.clips = keep
+
     if not args.dry_run:
         for p in orphans:
             try:
                 p.unlink()
             except OSError:
                 pass
+        if stale:
+            tasks.save_project(project, manifest, items)
 
     emit_json({
         "schema": "vidgrab.prune/1",
         "project": project.name,
         "orphans": len(orphans),
+        "stale_records": len(stale),
         "freed_bytes": freed,
         "freed_human": __import__("vidgrab.models", fromlist=["human_size"]).human_size(freed),
         "dry_run": bool(args.dry_run),
         "files": [p.name for p in orphans],
+        "stale": [n for _i, n in stale],
     })
     return 0
 

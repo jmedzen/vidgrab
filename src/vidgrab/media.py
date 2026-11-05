@@ -550,6 +550,15 @@ def grab_range(
     _absorb_info_json(item, outdir, stem)
 
     probe = ffprobe(final)
+    # 有檔案 ≠ 檔案可用。實際踩到：yt-dlp 回 0、也產出了 .mp4，
+    # 但只有 98KB、裡面一條 video 流都沒有（下載被截斷）。
+    # 這種檔進到素材庫就是一格「無圖、尺寸空白」的垃圾，而且不會報錯。
+    # 判斷依據只有一個：有沒有影像尺寸。壞檔的 duration 可能還是 6.0，
+    # 用「duration 也沒有」當條件會漏掉它。
+    if not (probe.get("width") or probe.get("height")):
+        final.unlink(missing_ok=True)
+        _clean_partials(outdir, stem)
+        raise MediaError("下載回來的檔案是壞的（沒有影像軌），已刪除")
     return {"path": str(final), "cached": False, **probe}
 
 

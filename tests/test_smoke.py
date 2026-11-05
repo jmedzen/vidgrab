@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 import time
 import urllib.request
@@ -2171,7 +2173,9 @@ def test_retry_progress_event_carries_attempt(monkeypatch, tmp_path):
         return 0, ""
 
     monkeypatch.setattr(media, "_run_stream", flaky)
-    monkeypatch.setattr(media, "ffprobe", lambda p: {"duration": 1.0})
+    # 要給尺寸，否則會被「壞檔」檢查擋下來（那條檢查是後來加的）
+    monkeypatch.setattr(media, "ffprobe",
+                        lambda p: {"width": 1920, "height": 1080, "duration": 1.0})
 
     media.grab_clip(_item_for_test(), 0, 5, tmp_path, label="t",
                     on_progress=events.append)
@@ -2237,3 +2241,156 @@ def test_admin_ui_covers_every_config_group():
     src = _ts_bundle()
     for g in groups:
         assert g in src, f"admin UI 沒有「{g}」這組"
+
+
+def test_progress_payload_is_not_printed_to_terminal(capsys):
+    """進度行的 JSON 不可以漏到終端。
+
+    實際踩到：pick 的時候 stderr 被 `17%{"kind": "download", ...}` 洗版，
+    整包 JSON 跟著進度一起印出來，人完全看不懂發生什麼事。
+    payload 是給 Web UI 畫進度條用的，終端只要人話那半。
+    """
+    from vidgrab.models import log
+
+    log("\r       50% 下載中\x00" + '{"kind": "download", "percent": 50}')
+    err = capsys.readouterr().err
+
+    assert "下載中" in err, "人話那半要留著"
+    assert "kind" not in err, f"JSON 漏出來了：{err!r}"
+    assert "\x00" not in err, "分隔符不該出現在終端"
+
+
+def test_log_handles_plain_message(capsys):
+    """沒有 payload 的普通訊息要原樣印出。"""
+    from vidgrab.models import log
+
+    log("✔ 完成：1 段")
+    assert "✔ 完成：1 段" in capsys.readouterr().err
+
+
+def test_corrupt_download_is_rejected_not_saved(monkeypatch, tmp_path):
+    """下載「成功」但檔案是壞的，不可以當成成功。
+
+    實際踩到：yt-dlp 回 0、也產出 .mp4，但只有 98KB、裡面一條影像軌都沒有。
+    這種檔進素材庫就是一格「無圖、尺寸空白」的垃圾，而且完全不會報錯。
+    """
+    from vidgrab import media
+
+    monkeypatch.setattr(media.time, "sleep", lambda _s: None)
+
+    def fake_run(cmd, on_progress=None, timeout=None):
+        stem = next((a for a in cmd if a.endswith(".%(ext)s")), "")
+        out = Path(stem.replace(".%(ext)s", ".mp4"))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"\x00" * 64)   # 有檔案，但解不出影像
+        return 0, ""
+
+    monkeypatch.setattr(media, "_run_stream", fake_run)
+    # 壞檔的特徵：width/height 是 None，但 duration 有值（真的遇過）
+    monkeypatch.setattr(media, "ffprobe",
+                        lambda p: {"width": None, "height": None, "duration": 6.0})
+
+    with pytest.raises(media.MediaError, match="壞的"):
+        media.grab_clip(_item_for_test(), 0, 6, tmp_path, label="t")
+
+    left = list(tmp_path.glob("*.mp4"))
+    assert not left, f"壞檔應該被刪掉，卻留著：{left}"
+
+
+def test_good_download_is_accepted(monkeypatch, tmp_path):
+    """正常的檔案不能被誤擋。"""
+    from vidgrab import media
+
+    def fake_run(cmd, on_progress=None, timeout=None):
+        stem = next((a for a in cmd if a.endswith(".%(ext)s")), "")
+        out = Path(stem.replace(".%(ext)s", ".mp4"))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"\x00" * 2048)
+        return 0, ""
+
+    monkeypatch.setattr(media, "_run_stream", fake_run)
+    monkeypatch.setattr(media, "ffprobe",
+                        lambda p: {"width": 1920, "height": 1080, "duration": 8.0})
+
+    got = media.grab_clip(_item_for_test(), 0, 8, tmp_path, label="t")
+    assert Path(got["path"]).exists()
+    assert got["width"] == 1920
+
+
+def test_prune_removes_records_whose_file_is_gone(tmp_path, monkeypatch):
+    """清單裡有紀錄、磁碟上沒檔案 → prune 要把它清掉。
+
+    實際踩到：刪了 .mp4 但 results.json 還記著，
+    素材庫就出現「看得到、點不開」的卡片。舊版 prune 只處理
+    「磁碟有、清單沒有」的反向孤兒，遇到這種完全幫不上忙。
+    """
+    import json as _json
+    import subprocess
+    from pathlib import Path
+
+    home = tmp_path / "projects"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("VIDGRAB_HOME", str(home))
+    proj = home / "stale-proj"
+    clips = proj / "clips"
+    clips.mkdir(parents=True, exist_ok=True)
+    (proj / "manifest.json").write_text(_json.dumps({"queries": ["x"]}), encoding="utf-8")
+
+    alive = clips / "keep.mp4"
+    alive.write_bytes(b"\x00" * 32)
+    (proj / "results.json").write_text(_json.dumps([{
+        "platform": "bilibili", "vid": "V1", "url": "u", "title": "t",
+        "clips": [
+            {"name": "keep.mp4", "path": str(alive)},
+            {"name": "gone.mp4", "path": str(clips / "gone.mp4")},
+        ],
+    }], ensure_ascii=False), encoding="utf-8")
+
+    root = Path(__file__).resolve().parents[1]
+    out = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "prune", "stale-proj"],
+        cwd=str(root), capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONPATH": str(root / "src")},
+    )
+    assert out.returncode == 0, out.stderr
+    got = _json.loads(out.stdout)
+    assert got["stale_records"] == 1, got
+
+    from vidgrab import tasks
+
+    _m, items = tasks.load_project(proj)
+    names = [Path(c["path"]).name for c in items[0].clips]
+    assert names == ["keep.mp4"], names
+
+
+def test_retry_recovers_from_transient_failure_for_real_binary(tmp_path, monkeypatch):
+    """用真的 yt-dlp 跑一次「前兩次假裝失敗」，確認重試機制在真流程裡也有效。
+
+    前面的測試都是替換 _run_stream；這條保留真的參數組裝，
+    只讓第一次嘗試回傳失敗碼，確保重試繞的是同一份 cmd。
+    """
+    from vidgrab import media
+
+    monkeypatch.setattr(media.time, "sleep", lambda _s: None)
+    real = media._run_stream
+    seen = {"n": 0, "cmds": []}
+
+    def flaky(cmd, on_progress=None, timeout=None):
+        seen["n"] += 1
+        seen["cmds"].append(list(cmd))
+        if seen["n"] <= 2:
+            return 1, "ERROR: HTTP Error 503: Service Unavailable"
+        return real(cmd, on_progress=on_progress, timeout=timeout)
+
+    monkeypatch.setattr(media, "_run_stream", flaky)
+
+    # 前兩次是我們假造的 503，之後交給真的 yt-dlp。
+    # 網址不存在 → 真的也會失敗，而且失敗訊息是可重試類 → 一路試到上限。
+    # 所以這裡驗的是「真的流程也會重試到 10 次」，不是「3 次就成功」。
+    item = _item_for_test()
+    with pytest.raises(media.MediaError):
+        media.grab_clip(item, 0, 3, tmp_path, label="t")
+
+    assert seen["n"] == media.MAX_DOWNLOAD_RETRIES, \
+        f"應該試滿 {media.MAX_DOWNLOAD_RETRIES} 次，實際 {seen['n']}"
+    assert seen["cmds"][0] == seen["cmds"][-1], "重試要用同一組參數"

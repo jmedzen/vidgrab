@@ -152,6 +152,14 @@ def human_size(num_bytes: float) -> str:
 
 
 def log(msg: str) -> None:
+    """寫一行到 stderr。
+
+    進度行可能長這樣：「\r<給人看的>\x00<給機器看的 JSON>」。
+    終端只要左半邊（右半邊是給 Web UI 畫進度條用的）；
+    不切開的話，使用者會看到整包 JSON 跟著進度一起印出來。
+    """
+    if "\x00" in msg:
+        msg = msg.split("\x00", 1)[0]
     print(msg, file=sys.stderr, flush=True)
 
 
