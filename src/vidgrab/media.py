@@ -391,6 +391,40 @@ def grab_full(
                       timeout=timeout, on_progress=on_progress)
 
 
+# 下載失敗最多重試幾次。10 次是使用者要求的；搭配下面的退避，
+# 大約會撐 3 分鐘左右，足夠撐過網路的短暫抽動。
+MAX_DOWNLOAD_RETRIES = 10
+
+# 這些錯誤重試有用（網路抽動、伺服器忙、暫時被限流）。
+# 其他錯誤（404、私人影片、地區限制）重試幾次都一樣，直接放棄。
+_RETRYABLE = (
+    "http error 5",          # 5xx
+    "http error 429",        # 太頻繁
+    "timed out",
+    "timeout",
+    "connection",
+    "temporarily unavailable",
+    "unable to download",
+    "read timed out",
+    "reset by peer",
+    "ssl",
+    "fragment",
+    "giving up after",
+    "incomplete read",
+    "network is unreachable",
+)
+
+
+def _is_retryable(message: str) -> bool:
+    low = (message or "").lower()
+    return any(token in low for token in _RETRYABLE)
+
+
+def _backoff(attempt: int) -> float:
+    """1s, 2s, 4s … 上限 20s。"""
+    return min(20.0, float(2 ** max(0, attempt - 1)))
+
+
 def grab_range(
     item: Item,
     start: float | None,
@@ -463,19 +497,46 @@ def grab_range(
         beater = threading.Thread(target=beat, daemon=True)
         beater.start()
 
-    try:
-        code, tail = _run_stream(cmd, on_progress=on_progress, timeout=timeout)
-    finally:
-        stop_beat.set()
+    produced: list[Path] = []
+    tail = ""
+    last_error = ""
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        try:
+            code, tail = _run_stream(cmd, on_progress=on_progress, timeout=timeout)
+        finally:
+            stop_beat.set()
 
-    produced = sorted(
-        p for p in outdir.glob(f"{stem}.*") if p.suffix.lower() in MEDIA_EXTS
-    )
-    if code != 0 or not produced:
+        produced = sorted(
+            p for p in outdir.glob(f"{stem}.*") if p.suffix.lower() in MEDIA_EXTS
+        )
+        if code == 0 and produced:
+            break
+
         lines = [ln for ln in tail.splitlines() if ln.strip()]
-        # 失敗時把 .part 殘檔清掉：留著只會佔空間，而且下次會從壞掉的地方續傳
+        last_error = lines[-1] if lines else "yt-dlp 沒有產出檔案"
+
+        # 殘檔一定要清：留著下次會從壞掉的地方續傳，永遠修不好
         _clean_partials(outdir, stem)
-        raise MediaError(lines[-1] if lines else "yt-dlp 沒有產出檔案")
+
+        if attempt >= MAX_DOWNLOAD_RETRIES or not _is_retryable(last_error):
+            raise MediaError(last_error)
+
+        wait = _backoff(attempt)
+        log(f"    ↻ 第 {attempt}/{MAX_DOWNLOAD_RETRIES} 次失敗，{wait:.0f} 秒後重試：{last_error[:90]}")
+        if on_progress:
+            try:
+                on_progress({
+                    "downloaded": None, "total": None, "percent": None,
+                    "speed": "", "eta": "", "fragment": "",
+                    "bytes": "", "estimated": True,
+                    "retry": attempt, "max_retries": MAX_DOWNLOAD_RETRIES,
+                })
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(wait)
+
+    if not produced:
+        raise MediaError(last_error or "yt-dlp 沒有產出檔案")
     # yt-dlp 有時會留下 `xxx.f30077.mp4` 這種帶格式編號的檔名。
     # 那是內部識別用的，對使用者與 agent 都是噪音，改成乾淨的名字。
     produced = [_normalize_name(p, stem) for p in produced]

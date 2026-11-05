@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from pathlib import Path
 
 try:
     import websocket
@@ -162,7 +163,10 @@ class Tab:
             elif msg.get("method") == "Log.entryAdded":
                 e = msg["params"]["entry"]
                 if e.get("level") == "error":
-                    self.errors.append(e.get("text", ""))
+                    # 帶上 URL，否則只看到「404」卻不知道是哪個請求
+                    where = e.get("url") or ""
+                    text = e.get("text", "")
+                    self.errors.append(f"{text} @ {where}" if where else text)
             elif msg.get("id") == want:
                 return msg.get("result")
         return None
@@ -189,6 +193,41 @@ class Tab:
         self.ws.close()
 
 
+def _start_fixture_server():
+    """用假的素材庫起一個獨立實例（port 8310）。
+
+    這樣介面檢查不會依賴、也不會弄壞真人正在用的 projects/。
+    """
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    data = Path(tempfile.mkdtemp(prefix="vg-ui-"))
+    make = root / "tools" / "make_fixture.py"
+    subprocess.run([sys.executable, str(make), str(data)],
+                   capture_output=True, timeout=120, check=False)
+
+    env = {**os.environ,
+           "VIDGRAB_HOME": str(data / "projects"),
+           "VIDGRAB_AUTH_DIR": str(data / "auth"),
+           "VIDGRAB_CONFIG": str(data / "config.json")}
+    (data / "auth").mkdir(parents=True, exist_ok=True)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "vidgrab.cli", "web", "--no-open", "--port", "8310"],
+        cwd=str(root), env={**env, "PYTHONPATH": str(root / "src")},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    for _ in range(60):  # 最多等 12 秒
+        try:
+            urllib.request.urlopen("http://127.0.0.1:8310/api/version", timeout=1).read()
+            print(f"… 測試實例已啟動（素材在 {data}）")
+            return proc
+        except Exception:  # noqa: BLE001
+            time.sleep(0.2)
+    proc.terminate()
+    return None
+
+
 def main() -> int:
     import urllib.parse as up
 
@@ -196,12 +235,23 @@ def main() -> int:
     launch = "--launch" in argv
     headful = "--headful" in argv
 
+    # --fixture：自己起一個「有測試素材的乾淨實例」，不動真實資料
+    fixture_proc = None
+    if "--fixture" in argv:
+        fixture_proc = _start_fixture_server()
+        if not fixture_proc:
+            print("✗ 起不來測試實例")
+            return 2
+
     # 先確認 Web UI 有在跑，否則後面的失敗訊息會很誤導
     try:
         urllib.request.urlopen("http://127.0.0.1:8310/api/version", timeout=3).read()
     except Exception:  # noqa: BLE001
+        if fixture_proc:
+            fixture_proc.terminate()
         print("✗ 找不到正在跑的 vidgrab Web UI（http://127.0.0.1:8310）")
         print("  請先在另一個終端機執行：./vidgrab web")
+        print("  或者加 --fixture 讓它自己起一個有測試素材的實例")
         return 2
 
     proc = None
@@ -230,6 +280,12 @@ def main() -> int:
     try:
         return _run()
     finally:
+        if fixture_proc:
+            fixture_proc.terminate()
+            try:
+                fixture_proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
         if proc:
             proc.terminate()
             try:
@@ -492,7 +548,17 @@ def _run() -> int:
     if clip_list:
         c = clip_list[0]
         tab.js(f"playClip({json.dumps(c)}, 'test.mp4')")
-        time.sleep(2.5)
+        # 等真的解出 metadata，不要用固定秒數賭 —— 大檔案偶爾會超過 2.5 秒，
+        # 那時讀到的 duration 是 NaN，會被誤判成「影片壞了」。
+        tab.js("""(() => new Promise(done => {
+          const v = document.querySelector('#videoplayer');
+          if (v.readyState >= 1) return done();
+          const fin = () => done();
+          v.addEventListener('loadedmetadata', fin, {once:true});
+          v.addEventListener('error', fin, {once:true});
+          setTimeout(fin, 8000);
+        }))()""", await_promise=True)
+        time.sleep(0.3)
         st = tab.js("""JSON.stringify({
           visible: getComputedStyle(document.querySelector('#player')).display !== 'none',
           src: document.querySelector('#videoplayer').currentSrc,
@@ -716,6 +782,58 @@ def _run() -> int:
     check("卡片上沒有「未知」膠囊", "未知" not in (pills or ""), str(pills))
     note = tab.js("document.querySelector('.licnote') ? document.querySelector('.licnote').textContent : ''")
     check("未標示授權改成一句說明", "未標示" in (note or ""), str(note))
+
+    print("── 系統設定（admin）")
+    has_admin = tab.js("!!document.querySelector('#openadmin')")
+    check("有設定入口", has_admin)
+    if has_admin:
+        tab.js("document.querySelector('#openadmin').click()")
+        time.sleep(1.2)
+        opened = tab.js("getComputedStyle(document.querySelector('#adminmodal')).display !== 'none'")
+        check("設定面板打開", opened)
+
+        n_inputs = tab.js("document.querySelectorAll('#adminmodal input,#adminmodal select').length")
+        check("每個設定項都有輸入元件", (n_inputs or 0) >= 20, f"{n_inputs} 個")
+
+        groups = tab.js("JSON.stringify([...document.querySelectorAll('#adminmodal h3')].map(e=>e.textContent))")
+        gl = json.loads(groups or "[]")
+        check("有分組（不是一長串）", len(gl) >= 3, str(gl))
+
+        # 沒有「其他」孤兒 = 每個設定項都有人寫標籤
+        check("沒有未分類的設定項", "其他" not in gl, str(gl))
+
+        # 每個欄位都要有可讀名稱，不然讀屏軟體唸不出來
+        unnamed = tab.js("""Array.from(document.querySelectorAll('#adminmodal input,#adminmodal select'))
+          .filter(el => !(el.getAttribute('aria-label') || (el.id && document.querySelector(`label[for="${el.id}"]`)) || el.closest('label'))).length""")
+        check("設定項都有標籤", (unnamed or 0) == 0, f"{unnamed} 個沒有")
+
+        # 存檔流程：改一個值 → 儲存 → API 要真的變
+        tab.js("""(() => {
+          const el = document.querySelector('#cfg-per_keyword');
+          const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          set.call(el, '17');
+          el.dispatchEvent(new Event('input', {bubbles:true}));
+        })()""")
+        time.sleep(0.4)
+        check("改了值之後儲存鈕可用",
+              tab.js("!document.querySelector('#adminsave').disabled"))
+        tab.js("document.querySelector('#adminsave').click()")
+        time.sleep(1.8)
+        saved = tab.js("(async () => { const r = await api('/api/config'); return String(r.values.per_keyword); })()",
+                       await_promise=True)
+        check("儲存有寫進設定", saved == "17", f"per_keyword={saved}")
+
+        # 還原
+        tab.js("document.querySelector('#adminreset').click()")
+        time.sleep(1.6)
+        back = tab.js("(async () => { const r = await api('/api/config'); return String(r.values.per_keyword); })()",
+                      await_promise=True)
+        check("一鍵還原有效", back == "12", f"per_keyword={back}")
+
+        tab.js("document.querySelector('#adminclose').click()")
+        time.sleep(0.6)
+        check("設定面板關閉",
+              tab.js("getComputedStyle(document.querySelector('#adminmodal')).display === 'none'"))
 
     print("── 沒有 JS 錯誤")
     real_errors = [e for e in tab.errors if e and "favicon" not in e.lower()]

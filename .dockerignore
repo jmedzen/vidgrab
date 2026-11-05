@@ -21,3 +21,8 @@ docs
 !README.md
 
 # 注意：tests/ 不要排除，Dockerfile 的測試階段會 COPY 它
+
+# 前端（階段 1）：打包產物已在 src/vidgrab/static/ 內隨 COPY 進去，
+# 這些不需要進映像
+web/node_modules/
+web/.vite/

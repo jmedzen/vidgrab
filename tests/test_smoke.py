@@ -189,16 +189,23 @@ def test_web_index_renders(web):
     with urllib.request.urlopen(web + "/", timeout=5) as resp:
         body = resp.read().decode()
     assert "vidgrab" in body
-    assert "/static/app.css" in body, "外殼要載入樣式"
-    assert "/static/app.js" in body, "外殼要載入程式"
+    # 階段 1 之後由 Vite 打包，檔名帶雜湊
+    assert "/static/assets/" in body, "外殼要載入打包後的資源"
+    assert ".css" in body and ".js" in body, "樣式與程式都要載入"
+    assert 'id="root"' in body, "React 掛載點"
 
-    for path, want in (("/static/index.html", 'id="keywords"'),
-                       ("/static/app.css", "--console-bg"),
-                       ("/static/app.js", 'id="mode"')):
+    for path, want in (("/static/index.html", 'id="root"'),):
         with urllib.request.urlopen(web + path, timeout=5) as resp:
             assert resp.status == 200, f"{path} 回應 {resp.status}"
             got = resp.read().decode()
         assert want in got, f"{path} 少了 {want}"
+
+    # 打包後的 CSS／JS 也要送得出來
+    import re
+    for m in re.findall(r'/static/assets/[A-Za-z0-9._-]+', body):
+        with urllib.request.urlopen(web + m, timeout=5) as resp:
+            assert resp.status == 200, f"{m} 回應 {resp.status}"
+            assert len(resp.read()) > 100, f"{m} 內容是空的"
 
 
 def test_static_route_blocks_traversal(web):
@@ -441,7 +448,7 @@ def test_library_persists(tmp_path, monkeypatch):
 
 def test_library_corrupt_file_is_safe(tmp_path, monkeypatch):
     monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
-    (tmp_path / "projects").mkdir(parents=True)
+    (tmp_path / "projects").mkdir(parents=True, exist_ok=True)
     (tmp_path / "projects" / "library.json").write_text("{ 壞掉的 json", encoding="utf-8")
 
     from vidgrab import library
@@ -816,16 +823,26 @@ def test_scrub_metadata_cleans_existing(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- 主題選單
 
 
-def _page_css() -> str:
-    """前端樣式（階段 0 之後放在 static/app.css）。"""
-    return _static_file("app.css")
-
-
 def _static_file(name: str) -> str:
     from pathlib import Path
 
     return (Path(__file__).resolve().parents[1]
             / "src" / "vidgrab" / "static" / name).read_text(encoding="utf-8")
+
+
+def _page_css() -> str:
+    """前端樣式。
+
+    階段 1 之後樣式由 Vite 打包，檔名帶內容雜湊（assets/index-xxxx.css），
+    所以用 glob 找，不能寫死檔名。
+    """
+    import glob
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "static"
+    hits = sorted(glob.glob(str(root / "assets" / "*.css")))
+    assert hits, "找不到打包後的 CSS（要先跑 cd web && npm run build）"
+    return Path(hits[0]).read_text(encoding="utf-8")
 
 
 def test_theme_menu_has_explicit_width():
@@ -863,7 +880,7 @@ def test_six_themes_defined_with_all_vars():
     from pathlib import Path
 
     src = _page_css()
-    themes = re.findall(r'\[data-theme="([a-z]+)"\]\s*\{(.*?)\}', src, re.S)
+    themes = re.findall(r'\[data-theme="?([a-z]+)"?\]\s*\{(.*?)\}', src, re.S)
     ids = [t[0] for t in themes]
     for want in ("midnight", "ink", "forest", "paper", "mist", "sakura"):
         assert want in ids, f"缺少主題：{want}"
@@ -1899,3 +1916,324 @@ def test_dockerfile_opts_into_lan_binding():
         "容器綁 0.0.0.0 卻沒帶 --allow-lan，會啟動失敗："
         f"{cmd_line!r}"
     )
+
+
+def test_write_json_is_safe_under_concurrent_writers(tmp_path):
+    """兩個執行緒同時寫同一個檔案不可以炸。
+
+    實際踩到：web 服務是多執行緒的，連按兩下釘選 →
+    兩邊都用 xxx.json.tmp 當暫存檔，A 先 rename 走，B rename 就
+    FileNotFoundError，連線直接斷掉（瀏覽器看到 ERR_EMPTY_RESPONSE）。
+    """
+    import threading
+
+    from vidgrab.models import read_json, write_json
+
+    target = tmp_path / "library.json"
+    write_json(target, {"n": 0})
+
+    errors: list[BaseException] = []
+
+    def hammer(seed: int) -> None:
+        try:
+            for i in range(25):
+                write_json(target, {"n": seed * 1000 + i})
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer, args=(k,)) for k in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"並行寫入爆炸：{errors[:2]}"
+    # 檔案要還是完整的 JSON（不能是被截斷的半份）
+    got = read_json(target, default=None)
+    assert isinstance(got, dict) and "n" in got
+    # 不可以留下暫存檔
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_built_assets_are_present_in_package():
+    """打包後的資源要真的存在且有內容。
+
+    階段 1 之後前端是 Vite 產物。如果忘了 build 就發佈，
+    /static/assets/* 會 404，整個介面白畫面 —— 這是很容易漏的一步。
+    """
+    import glob
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "static"
+    index = (root / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="root"' in index, "index.html 要有 React 掛載點"
+    assert "/static/assets/" in index, "index.html 要指向打包後的資源"
+
+    js = glob.glob(str(root / "assets" / "*.js"))
+    css = glob.glob(str(root / "assets" / "*.css"))
+    assert js, "找不到打包後的 JS（cd web && npm run build）"
+    assert css, "找不到打包後的 CSS（cd web && npm run build）"
+
+    # React 有進來才算真的打包成功
+    bundle = Path(js[0]).read_text(encoding="utf-8", errors="ignore")
+    assert len(bundle) > 50_000, f"JS 只有 {len(bundle)} bytes，可能打壞了"
+    assert "react" in bundle.lower(), "打包產物裡找不到 React"
+
+
+def test_theme_ids_match_between_ts_and_css():
+    """TS 的主題清單要跟 CSS 對得上。
+
+    漏一個主題，切過去就會變成「沒有對應變數」→ 透明或錯色，
+    而且只在切到那個主題時才看得出來。
+    """
+    import glob
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "vidgrab"
+    ts = (root.parent.parent / "web" / "src" / "lib" / "theme.ts").read_text(encoding="utf-8")
+    ts_ids = set(re.findall(r"id:\s*'([a-z]+)'", ts))
+
+    css_path = sorted(glob.glob(str(root / "static" / "assets" / "*.css")))[0]
+    css = Path(css_path).read_text(encoding="utf-8")
+    css_ids = set(re.findall(r'\[data-theme="?([a-z]+)"?\]', css))
+
+    for want in ("midnight", "ink", "forest", "paper", "mist", "sakura"):
+        assert want in ts_ids, f"theme.ts 少了 {want}"
+        assert want in css_ids, f"CSS 少了 {want} 的變數"
+    assert ts_ids <= css_ids, f"TS 有但 CSS 沒有：{ts_ids - css_ids}"
+
+
+# ---------------------------------------------------------------- 下載重試
+
+
+def test_download_retries_up_to_ten_times(monkeypatch, tmp_path):
+    """下載失敗要自動重試，最多 10 次。
+
+    用假的 _run_stream 模擬「前 3 次失敗、第 4 次成功」，
+    確認真的重試了、而且最後拿到檔案。
+    """
+    from vidgrab import media
+
+    monkeypatch.setattr(media.time, "sleep", lambda _s: None)  # 不要真的等
+
+    calls = {"n": 0}
+
+    def fake_run(cmd, on_progress=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 4:
+            return 1, "ERROR: HTTP Error 503: Service Unavailable"
+        # 假裝產出檔案
+        stem = next((a for a in cmd if a.endswith(".%(ext)s")), "")
+        out = Path(stem.replace(".%(ext)s", ".mp4"))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"x" * 64)
+        return 0, ""
+
+    monkeypatch.setattr(media, "_run_stream", fake_run)
+    monkeypatch.setattr(media, "ffprobe", lambda p: {"duration": 1.0, "width": 2, "height": 2})
+
+    item = _item_for_test()
+    out = media.grab_clip(item, 0, 5, tmp_path, label="t")
+
+    assert calls["n"] == 4, f"應該試 4 次，實際 {calls['n']}"
+    assert Path(out["path"]).exists()
+
+
+def test_download_gives_up_after_ten_and_does_not_retry_404(monkeypatch, tmp_path):
+    """永久性錯誤（404）不該重試；可重試錯誤最多 10 次就放棄。"""
+    from vidgrab import media
+
+    monkeypatch.setattr(media.time, "sleep", lambda _s: None)
+
+    # 404：只打一次
+    seen = {"n": 0}
+
+    def not_found(cmd, on_progress=None, timeout=None):
+        seen["n"] += 1
+        return 1, "ERROR: HTTP Error 404: Not Found"
+
+    monkeypatch.setattr(media, "_run_stream", not_found)
+    with pytest.raises(media.MediaError):
+        media.grab_clip(_item_for_test(), 0, 5, tmp_path / "a", label="t")
+    assert seen["n"] == 1, f"404 不該重試，卻試了 {seen['n']} 次"
+
+    # 503：試滿 10 次
+    seen["n"] = 0
+
+    def always_busy(cmd, on_progress=None, timeout=None):
+        seen["n"] += 1
+        return 1, "ERROR: HTTP Error 503: Service Unavailable"
+
+    monkeypatch.setattr(media, "_run_stream", always_busy)
+    with pytest.raises(media.MediaError):
+        media.grab_clip(_item_for_test(), 0, 5, tmp_path / "b", label="t")
+    assert seen["n"] == media.MAX_DOWNLOAD_RETRIES == 10, f"試了 {seen['n']} 次"
+
+
+def test_retry_backoff_is_bounded(monkeypatch):
+    """退避要遞增但有上限，不可以無限長大。"""
+    from vidgrab import media
+
+    waits = [media._backoff(n) for n in range(1, 12)]
+    assert waits[0] == 1.0
+    assert waits == sorted(waits), "要遞增"
+    assert max(waits) <= 20.0, "上限 20 秒"
+
+
+def _item_for_test():
+    from vidgrab.models import Item
+
+    return Item(platform="bilibili", vid="BVTEST", url="https://example.invalid/x",
+                title="測試")
+
+
+# ---------------------------------------------------------------- 設定／admin
+
+
+def test_every_config_field_has_admin_metadata():
+    """每個設定項都要有分組與標籤，否則 admin UI 會出現「其他」孤兒。"""
+    from vidgrab import config
+
+    described = config.describe()
+    keys = {f["key"] for f in described["fields"]}
+    assert keys == set(config.DEFAULTS), "describe() 漏了設定項"
+
+    for f in described["fields"]:
+        assert f["group"] != "其他", f"{f['key']} 沒有分組"
+        assert f["label"] and f["label"] != f["key"], f"{f['key']} 沒有人看得懂的標籤"
+        assert f["type"] in ("str", "int", "float", "bool", "list")
+
+
+def test_config_enum_options_are_exposed():
+    """有枚舉的欄位要把可選值交出來，前端才能做成下拉。"""
+    from vidgrab import config
+
+    by_key = {f["key"]: f for f in config.describe()["fields"]}
+    for key, allowed in config.ENUMS.items():
+        assert key in by_key, f"{key} 不在 fields 裡"
+        assert set(by_key[key]["options"]) == allowed, f"{key} 的可選項不對"
+        assert by_key[key]["value"] in allowed
+
+
+def test_config_marks_changed_from_default():
+    """改過的欄位要標成 changed，UI 才畫得出「與預設不同」的點。"""
+    from vidgrab import config
+
+    config.save({"height": 720})
+    by_key = {f["key"]: f for f in config.describe()["fields"]}
+    assert by_key["height"]["changed"] is True
+    assert by_key["height"]["value"] == 720
+    assert by_key["per"]["changed"] is False
+
+
+def test_admin_config_roundtrip_via_web(web):
+    """從網頁改設定 → 讀回來要是新值；還原也要真的回到預設。"""
+    import json as _json
+    import urllib.request
+
+    def post(payload: dict) -> dict:
+        req = urllib.request.Request(
+            web + "/api/config",
+            data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        return _json.loads(urllib.request.urlopen(req, timeout=10).read())
+
+    post({"set": {"per": 42, "height": 720}})
+    got = _json.loads(urllib.request.urlopen(web + "/api/config", timeout=10).read())
+    assert got["values"]["per"] == 42
+    assert got["values"]["height"] == 720
+
+    post({"reset": []})
+    back = _json.loads(urllib.request.urlopen(web + "/api/config", timeout=10).read())
+    assert back["values"]["per"] == back["defaults"]["per"]
+    assert back["values"]["height"] == back["defaults"]["height"]
+
+
+def test_retry_progress_event_carries_attempt(monkeypatch, tmp_path):
+    """重試時要送進度事件，前端才知道「正在重試第 n 次」。"""
+    from vidgrab import media
+
+    monkeypatch.setattr(media.time, "sleep", lambda _s: None)
+    events = []
+    state = {"n": 0}
+
+    def flaky(cmd, on_progress=None, timeout=None):
+        state["n"] += 1
+        if state["n"] == 1:
+            return 1, "ERROR: HTTP Error 503: Service Unavailable"
+        stem = next((a for a in cmd if a.endswith(".%(ext)s")), "")
+        out = Path(stem.replace(".%(ext)s", ".mp4"))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"x" * 32)
+        return 0, ""
+
+    monkeypatch.setattr(media, "_run_stream", flaky)
+    monkeypatch.setattr(media, "ffprobe", lambda p: {"duration": 1.0})
+
+    media.grab_clip(_item_for_test(), 0, 5, tmp_path, label="t",
+                    on_progress=events.append)
+
+    retries = [e for e in events if e.get("retry")]
+    assert retries, "沒有送出重試事件"
+    assert retries[0]["retry"] == 1
+    assert retries[0]["max_retries"] == 10
+
+
+# ---------------------------------------------------------------- 前端功能覆蓋
+
+
+def _ts_bundle() -> str:
+    """所有前端原始碼合起來，用來確認某個功能還在。"""
+    import glob
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "web" / "src"
+    parts = []
+    for pat in ("*.tsx", "*.ts", "lib/*.ts", "components/*.tsx"):
+        for f in sorted(glob.glob(str(root / pat))):
+            parts.append(Path(f).read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
+def test_frontend_keeps_features_ported_from_legacy():
+    """舊版有的行為，React 版不能偷偷掉。
+
+    這些都是實際存在過的功能，改寫時漏掉會讓使用者「東西不見了」
+    卻沒有任何錯誤訊息（畫面就只是少了一塊）。
+    """
+    src = _ts_bundle()
+    wanted = {
+        "開機自動開第一個專案": "void openProject(list[0]!.name)",
+        "素材庫排序送後端": "action: 'sort'",
+        "拖曳後回到手動順序": "setLibSort('manual')",
+        "頂端進度條": "ProgressBar",
+        "下載時推開 log（body.dl-on）": "dl-on",
+        "影片解不開的提示": "這個格式瀏覽器可能不支援",
+        "重試次數顯示": "maxRetries",
+        "燈箱": "lightbox",
+        "掃描結果區": "libscanbox",
+        "改名": "renaming",
+    }
+    missing = [name for name, token in wanted.items() if token not in src]
+    assert not missing, f"這些功能不見了：{missing}"
+
+
+def test_download_retry_limit_is_ten_and_configurable():
+    """重試上限必須是 10，而且前端也要知道。"""
+    from vidgrab import media
+
+    assert media.MAX_DOWNLOAD_RETRIES == 10
+    assert "maxRetries" in _ts_bundle()
+
+
+def test_admin_ui_covers_every_config_group():
+    """admin UI 要能顯示所有分組（漏一組等於那些設定改不到）。"""
+    from vidgrab import config
+
+    groups = {f["group"] for f in config.describe()["fields"]}
+    src = _ts_bundle()
+    for g in groups:
+        assert g in src, f"admin UI 沒有「{g}」這組"

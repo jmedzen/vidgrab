@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d12'/%3E%3Cpath d='M9 8h4l3 9 3-9h4l-5.5 16h-3z' fill='%236cc0ff'/%3E%3C/svg%3E">
+<title>vidgrab · 素材獵人</title>
+<script>
+// 必須在第一次繪製之前跑，否則淺色主題會先閃一下深色
+(function () {
+  try {
+    var t = localStorage.getItem('vidgrab.theme');
+    if (!t && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) t = 'paper';
+    document.documentElement.dataset.theme = t || 'midnight';
+    var w = Number(localStorage.getItem('vidgrab.sidebar'));
+    if (w >= 240 && w <= 620 && window.innerWidth > 820) {
+      document.documentElement.style.setProperty('--sidebar', w + 'px');
+    }
+  } catch (e) {}
+})();
+</script>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

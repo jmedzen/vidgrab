@@ -45,7 +45,7 @@ where = ["src"]
 
 # 前端檔案要一起打包，否則 pip 裝完之後 /static/* 會 404
 [tool.setuptools.package-data]
-vidgrab = ["static/*"]
+vidgrab = ["static/*", "static/assets/*"]
 
 [tool.ruff]
 line-length = 110

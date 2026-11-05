@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 import unicodedata
 from dataclasses import dataclass, field, asdict
@@ -213,10 +215,24 @@ class Item:
 
 
 def write_json(path: Path, data: Any) -> None:
+    """原子寫入。
+
+    暫存檔名必須唯一：web 服務是多執行緒的，兩個請求同時寫同一個檔案時，
+    固定用 xxx.tmp 會互相踩 —— A 已經把 tmp rename 走，B 再 rename 就
+    FileNotFoundError（實際發生過：連按兩下釘選就會炸）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    fd, name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, ensure_ascii=False, indent=2))
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def read_json(path: Path, default: Any = None) -> Any:

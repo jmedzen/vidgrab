@@ -13,3 +13,7 @@ dist/
 .pytest_cache/
 config.json
 library.json
+
+# 前端（階段 1）：node_modules 不進版控，但打包產物要進
+web/node_modules/
+web/.vite/

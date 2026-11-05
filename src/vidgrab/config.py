@@ -177,9 +177,59 @@ def reset(keys: list[str] | None = None) -> dict[str, Any]:
     return save(current)
 
 
+# admin UI 用的說明與分組。key 一定要跟 DEFAULTS 對得上（有測試在盯）。
+FIELDS: dict[str, dict[str, Any]] = {
+    "platform": {"group": "搜尋", "label": "平台", "help": "要搜哪裡"},
+    "per_keyword": {"group": "搜尋", "label": "每字幾支", "min": 1, "max": 50,
+                    "help": "一個關鍵字抓幾支候選"},
+    "order": {"group": "搜尋", "label": "搜尋排列"},
+    "sort": {"group": "搜尋", "label": "結果排序", "help": "智慧＝授權＋熱度"},
+    "duration": {"group": "搜尋", "label": "長度級距"},
+    "min_duration": {"group": "搜尋", "label": "最短（分鐘）", "min": 0},
+    "max_duration": {"group": "搜尋", "label": "最長（分鐘，0＝不限）", "min": 0},
+    "fresh_days": {"group": "搜尋", "label": "最近 N 天（0＝不限）", "min": 0},
+    "min_views": {"group": "搜尋", "label": "最少觀看", "min": 0},
+    "exclude": {"group": "搜尋", "label": "排除詞", "help": "標題含這些就跳過"},
+    "only_free": {"group": "授權", "label": "只留授權明確的"},
+    "drop_reposts": {"group": "授權", "label": "丟掉轉載／非原始出處"},
+    "verify_license": {"group": "授權", "label": "逐支確認授權", "help": "慢，但準"},
+    "per": {"group": "下載", "label": "每段秒數", "min": 1},
+    "height": {"group": "下載", "label": "解析度"},
+    "audio": {"group": "下載", "label": "只要聲音"},
+    "audio_format": {"group": "下載", "label": "聲音格式"},
+    "frames": {"group": "下載", "label": "抓畫面"},
+    "frame_count": {"group": "下載", "label": "抓幾張", "min": 1, "max": 12},
+    "host": {"group": "服務", "label": "綁定位址",
+             "help": "非本機位址要加 --allow-lan 才給開"},
+    "port": {"group": "服務", "label": "埠號", "min": 1, "max": 65535},
+}
+
+
 def describe() -> dict[str, Any]:
+    """給 admin UI：當前值、預設值、型別、可選項、說明、檔案路徑。"""
+    values = load()
+    fields = []
+    for key, default in DEFAULTS.items():
+        meta = FIELDS.get(key, {})
+        item: dict[str, Any] = {
+            "key": key,
+            "group": meta.get("group", "其他"),
+            "label": meta.get("label", key),
+            "type": TYPES.get(key, type(default)).__name__,
+            "value": values.get(key, default),
+            "default": default,
+            "help": meta.get("help", ""),
+            "changed": values.get(key, default) != default,
+        }
+        if key in ENUMS:
+            item["options"] = sorted(ENUMS[key])
+        for bound in ("min", "max"):
+            if bound in meta:
+                item[bound] = meta[bound]
+        fields.append(item)
     return {
         "path": str(config_path()),
-        "values": load(),
+        "values": values,
         "defaults": DEFAULTS,
+        "fields": fields,
     }

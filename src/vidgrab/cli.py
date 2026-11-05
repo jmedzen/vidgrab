@@ -719,6 +719,14 @@ def cmd_test(args: argparse.Namespace) -> int:
 
     code = subprocess.call([sys.executable, "-m", "pytest", str(target), "-q"])
 
+    # 前端產物有沒跟上原始碼（改了 web/src 卻忘記 build 是最容易漏的一步）
+    frontend = root / "tools" / "check_frontend.sh"
+    if frontend.exists():
+        print()
+        rc = subprocess.call(["bash", str(frontend)])
+        if rc != 0 and code == 0:
+            code = rc
+
     # 順手檢查 Dockerfile：需要的檔案沒被 .dockerignore 排掉
     checker = root / "tools" / "check_docker.py"
     if checker.exists():
@@ -737,7 +745,9 @@ def cmd_test(args: argparse.Namespace) -> int:
             # --launch：沒偵測到 CDP 就自己起一個臨時 Chromium。
             # 注意這不是「幫你開瀏覽器看介面」——vidgrab 開介面用的是系統預設瀏覽器，
             # 這裡只是為了能下斷言而需要一個可遙控的 Chromium。
-            rc = subprocess.call([sys.executable, str(ui), "--launch"])
+            # --fixture：用假的素材庫起一個獨立實例，
+            # 這樣不會依賴、也不會弄壞真人正在用的 projects/
+            rc = subprocess.call([sys.executable, str(ui), "--launch", "--fixture"])
             if rc == 2:
                 print("! 介面檢查需要 Chromium 系瀏覽器（CDP），這台機器上找不到，已略過")
             elif rc != 0:
