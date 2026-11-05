@@ -188,19 +188,47 @@ def project_payload(project: Path) -> dict[str, Any]:
 
 
 def projects_payload() -> list[dict[str, Any]]:
+    """回傳素材庫清單：已套用改名、排序與釘選。"""
+    from . import library
+
     root = tasks.projects_root()
-    out = []
-    for p in sorted([p for p in root.glob("*") if (p / "manifest.json").exists()], reverse=True):
+    folders = sorted([p.name for p in root.glob("*") if (p / "manifest.json").exists()])
+
+    lib = library.load()
+    lib, changed = library.sync(lib, folders)
+    if changed:
+        library.save(lib)
+
+    stats: dict[str, dict[str, Any]] = {}
+    for p in [root / f for f in folders]:
         manifest, items = tasks.load_project(p)
-        out.append(
-            {
-                "name": p.name,
-                "queries": manifest.get("queries") or [],
-                "count": len(items),
-                "clips": sum(len(i.clips) for i in items),
-                "created": manifest.get("created") or "",
-            }
-        )
+        stats[p.name] = {
+            "queries": manifest.get("queries") or [],
+            "count": len(items),
+            "clips": sum(len(i.clips) for i in items),
+            "created": manifest.get("created") or "",
+            "bytes": sum(
+                int(c.get("size_bytes") or 0) for i in items for c in (i.clips or [])
+            ),
+        }
+
+    out = []
+    for folder in lib.get("order", []):
+        if folder not in stats:
+            continue
+        meta = library.entry(lib, folder)
+        st = stats[folder]
+        out.append({
+            "name": folder,
+            "title": meta["title"],
+            "pinned": meta["pinned"],
+            "note": meta["note"],
+            "queries": st["queries"],
+            "count": st["count"],
+            "clips": st["clips"],
+            "created": st["created"],
+            "size": human_size(st["bytes"]) if st["bytes"] else "",
+        })
     return out
 
 
@@ -378,6 +406,33 @@ OPENAPI: dict[str, Any] = {
                     ],
                     "responses": {"200": {"description": "OK"}}},
         },
+        "/api/library": {
+            "get": {"tags": ["project"], "summary": "素材庫（含改名、釘選、目前排序）",
+                    "responses": {"200": {"description": "OK"}}},
+            "post": {
+                "tags": ["project"],
+                "summary": "改名／釘選／排序／拖曳",
+                "requestBody": {
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["action"],
+                        "properties": {
+                            "action": {"type": "string",
+                                       "enum": ["rename", "pin", "order", "move", "sort"]},
+                            "project": {"type": "string", "description": "資料夾名"},
+                            "title": {"type": "string", "description": "rename 用"},
+                            "pinned": {"type": "boolean", "description": "pin 用"},
+                            "order": {"type": "array", "items": {"type": "string"}},
+                            "delta": {"type": "integer", "description": "move 用，-1 上移、1 下移"},
+                            "mode": {"type": "string",
+                                     "enum": ["manual", "created", "name", "clips", "count"]},
+                        },
+                    }}}
+                },
+                "responses": {"200": {"description": "回傳更新後的清單"},
+                              "400": {"description": "參數不合法"}},
+            },
+        },
         "/api/project/delete": {
             "post": {"tags": ["project"], "summary": "刪除整個專案（連同已下載檔案）",
                      "responses": {"200": {"description": "OK"}}},
@@ -506,6 +561,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, png.read_bytes(), "image/png")
             return
+        if route == "/api/library":
+            from . import library
+
+            lib = library.load()
+            self._json({
+                "projects": projects_payload(),
+                "order": lib.get("order", []),
+                "sort": lib.get("sort", "manual"),
+            })
+            return
         if route == "/api/config":
             from . import config as cfg
 
@@ -562,6 +627,44 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         route = urllib.parse.urlparse(self.path).path
         body = self._body()
+
+        if route == "/api/library":
+            from . import library
+
+            if not body:
+                self._json({"projects": projects_payload(), "order": library.load().get("order", [])})
+                return
+            action = body.get("action")
+            lib = library.load()
+            try:
+                if action == "rename":
+                    folder = body.get("project", "")
+                    if not self._project_dir(folder):
+                        self._json({"error": "找不到專案"}, 404)
+                        return
+                    library.rename(lib, folder, body.get("title", ""))
+                elif action == "pin":
+                    folder = body.get("project", "")
+                    if not self._project_dir(folder):
+                        self._json({"error": "找不到專案"}, 404)
+                        return
+                    library.set_pinned(lib, folder, bool(body.get("pinned")))
+                elif action == "order":
+                    library.set_order(lib, body.get("order") or [])
+                elif action == "move":
+                    library.move(lib, body.get("project", ""), int(body.get("delta") or 0))
+                elif action == "sort":
+                    stats = {p["name"]: p for p in projects_payload()}
+                    library.sort_by(lib, body.get("mode", "manual"), stats)
+                else:
+                    self._json({"error": f"不認得的動作：{action}"}, 400)
+                    return
+            except ValueError as exc:
+                self._json({"error": str(exc)}, 400)
+                return
+            library.save(lib)
+            self._json({"ok": True, "projects": projects_payload()})
+            return
 
         if route == "/api/config":
             from . import config as cfg
@@ -1084,6 +1187,7 @@ PAGE = r"""<!doctype html>
   .lic-free { color:var(--ok); border-color:currentColor; }
   .lic-check { color:var(--warn); border-color:currentColor; }
   .lic-unknown { color:var(--bad); border-color:currentColor; }
+  .licnote { color:var(--muted); font-size:11.5px; opacity:.85; }
   .toolbar {
     display:flex; gap:8px; align-items:center; flex-wrap:wrap;
     padding:10px 12px; background:var(--panel); border:1px solid var(--line);
@@ -1143,6 +1247,60 @@ PAGE = r"""<!doctype html>
   .lightbox { position:fixed; inset:0; background:var(--scrim); display:none; z-index:100; align-items:center; justify-content:center; cursor:zoom-out; }
   .lightbox img, .lightbox video { max-width:92vw; max-height:92vh; border-radius:10px; }
   .lightbox.show { display:flex; }
+
+
+  /* ---- 素材庫（大型面板） ---- */
+  .libmodal {
+    position:fixed; inset:0; z-index:110; display:none;
+    background:var(--scrim); backdrop-filter:blur(3px);
+    align-items:center; justify-content:center; padding:24px;
+  }
+  .libmodal.show { display:flex; }
+  .libpanel {
+    width:min(1280px, 100%); max-height:90vh; display:flex; flex-direction:column;
+    background:var(--panel); border:1px solid var(--line); border-radius:16px;
+    box-shadow:var(--shadow); overflow:hidden;
+  }
+  .libhead {
+    display:flex; align-items:center; gap:12px; padding:16px 20px;
+    border-bottom:1px solid var(--line); flex-wrap:wrap;
+  }
+  .libhead h2 { margin:0; font-size:17px; letter-spacing:.03em; }
+  .libhead .count { color:var(--muted); font-size:12.5px; }
+  .libhead .grow { flex:1; }
+  .libhead select, .libhead button { width:auto; }
+  .libbody { overflow-y:auto; padding:16px 20px 22px; }
+
+  .libgrid { display:grid; gap:12px; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); }
+  .libcard {
+    position:relative; background:var(--card-bg); border:1px solid var(--line);
+    border-radius:12px; padding:14px; cursor:pointer; transition:.15s;
+    display:flex; flex-direction:column; gap:8px;
+  }
+  .libcard:hover { border-color:var(--accent); transform:translateY(-1px); }
+  .libcard.current { border-color:var(--accent); background:var(--accent-soft); }
+  .libcard.dragging { opacity:.45; }
+  .libcard.drop-target { border-color:var(--accent); border-style:dashed; }
+  .libcard .lctitle {
+    font-size:14.5px; font-weight:600; line-height:1.35;
+    display:flex; align-items:flex-start; gap:7px; word-break:break-word;
+  }
+  .libcard .pinmark { color:var(--accent); flex:none; }
+  .libcard .lcmeta { color:var(--muted); font-size:12px; display:flex; gap:10px; flex-wrap:wrap; }
+  .libcard .lcqueries {
+    color:var(--muted); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .libcard .lcactions {
+    display:flex; gap:6px; margin-top:auto; padding-top:8px;
+    border-top:1px solid var(--line); opacity:.72; transition:.15s;
+  }
+  .libcard:hover .lcactions, .libcard:focus-within .lcactions { opacity:1; }
+  .libcard .lcactions button { flex:1; padding:4px 6px; font-size:11.5px; }
+  .libcard input.renaming {
+    font-size:14px; font-weight:600; padding:5px 8px; width:100%;
+  }
+  .libempty { text-align:center; color:var(--muted); padding:56px 20px; }
+  .libempty .big { font-size:34px; margin-bottom:10px; opacity:.5; }
 
   /* ---- 播放器 ---- */
   .player {
@@ -1284,7 +1442,9 @@ PAGE = r"""<!doctype html>
     <div class="hint" style="margin-top:8px">長度預設 10 分鐘以上，適合找可反覆取用的長素材。</div>
 
     <div class="proj-list">
-      <h3>我的素材專案</h3>
+      <h3>我的素材專案
+        <button class="mini" id="openlib" title="展開素材庫">⤢ 展開</button>
+      </h3>
       <div id="projects"></div>
     </div>
     <div class="resizer" id="resizer" role="separator" aria-orientation="vertical"
@@ -1320,6 +1480,25 @@ PAGE = r"""<!doctype html>
     <p>手機 B 站 App →「我的」→ 右上角「掃一掃」<br>掃完在手機上按確認</p>
     <img id="qrimg" alt="B 站登入 QR">
     <div class="stat" id="loginstat">等待掃碼…</div>
+  </div>
+</div>
+
+<div class="libmodal" id="libmodal" role="dialog" aria-modal="true" aria-labelledby="libtitle">
+  <div class="libpanel">
+    <div class="libhead">
+      <h2 id="libtitle">我的素材專案</h2>
+      <span class="count" id="libcount"></span>
+      <span class="grow"></span>
+      <select id="libsort" title="排序方式" style="width:150px">
+        <option value="manual">手動順序</option>
+        <option value="created">建立時間</option>
+        <option value="name">名稱</option>
+        <option value="clips">片段數</option>
+        <option value="count">候選數</option>
+      </select>
+      <button class="ghost tiny" id="libclose">關閉</button>
+    </div>
+    <div class="libbody"><div class="libgrid" id="libgrid"></div></div>
   </div>
 </div>
 
@@ -1499,14 +1678,203 @@ async function api(path, opts) {
   return data;
 }
 
+
+// ------------------------------------------------------------ 素材庫面板
+let LIB = [];          // 目前清單
+let LIBDRAG = null;    // 拖曳中的資料夾
+
+function libVisible() {
+  const m = $('#libmodal');
+  return m && m.classList.contains('show');
+}
+
+async function openLibrary() {
+  $('#libmodal').classList.add('show');
+  renderLibrary();
+  // 排序模式存在伺服器，重新載入或換瀏覽器都一致
+  try {
+    const lib = await api('/api/library');
+    if (lib && lib.sort) $('#libsort').value = lib.sort;
+  } catch (e) { /* 讀不到就用預設 */ }
+}
+
+function closeLibrary() {
+  $('#libmodal').classList.remove('show');
+  LIBDRAG = null;
+}
+
+async function renderLibrary() {
+  try { LIB = await api('/api/projects'); } catch (e) { LIB = []; }
+  const grid = $('#libgrid');
+  $('#libcount').textContent = LIB.length ? `${LIB.length} 個專案` : '';
+
+  if (!LIB.length) {
+    grid.innerHTML = `<div class="libempty" style="grid-column:1/-1">
+      <div class="big">📁</div>還沒有素材專案。<br>在左邊打關鍵字搜一輪，就會出現在這裡。
+    </div>`;
+    return;
+  }
+
+  grid.innerHTML = LIB.map((p, i) => {
+    const cur = CURRENT && CURRENT.name === p.name;
+    return `
+    <div class="libcard ${cur ? 'current' : ''}" data-name="${esc(p.name)}" data-i="${i}"
+         draggable="true" tabindex="0">
+      <div class="lctitle">
+        ${p.pinned ? '<span class="pinmark" title="已釘選">📌</span>' : ''}
+        <span class="lctext">${esc(p.title || p.name)}</span>
+      </div>
+      <div class="lcmeta">
+        <span>${p.count} 支</span>
+        <span>${p.clips} 段</span>
+        ${p.size ? `<span>${esc(p.size)}</span>` : ''}
+        ${p.created ? `<span>${esc(p.created.slice(0, 10))}</span>` : ''}
+      </div>
+      <div class="lcqueries">${esc((p.queries || []).join('、') || '—')}</div>
+      <div class="lcactions">
+        <button class="mini" data-act="open">開啟</button>
+        <button class="mini" data-act="rename">改名</button>
+        <button class="mini" data-act="pin">${p.pinned ? '取消釘選' : '釘選'}</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  grid.querySelectorAll('.libcard').forEach(card => {
+    const name = card.dataset.name;
+    card.onclick = (e) => {
+      if (e.target.closest('[data-act]')) return;
+      pickProject(name);
+    };
+    card.querySelectorAll('[data-act]').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const act = btn.dataset.act;
+        if (act === 'open') pickProject(name);
+        else if (act === 'rename') startRename(card, name);
+        else if (act === 'pin') await togglePin(name);
+      };
+    });
+    card.ondblclick = (e) => {
+      if (e.target.closest('[data-act]')) return;
+      startRename(card, name);
+    };
+
+    // 拖曳排序
+    card.ondragstart = (e) => {
+      LIBDRAG = name;
+      card.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', name);
+    };
+    card.ondragend = () => {
+      LIBDRAG = null;
+      card.classList.remove('dragging');
+      document.querySelectorAll('.libcard').forEach(c => c.classList.remove('drop-target'));
+    };
+    card.ondragover = (e) => {
+      if (!LIBDRAG || LIBDRAG === name) return;
+      e.preventDefault();
+      card.classList.add('drop-target');
+    };
+    card.ondragleave = () => card.classList.remove('drop-target');
+    card.ondrop = async (e) => {
+      e.preventDefault();
+      card.classList.remove('drop-target');
+      if (!LIBDRAG || LIBDRAG === name) return;
+      const order = LIB.map(x => x.name).filter(n => n !== LIBDRAG);
+      const at = order.indexOf(name);
+      order.splice(at < 0 ? order.length : at, 0, LIBDRAG);
+      await saveOrder(order);
+    };
+  });
+}
+
+function pickProject(name) {
+  closeLibrary();
+  openProject(name);
+}
+
+async function togglePin(name) {
+  const p = LIB.find(x => x.name === name);
+  if (!p) return;
+  await libAction('pin', {project: name, pinned: !p.pinned});
+  toast(p.pinned ? '已取消釘選' : '已釘選，會排在最前面');
+}
+
+async function libAction(action, extra = {}) {
+  const res = await api('/api/library', {
+    method: 'POST',
+    body: JSON.stringify({action, ...extra}),
+  });
+  if (res && res.projects) LIB = res.projects;
+  await renderLibrary();
+  return res;
+}
+
+async function saveOrder(order) {
+  // 手動拖曳 = 使用者自己決定順序，排序模式要跟著回到 manual
+  $('#libsort').value = 'manual';
+  await libAction('order', {order});
+}
+
+function startRename(card, name) {
+  const target = card.querySelector('.lctext');
+  if (!target || card.querySelector('input.renaming')) return;
+  const current = target.textContent;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'renaming';
+  input.value = current;
+  input.maxLength = 120;
+  target.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const commit = async () => {
+    if (done) return;
+    done = true;
+    const title = input.value.trim();
+    if (!title || title === current) { await renderLibrary(); return; }
+    try {
+      await libAction('rename', {project: name, title});
+      toast('已改名為「' + title + '」');
+    } catch (e) {
+      toast('改名失敗：' + e.message);
+      await renderLibrary();
+    }
+  };
+  input.onblur = commit;
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+    if (e.key === 'Escape') { done = true; input.value = current; renderLibrary(); }
+  };
+}
+
+function initLibrary() {
+  $('#openlib').onclick = openLibrary;
+  $('#libclose').onclick = closeLibrary;
+  const modal = $('#libmodal');
+  modal.onclick = (e) => { if (e.target === modal) closeLibrary(); };
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && libVisible()) closeLibrary();
+  });
+  $('#libsort').onchange = async (e) => {
+    const mode = e.target.value;
+    await libAction('sort', {mode});
+    toast(mode === 'manual' ? '已切回手動順序' : '已依「' + e.target.selectedOptions[0].text + '」排序');
+  };
+}
+
 // ------------------------------------------------------------ 專案列表
 async function loadProjects() {
   const list = await api('/api/projects');
   const box = $('#projects');
   if (!list.length) { box.innerHTML = '<div class="hint">還沒有專案</div>'; return; }
   box.innerHTML = list.map(p => `
-    <div class="proj ${CURRENT && CURRENT.name === p.name ? 'active' : ''}" data-name="${esc(p.name)}">
-      <span>${esc((p.queries || []).join('、') || p.name)}</span>
+    <div class="proj ${CURRENT && CURRENT.name === p.name ? 'active' : ''}" data-name="${esc(p.name)}"
+         title="${esc((p.queries || []).join('、'))}">
+      <span>${p.pinned ? '📌 ' : ''}${esc(p.title || p.name)}</span>
       <small>${p.count}支 / ${p.clips}段</small>
     </div>`).join('');
   box.querySelectorAll('.proj').forEach(el => el.onclick = () => openProject(el.dataset.name));
@@ -1525,8 +1893,17 @@ async function openProject(name) {
 function render() {
   if (!CURRENT) return;
   const s = CURRENT.stats;
-  const lic = Object.entries(s.by_license || {}).map(([k, v]) =>
-    `<span class="pill ${LIC_CLASS[k] || 'lic-unknown'}">${esc(k)} · ${v}</span>`).join('');
+  // 授權統計：用中文標籤，把「未知」獨立成一句灰字，不要佔一排膠囊
+  const LIC_LABEL = {free:'可自由使用', 'free-attribution':'可用需標註',
+                     check:'需確認授權', unknown:'未知', none:'無資訊'};
+  const licEntries = Object.entries(s.by_license || {});
+  const knownLic = licEntries.filter(([k]) => k !== 'unknown' && k !== 'none');
+  const unknownCount = licEntries
+    .filter(([k]) => k === 'unknown' || k === 'none')
+    .reduce((a, [, v]) => a + v, 0);
+  const lic = knownLic.map(([k, v]) =>
+    `<span class="pill ${LIC_CLASS[k] || 'lic-unknown'}">${esc(LIC_LABEL[k] || k)} · ${v}</span>`).join('')
+    + (unknownCount ? `<span class="licnote">${unknownCount} 支未標示授權</span>` : '');
   const items = CURRENT.items || [];
 
   const cards = items.map(it => {
@@ -1547,6 +1924,8 @@ function render() {
           </div>`).join('')}</div>`
       : '';
     const licenseCls = LIC_CLASS[it.license_kind] || 'lic-unknown';
+    // 「未知」幾乎每支都是，掛在每張卡片上等於雜訊 → 只有真的查出授權才顯示膠囊
+    const showLicense = it.license_kind && it.license_kind !== 'unknown';
     const notes = [];
     if (it.repost) notes.push('轉載／非原始出處');
     if (it.note) notes.push(it.note);
@@ -1562,7 +1941,7 @@ function render() {
             <span>時長 <b>${esc(it.duration)}</b></span>
             <span>觀看 <b>${esc(it.views_label)}</b></span>
             <span>${esc(it.pubdate || '—')}</span>
-            <span class="pill ${licenseCls}">${esc(it.license_short)}</span>
+            ${showLicense ? `<span class="pill ${licenseCls}">${esc(it.license_short)}</span>` : ''}
           </div>
           ${thumbs}
           ${notes.length ? `<div class="warnline">⚠ ${esc(notes.join('；'))}</div>` : ''}
@@ -1940,6 +2319,7 @@ async function boot() {
   initTheme();
   initResizer();
   initPlayer();
+  initLibrary();
   showBuild();
   await loadProjects();
   try {

@@ -312,3 +312,176 @@ def test_openapi_covers_readme_endpoints(web):
     normalised = {p.split("{")[0].rstrip("/") for p in paths}
     missing = [r for r in referenced if r.split("{")[0].rstrip("/") not in normalised]
     assert not missing, f"README 提到但 OpenAPI 沒有：{missing}"
+
+
+# ---------------------------------------------------------------- 素材庫
+
+
+def _lib(order, pinned=()):
+    return {"order": list(order), "items": {f: {"pinned": f in pinned} for f in order}}
+
+
+def test_library_sync_adds_and_drops(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import library
+
+    data, changed = library.sync({"order": [], "items": {}}, ["a", "b"])
+    assert changed and data["order"] == ["a", "b"]
+
+    data, changed = library.sync(data, ["b", "c"])  # a 被刪了、c 是新的
+    assert changed
+    assert set(data["order"]) == {"b", "c"}
+    assert "a" not in data["items"]
+
+
+def test_library_rename_and_pin(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import library
+
+    data = _lib(["a"])
+    library.rename(data, "a", "我的素材")
+    assert library.entry(data, "a")["title"] == "我的素材"
+
+    library.set_pinned(data, "a", True)
+    assert library.entry(data, "a")["pinned"] is True
+
+    with pytest.raises(ValueError):
+        library.rename(data, "a", "   ")
+    with pytest.raises(ValueError):
+        library.rename(data, "a", "x" * 200)
+
+
+def test_library_pin_always_first():
+    from vidgrab import library
+
+    data = _lib(["a", "b", "c"], pinned={"c"})
+    library.set_order(data, ["a", "b", "c"])
+    assert data["order"][0] == "c", "釘選的必須排最前"
+
+    data = _lib(["a", "b", "c"], pinned={"c"})
+    library.move(data, "a", -1)  # 未釘選的不能越過釘選
+    assert data["order"][0] == "c"
+
+
+def test_library_move_keeps_regions():
+    from vidgrab import library
+
+    data = _lib(["a", "b", "c", "d"], pinned={"a", "c"})
+    library.move(data, "d", -1)
+    assert data["order"] == ["a", "c", "d", "b"]
+    assert set(data["order"][:2]) == {"a", "c"}, "釘選區不能被未釘選的擠開"
+
+
+def test_library_sort_pinned_first():
+    from vidgrab import library
+
+    data = _lib(["a", "b", "c"], pinned={"b"})
+    stats = {"a": {"created": "20260101"}, "b": {"created": "20250101"}, "c": {"created": "20240101"}}
+    library.sort_by(data, "created", stats)
+    assert data["order"][0] == "b"
+    assert data["order"][1:] == ["a", "c"]
+
+    with pytest.raises(ValueError):
+        library.sort_by(data, "nonsense", stats)
+
+
+def test_library_persists(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import library
+
+    data = _lib(["a", "b"])
+    library.rename(data, "a", "改過的名字")
+    library.save(data)
+
+    again = library.load()
+    assert library.entry(again, "a")["title"] == "改過的名字"
+    assert again["order"] == ["a", "b"]
+
+
+def test_library_corrupt_file_is_safe(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    (tmp_path / "projects").mkdir(parents=True)
+    (tmp_path / "projects" / "library.json").write_text("{ 壞掉的 json", encoding="utf-8")
+
+    from vidgrab import library
+
+    data = library.load()
+    assert data["order"] == [] and data["items"] == {}
+
+
+def test_api_library_endpoints(web):
+    import urllib.request
+
+    def post(payload):
+        req = urllib.request.Request(
+            web + "/api/library", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+
+    # 沒有專案時是空清單
+    assert get(web + "/api/library")["projects"] == []
+
+    # 不認得的動作要擋下來
+    import urllib.error
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post({"action": "hack"})
+    assert exc.value.code == 400
+
+
+def test_library_sort_mode_persists(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import library
+
+    data = _lib(["a", "b"])
+    library.sort_by(data, "name", {})
+    assert data["sort"] == "name"
+
+    # 手動拖曳後，模式要回到 manual
+    library.set_order(data, ["b", "a"])
+    assert data["sort"] == "manual"
+
+    library.save(data)
+    assert library.load()["sort"] == "manual"
+
+
+@pytest.mark.parametrize("mode", ["manual", "name", "created", "clips", "count"])
+def test_pin_first_invariant_all_modes(mode):
+    """不管用哪種排序，釘選的永遠排在未釘選的前面。"""
+    from vidgrab import library
+
+    data = _lib(["a", "b", "c", "d"], pinned={"c"})
+    stats = {
+        "a": {"created": "20260101", "clips": 1, "count": 10, "title": "aaa"},
+        "b": {"created": "20250101", "clips": 3, "count": 30, "title": "bbb"},
+        "c": {"created": "20240101", "clips": 0, "count": 1, "title": "ccc"},
+        "d": {"created": "20230101", "clips": 9, "count": 90, "title": "ddd"},
+    }
+    library.sort_by(data, mode, stats)
+    flags = [data["items"][f]["pinned"] for f in data["order"]]
+    first_unpinned = flags.index(False) if False in flags else len(flags)
+    assert all(flags[:first_unpinned]), f"{mode} 排序後釘選的沒有排在最前：{data['order']}"
+
+
+def test_pin_moves_to_front_immediately():
+    """釘選後必須立刻排到最前，否則會出現「已釘選卻在後面」的矛盾。"""
+    from vidgrab import library
+
+    data = _lib(["a", "b", "c"])
+    library.set_pinned(data, "c", True)
+    assert data["order"][0] == "c", f"釘選後沒排到最前：{data['order']}"
+
+    flags = [data["items"][f]["pinned"] for f in data["order"]]
+    first_unpinned = flags.index(False) if False in flags else len(flags)
+    assert all(flags[:first_unpinned])
+
+
+def test_unpin_keeps_order_sane():
+    from vidgrab import library
+
+    data = _lib(["a", "b", "c"], pinned={"c"})
+    library.set_pinned(data, "c", False)
+    assert set(data["order"]) == {"a", "b", "c"}
+    assert not any(data["items"][f]["pinned"] for f in data["order"])

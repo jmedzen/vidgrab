@@ -88,6 +88,16 @@ brew install ffmpeg uv
 
 播放器顯示解析度與長度；按 **關閉** 收起。整支下載的檔案標示為「整支」，切片則標示實際區間（如 `1:00–1:15`）。
 
+### 素材庫（大型面板）
+
+側欄的「我的素材專案」按 **⤢ 展開**，會打開一個大面板，一次看清所有專案：
+卡片上有支數、已下載段數、佔用空間、建立日期。
+
+- **改名**：雙擊卡片，或按「改名」。名稱只是顯示用的標籤，**資料夾不會被搬動**，下載紀錄與片段路徑完全不受影響
+- **釘選**：按「釘選」，重要的專案永遠排在最前面（任何排序方式下都成立）
+- **排序**：手動順序／建立時間／名稱／片段數／候選數。手動拖曳卡片就能改順序，拖過之後自動切回「手動」
+- 排序方式存在伺服器（`library.json`），換瀏覽器、重開容器都一樣
+
 ### 主題與側欄
 
 右上角的 ◐ 按鈕切換主題，六組分別是：
@@ -254,6 +264,8 @@ curl -s -X POST http://127.0.0.1:8310/api/config \
 | GET | `/api/projects` | 所有專案索引 |
 | GET | `/api/project/{name}` | 單一專案（含候選與已下載片段） |
 | GET | `/api/item/{name}/{i}` | 單一候選影片 |
+| GET | `/api/library` | 素材庫（改名／釘選／排序後的清單） |
+| POST | `/api/library` | 改名、釘選、排序、拖曳（見下） |
 | POST | `/api/project/delete` | 刪除整個專案 |
 | POST | `/api/delete-clip` | 刪除單一片段檔 |
 | POST | `/api/refresh` | 重新確認授權（回 `job`） |
@@ -265,6 +277,28 @@ curl -s -X POST http://127.0.0.1:8310/api/config \
 | POST | `/api/login/logout` | 登出 |
 | POST | `/api/open` | 用瀏覽器打開 HTML 清單 |
 | GET | `/file/{專案}/{路徑}` | 取回片段或縮圖（支援 Range） |
+
+`/api/library` 的動作：
+
+```bash
+# 改名（只改顯示名稱，不動資料夾）
+curl -X POST http://127.0.0.1:8310/api/library -H 'Content-Type: application/json' \
+  -d '{"action":"rename","project":"20261105-台北_街景","title":"台北街景素材"}'
+
+# 釘選（永遠排最前）
+curl -X POST http://127.0.0.1:8310/api/library -H 'Content-Type: application/json' \
+  -d '{"action":"pin","project":"20261105-台北_街景","pinned":true}'
+
+# 排序：manual / created / name / clips / count
+curl -X POST http://127.0.0.1:8310/api/library -H 'Content-Type: application/json' \
+  -d '{"action":"sort","mode":"clips"}'
+
+# 手動指定順序，或上／下移一格
+curl -X POST http://127.0.0.1:8310/api/library -H 'Content-Type: application/json' \
+  -d '{"action":"order","order":["專案A","專案B"]}'
+curl -X POST http://127.0.0.1:8310/api/library -H 'Content-Type: application/json' \
+  -d '{"action":"move","project":"專案A","delta":-1}'
+```
 
 > 在 `/api/search` 或 `/api/pick` 帶 `save_settings: true`，
 > 這次呼叫用的參數就會同時變成預設值。
@@ -306,6 +340,9 @@ docker exec vidgrab vidgrab build                 # 確認跑的是哪次建置
 要嘛只用短片段、以評論或教學形式引用，並在影片說明標明出處、作者、原片連結。
 `index.html` 底部也寫了同樣的提醒。
 
+介面上不再對每支影片掛「未知」膠囊（幾乎每支都是，掛了等於雜訊）。
+只有真的查出授權的才會顯示標籤；其餘在清單上方用一句「N 支未標示授權」帶過。
+
 ---
 
 ## 版本與 build number
@@ -339,6 +376,7 @@ src/vidgrab/
 ├── sources.py   B 站 wbi 簽名搜尋、YouTube yt-dlp 搜尋
 ├── media.py     下載、切片、抓畫面
 ├── config.py    持久化設定
+├── library.py   素材庫（改名／排序／釘選）
 ├── auth.py      B 站掃碼登入
 ├── report.py    HTML／CSV 清單
 └── models.py    資料結構與工具

@@ -16,6 +16,12 @@ import websocket
 CDP = "http://127.0.0.1:9222"
 
 
+def get(url: str):
+    """讀一個 JSON 端點（測試裡用來對照前後狀態）。"""
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
 def new_tab(url: str) -> str:
     req = urllib.request.Request(f"{CDP}/json/new?{urllib.parse.quote(url, safe='')}", method="PUT")
     with urllib.request.urlopen(req, timeout=10) as resp:
@@ -185,6 +191,13 @@ def main() -> int:
     check("重新載入後記得寬度", wr == 420, f"{wr}px")
 
     print("── 播放器")
+    # 先確定開的是「有片段」的專案，否則沒東西可播（不該誤判成功能壞掉）
+    tab.js("""(async () => {
+      const list = await api('/api/projects');
+      const withClips = list.find(p => p.clips > 0);
+      if (withClips) await openProject(withClips.name);
+    })()""", await_promise=True)
+    time.sleep(2.5)
     # 有没有片段可以播
     clips = tab.js("""JSON.stringify((() => {
       const rows = [...document.querySelectorAll('[data-play]')].map(e => e.dataset.play);
@@ -222,6 +235,100 @@ def main() -> int:
         time.sleep(0.4)
         vis = tab.js("getComputedStyle(document.querySelector('#player')).display")
         check("關閉播放器", vis == "none", vis)
+
+    print("── 素材庫面板")
+    # 先從 API 取狀態（面板還沒開，DOM 是空的），測完再還原
+    snap = get("http://127.0.0.1:8310/api/projects")
+    before = {p["name"]: {"title": p["title"], "pinned": p["pinned"]} for p in snap}
+    tab.js("openLibrary()")
+    time.sleep(1.2)
+    opened = tab.js("getComputedStyle(document.querySelector('#libmodal')).display !== 'none'")
+    check("面板打開", opened)
+
+    cards = tab.js("document.querySelectorAll('#libgrid .libcard').length")
+    check("列出專案", (cards or 0) > 0, f"{cards} 個")
+
+    if cards and cards > 0:
+        first = tab.js("document.querySelector('#libgrid .libcard').dataset.name")
+        orig = tab.js("document.querySelector('#libgrid .libcard .lctext').textContent")
+
+        # 改名
+        tab.js("document.querySelector('#libgrid .libcard [data-act=rename]').click()")
+        time.sleep(0.4)
+        has_input = tab.js("!!document.querySelector('#libgrid input.renaming')")
+        check("改名輸入框出現", has_input)
+        if has_input:
+            tab.js("""
+              const inp = document.querySelector('#libgrid input.renaming');
+              inp.value = '自動測試名稱';
+              inp.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));
+              inp.blur();
+            """)
+            time.sleep(1.5)
+            titles = tab.js("JSON.stringify([...document.querySelectorAll('#libgrid .lctext')].map(e=>e.textContent))")
+            check("改名生效", "自動測試名稱" in (titles or ""), str(titles))
+            # 還原，讓測試可以重複跑
+            tab.js(f"""(async () => {{
+              await api('/api/library', {{method:'POST', body: JSON.stringify(
+                {{action:'rename', project:{json.dumps(first)}, title:{json.dumps(orig)}}})}});
+            }})()""", await_promise=True)
+            time.sleep(0.8)
+
+        # pin：切換後狀態必須改變，且釘選的要排最前
+        was_pinned = tab.js(f"""(() => {{
+          const c = document.querySelector('#libgrid .libcard[data-name="{first}"]');
+          return !!c && !!c.querySelector('.pinmark');
+        }})()""")
+        tab.js(f"""document.querySelector('#libgrid .libcard[data-name="{first}"] [data-act=pin]').click()""")
+        time.sleep(1.5)
+        now_pinned = tab.js(f"""(() => {{
+          const c = document.querySelector('#libgrid .libcard[data-name="{first}"]');
+          return !!c && !!c.querySelector('.pinmark');
+        }})()""")
+        check("釘選可切換", now_pinned != was_pinned, f"{was_pinned} → {now_pinned}")
+        if now_pinned:
+            first_pinned = tab.js("!!document.querySelector('#libgrid .libcard .pinmark')")
+            check("釘選排在最前", first_pinned)
+
+    # 排序選單
+    sorts = tab.js("JSON.stringify([...document.querySelectorAll('#libsort option')].map(o=>o.value))")
+    check("有四種以上排序方式", len(json.loads(sorts or "[]")) >= 4, str(sorts))
+    tab.js("""
+      const sel = document.querySelector('#libsort');
+      sel.value = 'name';
+      sel.dispatchEvent(new Event('change', {bubbles:true}));
+    """)
+    time.sleep(1.5)
+    check("切換排序不報錯", not any("libsort" in e or "sort" in e.lower() for e in tab.errors))
+
+    tab.js("closeLibrary()")
+    time.sleep(0.4)
+    closed = tab.js("getComputedStyle(document.querySelector('#libmodal')).display === 'none'")
+    check("面板關閉", closed)
+
+    # 還原成進來的樣子
+    if before:
+        import urllib.request as _ur
+        for name, meta in before.items():
+            for payload in (
+                {"action": "rename", "project": name, "title": meta["title"]},
+                {"action": "pin", "project": name, "pinned": meta["pinned"]},
+            ):
+                req = _ur.Request(
+                    "http://127.0.0.1:8310/api/library",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                try:
+                    _ur.urlopen(req, timeout=5).read()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    print("── 授權膠囊")
+    pills = tab.js("JSON.stringify([...document.querySelectorAll('.card .meta .pill')].map(e=>e.textContent.trim()))")
+    check("卡片上沒有「未知」膠囊", "未知" not in (pills or ""), str(pills))
+    note = tab.js("document.querySelector('.licnote') ? document.querySelector('.licnote').textContent : ''")
+    check("未標示授權改成一句說明", "未標示" in (note or ""), str(note))
 
     print("── 沒有 JS 錯誤")
     real_errors = [e for e in tab.errors if e and "favicon" not in e.lower()]
