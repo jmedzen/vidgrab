@@ -257,6 +257,7 @@ def run_pick(
 
     clips_dir = project / "clips"
     frames_dir = project / "frames"
+    thumb_dir = project / "thumbs"
     grabbed = 0
     order = list(indexes)  # 預先算好位置，進度回呼會很頻繁
     for n in order:
@@ -377,10 +378,25 @@ def run_pick(
             ]
             from .models import clip_id
 
+            # 每個片段下載完就立刻抽一格縮圖。
+            # 縮圖一定從這個片段檔本身抽，所以畫面必然對得上
+            # （以前是去整支影片的均勻位置抓，跟片段毫無關係）。
+            cid = clip_id(item.platform, item.vid, start, end)
+            thumb_path = thumb_dir / f"{_safe_name(cid)}.jpg"
+            thumb = None
+            try:
+                got_thumb = media.thumb_from_clip(Path(info["path"]), thumb_path)
+                thumb = str(got_thumb) if got_thumb else None
+            except Exception:  # noqa: BLE001
+                thumb = None
+            if not thumb:
+                emit("     ▣ 縮圖沒抽出來（片段仍然可用）")
+
             item.clips.append(
                 {
-                    "id": clip_id(item.platform, item.vid, start, end),
+                    "id": cid,
                     "asset_id": item.asset_id(),
+                    "thumb": thumb,
                     "path": info["path"],
                     "start": start,
                     "end": end,
@@ -412,6 +428,17 @@ def run_pick(
     return {"project": project, "grabbed": grabbed, "items": items}
 
 
+def _safe_name(text: str) -> str:
+    """把 clip id 變成安全的檔名。
+
+    `bilibili:BV1xx#30-45` 的 `:` 和 `#` 在檔名裡會出問題，換成 `_`。
+    """
+    out = []
+    for ch in str(text):
+        out.append(ch if (ch.isalnum() or ch in "-_.") else "_")
+    return "".join(out) or "clip"
+
+
 def _emit_over(emit, text: str, payload: dict | None = None) -> None:
     """進度用「覆寫同一行」的方式送出，避免日誌被幾百行洗掉。
 
@@ -434,3 +461,43 @@ def _auto_point(item: Item, per: float) -> float:
         return 0.0
     start = max(3.0, dur * 0.12)
     return max(0.0, min(start, dur - per - 1)) if dur > per + 2 else 0.0
+
+
+def backfill_thumbs(project: Path, *, emit=print) -> dict:
+    """幫已經下載好的片段補縮圖。
+
+    縮圖是後來才加的功能，舊專案的片段沒有。
+    這裡從片段檔本身抽，所以畫面一定對得上，不會出現「圖文不符」。
+    """
+    from .media import thumb_from_clip
+
+    manifest, items = load_project(project)
+    thumb_dir = project / "thumbs"
+    made = kept = failed = 0
+
+    for item in items:
+        for clip in item.clips:
+            cid = clip.get("id") or ""
+            path = Path(clip.get("path") or "")
+            if not cid or not path.exists():
+                failed += 1
+                continue
+            dest = thumb_dir / f"{_safe_name(cid)}.jpg"
+            existing = clip.get("thumb")
+            if existing and Path(existing).exists():
+                kept += 1
+                continue
+            try:
+                got = thumb_from_clip(path, dest)
+            except Exception:  # noqa: BLE001
+                got = None
+            if got:
+                clip["thumb"] = str(got)
+                made += 1
+            else:
+                failed += 1
+
+    if made:
+        save_project(project, manifest, items)
+    emit(f"  縮圖：新增 {made}、已存在 {kept}、失敗 {failed}")
+    return {"made": made, "kept": kept, "failed": failed}

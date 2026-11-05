@@ -59,6 +59,9 @@ def clip_summary(clip: dict[str, Any], root: Path, item: Item | None = None) -> 
             else "landscape" if clip.get("width") else ""
         ),
         "cached": bool(clip.get("cached")),
+        # 縮圖路徑：任務清單要看到畫面，就得把這個帶出去
+        "thumb": _rel_or_abs(clip.get("thumb") or "", root),
+        "has_thumb": bool(clip.get("thumb")) and Path(clip["thumb"]).exists(),
     }
 
 

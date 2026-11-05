@@ -292,6 +292,47 @@ def probe_frames(item: Item, outdir: Path, n: int = 3, opts: GrabOptions | None 
     return frames
 
 
+def thumb_from_clip(clip_path: Path, dest: Path, at: float | None = None,
+                    width: int = 640) -> Path | None:
+    """從**已經下載好的片段**抽一格當縮圖。
+
+    這是唯一能保證「縮圖就是這個片段」的做法。
+    原本的做法是另外去整支影片均勻位置抓 3 格——那些畫面對不對得上
+    全靠運氣（實測：片段在 30–75 秒，抓的卻是 914/1827/2740 秒）。
+    """
+    clip_path = Path(clip_path)
+    if not clip_path.exists():
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+
+    where = 0.5 if at is None else max(0.0, float(at))
+    if at is None:
+        # 取片段中間：+-0.2 秒內多半是黑場或轉場，中間最安全
+        dur = 0.0
+        try:
+            dur = float(ffprobe(clip_path).get("duration") or 0)
+        except Exception:  # noqa: BLE001
+            dur = 0.0
+        where = dur / 2 if dur > 0.4 else 0.0
+
+    proc = _run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-ss", f"{where:.2f}", "-i", str(clip_path),
+            "-frames:v", "1", "-vf", f"scale={width}:-2", str(dest),
+        ],
+        timeout=60,
+    )
+    if proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+        return dest
+    # 中間抽不到（超短片段）就退回第一格
+    if where > 0:
+        return thumb_from_clip(clip_path, dest, at=0.0, width=width)
+    return None
+
+
 def contact_sheet(frames: list[Path], dest: Path, height: int = 270) -> bool:
     """幾格畫面和成一張橫排圖，一眼看完整段素材。"""
     frames = [f for f in frames if Path(f).exists()]

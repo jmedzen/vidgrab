@@ -118,6 +118,20 @@ def _fmt_ts(seconds: float | None) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
+def _thumb_url(thumb: str | None, project: Path) -> str:
+    """把縮圖路徑變成 /file/... 這種可以給 <img> 用的網址。"""
+    if not thumb:
+        return ""
+    p = Path(thumb)
+    if not p.exists():
+        return ""
+    try:
+        rel = str(p.relative_to(project))
+    except ValueError:
+        return ""
+    return f"/file/{urllib.parse.quote(project.name)}/{urllib.parse.quote(rel)}"
+
+
 def clip_info(clip: dict[str, Any], project: Path, root: Path) -> dict[str, Any]:
     path = Path(clip.get("path", ""))
     rel = str(path.relative_to(project)) if str(path).startswith(str(project)) else str(path)
@@ -135,6 +149,9 @@ def clip_info(clip: dict[str, Any], project: Path, root: Path) -> dict[str, Any]
         "span": "整支" if is_full else f"{_fmt_ts(start)}–{_fmt_ts(end)}",
         "size": human_size(clip.get("size_bytes") or 0),
         "dims": f"{clip.get('width')}×{clip.get('height')}" if clip.get("width") else "",
+        # 片段自己的縮圖（從這個片段檔抽的，畫面一定對得上）
+        "thumb": _thumb_url(clip.get("thumb"), project),
+        "orientation": clip.get("orientation") or "",
     }
 
 
@@ -1337,6 +1354,14 @@ PAGE = r"""<!doctype html>
   .clip-row { display:flex; align-items:center; gap:9px; color:var(--muted); }
   .clip-row a { color:var(--accent); text-decoration:none; }
   .clip-row code { background:var(--code-bg); padding:1px 6px; border-radius:5px; font-size:11.5px; }
+  .clip-thumb {
+    flex:none; width:74px; height:42px; object-fit:cover; border-radius:5px;
+    border:1px solid var(--line); background:var(--panel2); cursor:zoom-in;
+  }
+  .clip-nothumb {
+    display:flex; align-items:center; justify-content:center;
+    font-size:10px; color:var(--muted); cursor:default;
+  }
   .warnline { font-size:12px; color:var(--warn); margin-top:7px; }
   .empty { text-align:center; color:var(--muted); padding:70px 20px; line-height:2; }
   .empty .big { font-size:34px; opacity:.5; }
@@ -2185,6 +2210,10 @@ function render() {
     const clips = it.clips.length
       ? `<div class="clipbox">${it.clips.map((c, ci) => `
           <div class="clip-row">
+            ${c.thumb
+              ? `<img class="clip-thumb" src="${esc(c.thumb)}" loading="lazy" title="這一格就是這個片段"
+                      onclick="lightbox('img','${esc(c.thumb)}')">`
+              : `<span class="clip-thumb clip-nothumb" title="沒有縮圖">無圖</span>`}
             <a href="${esc(c.rel)}" data-play="${esc(c.rel)}" data-name="${esc(c.name)}">${esc(c.name)}</a>
             <code>${esc(c.span)}</code>
             <span>${esc(c.dims)} · ${esc(c.size)}</span>

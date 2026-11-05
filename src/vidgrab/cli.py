@@ -435,6 +435,36 @@ def emit_json(payload: dict | list) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
+def cmd_thumbs(args: argparse.Namespace) -> int:
+    """幫已下載的片段補上縮圖（縮圖功能是後來才加的）。
+
+    縮圖一律從片段檔本身抽，所以畫面必然對得上。
+    """
+    targets = []
+    if args.projects:
+        for raw in args.projects:
+            targets.append(resolve_project(raw))
+    else:
+        root = tasks.projects_root()
+        if root.exists():
+            targets = sorted(p for p in root.iterdir()
+                             if (p / "results.json").exists())
+
+    out = []
+    for proj in targets:
+        result = tasks.backfill_thumbs(proj, emit=lambda *_: None)
+        out.append({"project": proj.name, **result})
+
+    emit_json({
+        "schema": "vidgrab.thumbs/1",
+        "projects": out,
+        "made": sum(o["made"] for o in out),
+        "kept": sum(o["kept"] for o in out),
+        "failed": sum(o["failed"] for o in out),
+    })
+    return 0
+
+
 def cmd_forget(args: argparse.Namespace) -> int:
     """把專案從素材庫清單移除（資料夾已刪掉、清單還留著記錄時用）。
 
@@ -885,6 +915,10 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--save", action="store_true", help="把這次的選項存成預設")
     bt.add_argument("--timeout", type=float, help="這個批次最多跑幾秒（超過就中止）")
     bt.set_defaults(func=cmd_batch)
+
+    pt = sub.add_parser("thumbs", help="幫已下載的片段補縮圖（省略專案＝全部）")
+    pt.add_argument("projects", nargs="*", help="專案名稱（省略＝所有專案）")
+    pt.set_defaults(func=cmd_thumbs)
 
     pf = sub.add_parser("forget", help="把專案從素材庫清單移除（資料夾已刪掉時用）")
     pf.add_argument("projects", nargs="+", help="專案名稱（可多個）")

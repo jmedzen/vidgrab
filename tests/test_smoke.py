@@ -1579,3 +1579,94 @@ def test_forget_removes_deleted_project_from_library(tmp_path, monkeypatch):
     r = subprocess.run([sys.executable, "-m", "vidgrab.cli", "vault"],
                        capture_output=True, text=True, timeout=60, env=env)
     assert "ghost" not in r.stdout, "forget 之後記錄要消失"
+
+
+def test_thumb_comes_from_the_clip_itself(tmp_path):
+    """縮圖一定要從「這個片段檔」抽，不能另外去整支影片抓。
+
+    以前是到整支影片的均勻位置抓 3 格（片段在 30–75 秒，
+    抓的卻是 914／1827／2740 秒），那些圖跟片段毫無關係。
+    """
+    import subprocess
+
+    from vidgrab.media import thumb_from_clip
+
+    src = tmp_path / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+         "color=c=red:s=320x180:d=3", "-pix_fmt", "yuv420p", str(src)],
+        check=True, capture_output=True, timeout=60,
+    )
+    dest = tmp_path / "t.jpg"
+    got = thumb_from_clip(src, dest)
+    assert got is not None and dest.exists()
+    assert dest.stat().st_size > 0
+
+    # 重跑不會重做（有就沿用）
+    again = thumb_from_clip(src, dest)
+    assert again == dest
+
+    # 片段不存在就回 None，不可以拋
+    assert thumb_from_clip(tmp_path / "nope.mp4", tmp_path / "x.jpg") is None
+
+
+def test_backfill_thumbs_fills_every_clip(tmp_path, monkeypatch):
+    """既有片段要能補縮圖，而且補完每個片段都有。"""
+    import subprocess
+
+    from vidgrab import tasks
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    proj = _make_project(tmp_path, "p1", items=[
+        {"platform": "b", "vid": "v1", "url": "u", "title": "甲"},
+    ])
+    clips = proj / "clips"
+    clips.mkdir(parents=True, exist_ok=True)
+    made = clips / "one.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+         "color=c=blue:s=320x180:d=2", "-pix_fmt", "yuv420p", str(made)],
+        check=True, capture_output=True, timeout=60,
+    )
+
+    manifest, items = tasks.load_project(proj)
+    items[0].clips = [{"path": str(made), "start": 0.0, "end": 2.0,
+                       "id": "b:v1#0-2"}]
+    tasks.save_project(proj, manifest, items)
+
+    stats = tasks.backfill_thumbs(proj, emit=lambda *_: None)
+    assert stats["made"] == 1 and stats["failed"] == 0
+
+    _m, after = tasks.load_project(proj)
+    thumb = after[0].clips[0].get("thumb")
+    assert thumb and Path(thumb).exists()
+
+
+def test_agent_exposes_clip_thumb(tmp_path, monkeypatch):
+    """agent 介面一定要把 clipping 縮圖帶出去。
+
+    這是「使用者看不到截圖」的真正原因之一：
+    縮圖明明在磁碟上，但 clip_summary 沒有把它放進回傳的 dict，
+    所以任務清單／agent 都拿不到。
+    """
+    from pathlib import Path
+
+    from vidgrab.agent import clip_summary
+
+    thumb = tmp_path / "t.jpg"
+    thumb.write_bytes(b"fake-jpg")
+
+    got = clip_summary(
+        {"path": "a.mp4", "start": 0, "end": 5, "width": 640, "height": 360,
+         "thumb": str(thumb)},
+        tmp_path,
+    )
+    assert got["thumb"], "clip_summary 要把 thumb 帶出來"
+    assert got["has_thumb"] is True
+
+    # 檔案不存在時 has_thumb 要是 False，不要騙人
+    missing = clip_summary(
+        {"path": "a.mp4", "start": 0, "end": 5, "thumb": str(tmp_path / "nope.jpg")},
+        tmp_path,
+    )
+    assert missing["has_thumb"] is False

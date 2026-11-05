@@ -172,6 +172,7 @@ brew install ffmpeg uv
 ./vidgrab purge demo-taipei        # 篩掉教學／課程
 ./vidgrab prune demo-taipei        # 清孤兒檔案
 ./vidgrab forget demo-taipei       # 從清單移除記錄
+./vidgrab thumbs                   # 補片段縮圖
 ./vidgrab list          # 列出所有專案
 ./vidgrab login         # 掃碼登入 B 站
 ./vidgrab build         # 版本與 build number
@@ -379,6 +380,29 @@ yt-dlp 只在**結束時**吐一行進度，中間完全是空的。
 
 > `forget` 不能走一般的專案解析（那要求資料夾存在），
 > 它處理的正是「資料夾已經不見」的情況。
+
+### 每個片段都有縮圖
+
+片段下載完會**立刻**從那個片段檔抽一格當縮圖，寫進 `thumbs/`：
+
+- 網頁的每個片段列左邊都有縮圖，點一下放大
+- `vault` 的 JSON 帶 `thumb`（路徑）與 `has_thumb`（檔案真的在不在）
+- 縮圖一定從**這個片段**抽，所以畫面必然對得上
+
+> **為什麼不另外去抓**
+>
+> 原本的做法是到整支影片的均勻位置抓 3 格。實測一支 3654 秒的影片，
+> 抓的是 914／1827／2740 秒，但片段只有 30–75 秒——**那些圖跟片段毫無關係**。
+> 而且在網頁上根本看不到：`clip_summary` 沒把 `thumb` 帶出去。
+
+舊專案（縮圖功能加入前下載的）可以補：
+
+```bash
+./vidgrab thumbs            # 所有專案
+./vidgrab thumbs mytheme    # 指定專案
+```
+
+重跑不會重做，已經有縮圖的直接沿用。
 
 ### 直式片段會被標出來
 
