@@ -1,0 +1,12 @@
+[project]
+name = "vidgrab"
+version = "0.1.0"
+description = "關鍵字找素材：搜 B 站／YouTube，只切你要的幾秒，連同授權資訊整理成清單"
+requires-python = ">=3.9"
+dependencies = ["yt-dlp>=2024.1.1"]
+
+[project.scripts]
+vidgrab = "vidgrab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

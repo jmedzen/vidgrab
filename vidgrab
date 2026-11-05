@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# vidgrab 啟動器：第一次執行會自己建 venv、裝 yt-dlp，之後直接跑。
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export VIDGRAB_HOME="${VIDGRAB_HOME:-$HERE/projects}"
+export PYTHONPATH="$HERE/src${PYTHONPATH:+:$PYTHONPATH}"
+# 所有快取都留在專案內，避免動到 ~/.cache
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$HERE/.cache/uv}"
+export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$HERE/.cache/python}"
+export UV_TOOL_DIR="${UV_TOOL_DIR:-$HERE/.cache/uv-tools}"
+
+VENV="$HERE/.venv"
+
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+  echo "✗ 找不到 ffmpeg／ffprobe。請先安裝：brew install ffmpeg" >&2
+  exit 1
+fi
+
+need_install=0
+if [ ! -x "$VENV/bin/python" ]; then
+  need_install=1
+elif ! "$VENV/bin/python" -c "import yt_dlp" >/dev/null 2>&1; then
+  need_install=1
+fi
+
+if [ "$need_install" = "1" ]; then
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "✗ 找不到 uv。請先安裝：brew install uv" >&2
+    exit 1
+  fi
+  echo "▶ 第一次執行：建立 venv 並安裝 yt-dlp（約 1 分鐘）…" >&2
+  PY="$(command -v python3)"
+  rm -rf "$VENV"
+  uv venv --python "$PY" "$VENV" >&2
+  uv pip install --python "$VENV/bin/python" "yt-dlp>=2024.1.1" "requests>=2.28" "qrcode[pil]>=7.4" >&2
+  echo "✔ 環境就緒" >&2
+fi
+
+exec "$VENV/bin/python" -m vidgrab "$@"
