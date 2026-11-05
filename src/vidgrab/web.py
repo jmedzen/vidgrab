@@ -524,7 +524,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
-def serve(host: str = "127.0.0.1", port: int = 7788, open_browser: bool = True) -> None:
+def serve(host: str = "127.0.0.1", port: int = 8310, open_browser: bool = True) -> None:
     root = tasks.projects_root()
     root.mkdir(parents=True, exist_ok=True)
     httpd = ThreadingHTTPServer((host, port), Handler)

@@ -386,7 +386,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     w = sub.add_parser("web", help="開 Web UI（本機網頁介面）")
     w.add_argument("--host", default="127.0.0.1")
-    w.add_argument("--port", type=int, default=7788)
+    w.add_argument("--port", type=int, default=8310)
     w.add_argument("--no-open", action="store_true", help="不要自動開瀏覽器")
     w.set_defaults(func=cmd_web)
 
