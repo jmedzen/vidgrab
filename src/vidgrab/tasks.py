@@ -309,8 +309,12 @@ def run_pick(
                 c for c in item.clips
                 if not (c.get("start") == start and c.get("end") == end)
             ]
+            from .models import clip_id
+
             item.clips.append(
                 {
+                    "id": clip_id(item.platform, item.vid, start, end),
+                    "asset_id": item.asset_id(),
                     "path": info["path"],
                     "start": start,
                     "end": end,
@@ -319,13 +323,16 @@ def run_pick(
                     "width": info.get("width"),
                     "height": info.get("height"),
                     "full": start is None,
+                    "cached": bool(info.get("cached")),
                 }
             )
             dims = f"{info.get('width')}×{info.get('height')}" if info.get("width") else ""
             what = "整支" if start is None else f"{fmt_ts(start)}–{fmt_ts(end or 0)}"
-            emit(f"     ✓ {what} → {Path(info['path']).name} {dims} {human_size(info.get('size_bytes', 0))}")
             grabbed += 1
+            # 先存檔再回報：emit 可能拋錯（例如批次逾時），
+            # 但抓到的片段一定要先落地，否則檔案在、清單卻沒有。
             save_project(project, manifest, items)
+            emit(f"     ✓ {what} → {Path(info['path']).name} {dims} {human_size(info.get('size_bytes', 0))}")
 
     save_project(project, manifest, items)
     emit(f"✔ 完成：{grabbed} 段 → {clips_dir}")

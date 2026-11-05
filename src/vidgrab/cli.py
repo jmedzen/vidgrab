@@ -51,17 +51,24 @@ SHORT_LICENSE = {
 
 
 def resolve_project(value: str | None) -> Path:
+    """找出專案目錄。
+
+    失敗時丟 `NoProject`／`NotFound`（不是 SystemExit），
+    這樣 JSON 模式才能回結構化錯誤給 agent。
+    """
+    from .models import NoProject, NotFound
+
     if not value:
         cands = sorted([p for p in tasks.projects_root().glob("*") if (p / "manifest.json").exists()])
         if not cands:
-            raise SystemExit("這底下還沒有專案，先跑一次 search。")
+            raise NoProject(f"{tasks.projects_root()} 底下還沒有專案")
         log(f"（沒指定專案，用最新的：{cands[-1].name}）")
         return cands[-1]
     path = Path(value).expanduser()
     if path.is_absolute():
         if (path / "manifest.json").exists():
             return path
-        raise SystemExit(f"找不到專案（沒有 manifest.json）：{path}")
+        raise NotFound(f"找不到專案（沒有 manifest.json）：{path}")
     if (Path.cwd() / path / "manifest.json").exists():
         return Path.cwd() / path
     candidate = tasks.projects_root() / value
@@ -71,8 +78,14 @@ def resolve_project(value: str | None) -> Path:
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        raise SystemExit("對到多個專案：\n  " + "\n  ".join(m.name for m in matches))
-    raise SystemExit(f"找不到專案：{value}")
+        from .models import BadInput
+
+        raise BadInput(
+            "對到多個專案：" + "、".join(m.name for m in matches),
+            code="ambiguous_project",
+            hint="改用具名的完整專案名稱",
+        )
+    raise NotFound(f"找不到專案：{value}")
 
 
 # ---------------------------------------------------------------- 顯示
@@ -208,11 +221,18 @@ def _parse_ranges(specs: list[str]) -> list[tuple[float, float]]:
             if not chunk:
                 continue
             if "-" not in chunk:
-                raise SystemExit(f"區段要寫成 開始-結束，例如 1:00-2:30（收到 {chunk}）")
+                from .models import BadInput
+
+                raise BadInput(
+                    f"區段要寫成 開始-結束（收到 {chunk}）",
+                    hint="例如 --range 1:00-2:30",
+                )
             lo, _, hi = chunk.partition("-")
             start, end = _ts(lo), _ts(hi)
             if end <= start:
-                raise SystemExit(f"區段結束要比開始晚：{chunk}")
+                from .models import BadInput
+
+                raise BadInput(f"區段結束要比開始晚：{chunk}")
             out.append((start, end))
     return out
 
@@ -226,9 +246,13 @@ def cmd_pick(args: argparse.Namespace) -> int:
         manifest, items = tasks.load_project(project)
         idxs = list(range(min(args.top, len(items))))
     else:
-        raise SystemExit("要指定 --select 1,3-5 或 --top 3。")
+        from .models import BadInput
+
+        raise BadInput("沒有指定要抓哪幾支", hint="用 --select 1,3-5 或 --top 3")
     if not idxs:
-        raise SystemExit("選到的編號都是空的。")
+        from .models import BadInput
+
+        raise BadInput("選到的編號都是空的", hint="確認編號沒有超出範圍")
 
     from . import config
     from .models import parse_ts
@@ -282,6 +306,106 @@ def cmd_scrub(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_batch(args: argparse.Namespace) -> int:
+    """一次抓多個片段——agent 的批次入口。
+
+    三個關鍵性質：
+    - **冪等**：同樣的請求重跑不會重複下載，回 `cached: true`
+    - **部分成功**：某支失敗不影響其他支，每支各自回報結果
+    - **可機器判讀**：一律輸出 JSON，含 exit code 對應的成功／失敗數
+    """
+    from . import agent, config
+
+    project = resolve_project(args.project)
+
+    # 解析要抓什麼：可以用 asset id、索引，或「這個專案全部」
+    manifest, items = tasks.load_project(project)
+    targets: list[int] = []
+    if args.select:
+        targets = parse_selector(args.select, len(items))
+    elif args.top:
+        targets = list(range(min(args.top, len(items))))
+    elif args.all:
+        targets = list(range(len(items)))
+    if not targets:
+        emit_json({"error": {"code": "no_targets",
+                             "message": "沒有指定要抓的項目（--select／--top／--all）",
+                             "retryable": False}})
+        return 1
+
+    values = effective(args, ("per", "height", "audio", "audio_format"))
+    if args.save:
+        patch = {k: v for k, v in values.items() if getattr(args, k, None) is not None}
+        config.save_patch(patch)
+
+    # 用「範圍」當去重鍵，不用 label／id：
+    # 舊資料沒有 id，混用會讓同一個片段被當成新的
+    def _key(c: dict) -> tuple:
+        return (c.get("start"), c.get("end"))
+
+    before = {i: {_key(c) for c in items[i].clips} for i in targets}
+
+    started = time.time()
+
+    # agent 呼叫要有上限，不能讓一個批次把整個 session 卡死
+    deadline = started + float(args.timeout) if args.timeout else None
+
+    def _tick(_msg: str) -> None:
+        if deadline and time.time() > deadline:
+            from .models import VidgrabError
+
+            raise VidgrabError(
+                f"批次超過 {args.timeout} 秒，已中止",
+                code="timeout",
+                retryable=True,
+                hint="已經抓好的片段都會保留；調高 --timeout 或縮小批次重試",
+            )
+
+    result = tasks.run_pick(
+        project, targets,
+        per=float(values["per"]),
+        ranges=_parse_ranges(args.range or []),
+        full=bool(args.full),
+        height=int(values["height"]),
+        audio=bool(values["audio"]),
+        audio_format=str(values["audio_format"]),
+        frames=bool(args.frames),
+        frame_count=int(args.frame_count),
+        dry_run=bool(args.dry_run),
+        emit=_tick if deadline else (lambda _msg: None),  # stdout 只能有 JSON
+    )
+
+    # 重新載入拿最終狀態
+    _, after_items = tasks.load_project(project)
+    grabbed = []
+    for i in targets:
+        item = after_items[i]
+        new_clips = [c for c in item.clips if _key(c) not in before.get(i, set())]
+        grabbed.append({
+            "index": i,
+            "asset_id": item.asset_id(),
+            "title": item.title,
+            "new_clips": [agent.clip_summary(c, project, item) for c in new_clips],
+            "total_clips": len(item.clips),
+            "error": item.error or None,
+        })
+
+    ok = sum(1 for g in grabbed if not g["error"])
+    failed = sum(1 for g in grabbed if g["error"])
+    emit_json({
+        "schema": "vidgrab.batch/1",
+        "project": project.name,
+        "requested": len(targets),
+        "ok": ok,
+        "failed": failed,
+        "elapsed_seconds": round(time.time() - started, 2),
+        "dry_run": bool(args.dry_run),
+        "results": grabbed,
+        "summary": result,
+    })
+    return 0 if failed == 0 else 1
+
+
 def cmd_refresh(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     manifest, items = tasks.load_project(project)
@@ -305,8 +429,74 @@ def cmd_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
+def emit_json(payload: dict | list) -> None:
+    """機器可讀輸出。agent 靠這個，不要印任何其他人類文字到 stdout。"""
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+def cmd_vault(args: argparse.Namespace) -> int:
+    """整個素材庫的快照——agent 的主要入口。"""
+    from . import agent
+
+    manifest = agent.vault_manifest(
+        with_items=not args.no_items,
+        with_description=args.with_description,
+    )
+
+    if args.project:
+        project = resolve_project(args.project)
+        for p in manifest["projects"]:
+            if p["name"] == project.name:
+                emit_json(p)
+                return 0
+        emit_json({"error": {"code": "not_found", "message": f"找不到專案：{args.project}",
+                             "retryable": False}})
+        return 1
+
+    if args.query:
+        manifest["query"] = args.query
+        manifest["matches"] = [
+            {"project": h["project"], "score": h["score"], "matched": h["matched"],
+             "item": h["item"]}
+            for h in agent.search_assets(manifest, args.query, limit=args.limit)
+        ]
+        del manifest["projects"]  # 只回命中，agent 才不用自己篩
+        emit_json(manifest)
+        return 0
+
+    emit_json(manifest)
+    return 0
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    """用片段 id 或 asset id 找回素材。"""
+    from . import agent
+
+    vault = agent.vault_manifest(with_items=True)
+    needle = args.id
+
+    for proj in vault["projects"]:
+        for item in proj.get("items", []) or []:
+            if item["id"] == needle:
+                emit_json({"project": proj["name"], "item": item})
+                return 0
+            for clip in item.get("clips", []):
+                if clip["id"] == needle:
+                    emit_json({"project": proj["name"], "item": item, "clip": clip})
+                    return 0
+
+    emit_json({"error": {"code": "not_found", "message": f"找不到：{needle}",
+                         "retryable": False}})
+    return 1
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
+    if getattr(args, "json", False):
+        from . import agent
+
+        emit_json(agent.project_summary(project, with_items=True, with_description=True))
+        return 0
     manifest, items = tasks.load_project(project)
     print(f"專案：{project}")
     print(f"關鍵字：{'、'.join(manifest.get('queries') or [])}  來源：{', '.join(manifest.get('sources') or [])}")
@@ -319,6 +509,11 @@ def cmd_show(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     root = tasks.projects_root()
     projects = sorted([p for p in root.glob("*") if (p / "manifest.json").exists()])
+    if getattr(args, "json", False):
+        from . import agent
+
+        emit_json(agent.vault_manifest(with_items=False))
+        return 0
     if not projects:
         print(f"（{root} 底下還沒有專案）")
         return 0
@@ -350,13 +545,15 @@ def cmd_config(args: argparse.Namespace) -> int:
         patch = {}
         for item in args.set:
             if "=" not in item:
-                raise SystemExit(f"要寫成 key=value，收到：{item}")
+                from .models import BadInput
+
+            raise BadInput(f"要寫成 key=value，收到：{item}")
             key, _, value = item.partition("=")
             patch[key.strip()] = value.strip()
         try:
             values = config.save_patch(patch)
         except config.ConfigError as exc:
-            raise SystemExit(f"✗ {exc}") from exc
+            raise BadInput(str(exc)) from exc
         print(f"✔ 已更新：{', '.join(sorted(patch))}")
         if args.json:
             print(json.dumps(values, ensure_ascii=False, indent=2))
@@ -568,11 +765,43 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("project", nargs="?", help="專案名稱或路徑（省略 = 全部）")
     sc.set_defaults(func=cmd_scrub)
 
+    bt = sub.add_parser("batch", help="批次抓片（agent 用，一律 JSON）")
+    bt.add_argument("project", nargs="?", help="專案名稱或路徑（省略 = 最新）")
+    bt.add_argument("--select", help="編號，如 1,3,5-7")
+    bt.add_argument("--top", type=int, help="前 N 支")
+    bt.add_argument("--all", action="store_true", help="整個專案")
+    bt.add_argument("--range", action="append", help="區段，如 1:00-2:30")
+    bt.add_argument("--full", action="store_true", help="整支下載")
+    bt.add_argument("--per", type=float, help="每段幾秒")
+    bt.add_argument("--height", type=int, help="最高解析度")
+    bt.add_argument("--audio", action="store_true", help="只要聲音")
+    bt.add_argument("--audio-format", dest="audio_format", help="m4a/mp3/wav/opus")
+    bt.add_argument("--frames", action="store_true", help="順便抓畫面")
+    bt.add_argument("--frame-count", dest="frame_count", type=int, default=3)
+    bt.add_argument("--dry-run", action="store_true", help="只回報要抓什麼，不下載")
+    bt.add_argument("--save", action="store_true", help="把這次的選項存成預設")
+    bt.add_argument("--timeout", type=float, help="這個批次最多跑幾秒（超過就中止）")
+    bt.set_defaults(func=cmd_batch)
+
+    vt = sub.add_parser("vault", help="素材庫快照（agent 的主要入口）")
+    vt.add_argument("project", nargs="?", help="只看某個專案")
+    vt.add_argument("--query", help="在已下載的素材裡搜尋")
+    vt.add_argument("--limit", type=int, default=20, help="搜尋回幾筆（出廠 20）")
+    vt.add_argument("--no-items", action="store_true", help="只回專案摘要，不回每支素材")
+    vt.add_argument("--with-description", action="store_true", help="附上完整說明")
+    vt.set_defaults(func=cmd_vault)
+
+    fd = sub.add_parser("find", help="用 asset id 或片段 id 找回素材")
+    fd.add_argument("id", help="例如 bilibili:BV1xx 或 bilibili:BV1xx#60-75")
+    fd.set_defaults(func=cmd_find)
+
     sh = sub.add_parser("show", help="看專案清單")
     sh.add_argument("project", nargs="?")
+    sh.add_argument("--json", action="store_true", help="輸出 JSON（給程式／agent 用）")
     sh.set_defaults(func=cmd_show)
 
     l = sub.add_parser("list", help="列出所有專案")
+    l.add_argument("--json", action="store_true", help="輸出 JSON（給程式／agent 用）")
     l.set_defaults(func=cmd_list)
 
     o = sub.add_parser("open", help="用瀏覽器打開清單")
@@ -613,23 +842,66 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _json_mode(args: argparse.Namespace) -> bool:
+    """這個指令是不是在「機器可讀」模式。
+
+    agent 靠這個判斷：JSON 模式下，成功與失敗都只能有 JSON 到 stdout。
+    """
+    if getattr(args, "json", False):
+        return True
+    return getattr(args, "cmd", "") in ("vault", "find", "batch")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not media.ffmpeg_ok() and args.cmd != "list":
-        print("✗ 需要 ffmpeg 與 ffprobe：brew install ffmpeg", file=sys.stderr)
+    machine = _json_mode(args)
+
+    from .models import MissingFFmpeg, VidgrabError
+
+    if not media.ffmpeg_ok() and args.cmd not in ("list", "vault", "find"):
+        err = MissingFFmpeg("需要 ffmpeg 與 ffprobe")
+        if machine:
+            emit_json({"ok": False, "error": err.to_dict()})
+        else:
+            print(f"✗ {err}：{err.hint}", file=sys.stderr)
         return 2
+
     try:
         return args.func(args)
     except KeyboardInterrupt:
-        print("\n中止。", file=sys.stderr)
+        if machine:
+            emit_json({"ok": False, "error": {
+                "code": "interrupted", "message": "使用者中斷", "retryable": True}})
+        else:
+            print("\n中止。", file=sys.stderr)
         return 130
     except SystemExit:
         raise
+    except VidgrabError as exc:
+        # 可預期錯誤：給 agent 判斷該不該重試
+        if args.debug:
+            traceback.print_exc()
+        if machine:
+            emit_json({"ok": False, "error": exc.to_dict()})
+        else:
+            print(f"✗ {exc}", file=sys.stderr)
+            if exc.hint:
+                print(f"  → {exc.hint}", file=sys.stderr)
+        return 1
     except Exception as exc:  # noqa: BLE001
         if args.debug:
             traceback.print_exc()
-        print(f"✗ {exc}", file=sys.stderr)
+        if machine:
+            # 非預期錯誤也要是合法 JSON，agent 才不會拿到一行 traceback
+            emit_json({"ok": False, "error": {
+                "code": "internal",
+                "message": f"{type(exc).__name__}: {exc}",
+                "retryable": True,
+                "hint": "這是未預期的錯誤，帶 --debug 可以看到細節",
+            }})
+        else:
+            print(f"✗ {exc}", file=sys.stderr)
         return 1
 
 

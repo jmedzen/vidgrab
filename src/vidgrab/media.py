@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -370,11 +371,16 @@ def grab_range(
     )
     if code != 0 or not produced:
         lines = [ln for ln in tail.splitlines() if ln.strip()]
+        # 失敗時把 .part 殘檔清掉：留著只會佔空間，而且下次會從壞掉的地方續傳
+        _clean_partials(outdir, stem)
         raise MediaError(lines[-1] if lines else "yt-dlp 沒有產出檔案")
+    # yt-dlp 有時會留下 `xxx.f30077.mp4` 這種帶格式編號的檔名。
+    # 那是內部識別用的，對使用者與 agent 都是噪音，改成乾淨的名字。
+    produced = [_normalize_name(p, stem) for p in produced]
     final = produced[0]
     # 合併音視訊時，yt-dlp 會留下暫存軌；這裡只留成品
     for leftover in outdir.glob(f"{stem}.f*"):
-        if leftover != final:
+        if leftover != final and leftover.suffix.lower() not in MEDIA_EXTS:
             leftover.unlink(missing_ok=True)
 
     # 把 sidecar info json 的內容併進 item：這是素材庫的資料來源
@@ -382,6 +388,46 @@ def grab_range(
 
     probe = ffprobe(final)
     return {"path": str(final), "cached": False, **probe}
+
+
+def _normalize_name(path: Path, stem: str) -> Path:
+    """把 `stem.f30077.mp4` 這種檔名改成 `stem.mp4`。
+
+    只在「改名後不會撞到既有檔案」時才動，避免蓋掉別的片段。
+    """
+    if not re.match(rf"^{re.escape(stem)}\.f\d+\.", path.name):
+        return path
+    target = path.with_name(f"{stem}{path.suffix}")
+    if target.exists() and target.stat().st_size > 0:
+        return path  # 已經有乾淨的，不要動
+    try:
+        path.rename(target)
+        # info.json 也要跟著改，否則對不起來
+        side = path.with_name(path.name.rsplit(".", 2)[0] + ".info.json")
+        if side.exists():
+            side.rename(target.with_name(target.stem + ".info.json"))
+        return target
+    except OSError:
+        return path
+
+
+def _clean_partials(outdir: Path, stem: str) -> int:
+    """清掉中斷下載留下的暫存檔，回傳清掉幾個。"""
+    removed = 0
+    for leftover in outdir.glob(f"{stem}*.part"):
+        try:
+            leftover.unlink()
+            removed += 1
+        except OSError:
+            pass
+    # ffmpeg 合併時的中間檔
+    for leftover in outdir.glob(f"{stem}*.temp.*"):
+        try:
+            leftover.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _absorb_info_json(item: Item, outdir: Path, stem: str) -> None:

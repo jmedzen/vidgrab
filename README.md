@@ -19,6 +19,7 @@
 - [快速開始](#快速開始)
 - [網頁介面](#網頁介面)
 - [命令列](#命令列)
+- [給 AI agent 用](#給-ai-agent-用)
 - [設定](#設定)
 - [REST API](#rest-api)
 - [Docker](#docker)
@@ -173,6 +174,128 @@ brew install ffmpeg uv
 ./vidgrab build         # 版本與 build number
 ./vidgrab test          # 跑測試 + Dockerfile 檢查
 ```
+
+---
+
+## 給 AI agent 用
+
+人看的是 HTML／CSV，機器要的是另一套東西。這幾個指令專為 agent 設計，
+**stdout 只有 JSON**，不含任何給人看的裝飾文字。
+
+```bash
+./vidgrab vault                      # 整個素材庫的快照（主要入口）
+./vidgrab vault <專案>                # 單一專案（含每支素材與每個片段）
+./vidgrab vault --query "夜晚 街景"    # 在「已下載的素材」裡搜尋
+./vidgrab batch <專案> --top 3 --range 1:00-1:30   # 批次抓片
+./vidgrab find "bilibili:BV1xx#60-75"              # 用 id 找回素材
+```
+
+### 穩定 id
+
+每個素材與片段都有**可重算的 id**：重新掃描、搬專案、重建清單都不會變。
+agent 可以把它存進自己的記憶，之後永遠找得回來。
+
+| 對象 | id 長相 |
+|---|---|
+| 一支影片 | `bilibili:BV1EE411k75J` |
+| 一個片段 | `bilibili:BV1EE411k75J#60-75` |
+| 整支 | `bilibili:BV1EE411k75J#full` |
+
+用的是「平台 + 平台自己的編號」與「秒數範圍」，不是資料庫序號——
+所以就算 `library.json` 被砍掉重練，id 還是同一個。
+
+### 一次呼叫就拿到全部
+
+`vault` 刻意做成「一個指令回完整狀態」，因為 agent 不擅長多輪探索：
+
+```json
+{
+  "schema": "vidgrab.vault/1",
+  "root": "/絕對路徑/projects",
+  "totals": {"projects": 5, "clips": 31, "bytes": 193881525},
+  "projects": [{
+    "name": "20261105-handpan",
+    "pinned": true,
+    "counts": {"candidates": 11, "with_clips": 5, "clips": 5},
+    "items": [{
+      "id": "bilibili:BV1xx",
+      "title": "…",
+      "license": {"kind": "unknown", "label": "未標示"},
+      "search_terms": ["手碟", "音樂"],
+      "credit_hint": "授權未標示，使用前請先聯繫 …",
+      "clips": [{
+        "id": "bilibili:BV1xx#60-75",
+        "path": "/絕對路徑/…mp4",
+        "exists": true,
+        "start": 60, "end": 75, "duration": 15.0,
+        "cached": false
+      }]
+    }]
+  }]
+}
+```
+
+幾個刻意的設計：
+
+- **路徑一律絕對路徑**，agent 拿到就能直接用，不用自己拼
+- **`exists` 旗標**：清單有記錄但檔案被刪掉時，agent 看得出來
+- **`cached` 旗標**：分辨「這次真的下載」與「本來就在」
+- **`credit_hint` 直接给可讀句子**，agent 不用自己判斷授權風險
+
+### 冪等：重跑不會重複下載
+
+`batch` 對「同一個片段的同一個範圍」是冪等的。重跑只會回 `new_clips: []`，
+不會重新下載、也不會產生重複檔案。所以 agent 可以安全地重試。
+
+```json
+{"schema": "vidgrab.batch/1", "requested": 3, "ok": 3, "failed": 0,
+ "elapsed_seconds": 12.4, "dry_run": false,
+ "results": [{"index": 0, "asset_id": "bilibili:BV1xx",
+              "new_clips": [...], "error": null}]}
+```
+
+- **部分成功**：某支失敗不影響其他支，每支各自回報
+- **`--timeout`**：批次最多跑幾秒，避免 agent 被單一請求卡死
+- **`--dry-run`**：只回報要抓什麼，不動網路
+
+### 錯誤也是結構化的
+
+失敗時不會吐 traceback，而是：
+
+```json
+{"ok": false, "error": {
+  "code": "bad_input",
+  "message": "區段要寫成 開始-結束（收到 abc）",
+  "retryable": false,
+  "hint": "例如 --range 1:00-2:30"
+}}
+```
+
+`retryable` 讓 agent 知道該重試還是該換方法。可用的 code：
+
+| code | 意思 | 可重試 |
+|---|---|---|
+| `not_found` | 找不到專案／素材 | 否 |
+| `bad_input` | 參數寫錯 | 否 |
+| `ambiguous_project` | 專案名對到多個 | 否 |
+| `no_project` | 還沒有任何專案 | 否 |
+| `no_targets` | 沒指定要抓哪幾支 | 否 |
+| `login_required` | 需要登入 B 站 | 否 |
+| `download_failed` | 下載失敗 | **是** |
+| `timeout` | 批次逾時 | **是** |
+| `missing_ffmpeg` | 缺 ffmpeg | 否 |
+| `internal` | 未預期錯誤 | **是** |
+
+### 在已下載的素材裡搜尋
+
+`search` 是去平台找**新片**；`vault --query` 是在你**手上的素材**裡找。
+
+```bash
+./vidgrab vault --query "台北 夜晚"
+```
+
+比對標題、作者、標籤、素材關鍵字，回傳帶 `score` 與 `matched` 的排序結果。
+這是 agent 最常用的一步——先問「我手上有什麼可以用」，再決定要不要去抓新的。
 
 ### 常用篩選
 

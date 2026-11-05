@@ -198,6 +198,10 @@ class Item:
     description_full: str = ""                              # 完整說明（不受截斷）
     info_json: str = ""                                     # sidecar json 路徑
 
+    def asset_id(self) -> str:
+        """agent 用來引用這支影片的穩定鍵。"""
+        return asset_id(self.platform, self.vid)
+
     def blob(self) -> str:
         return " ".join([self.title, self.description, self.license_hint])
 
@@ -402,3 +406,92 @@ def _credit_hint(item: "Item") -> str:
     if item.license_kind in ("free", "free-attribution"):
         return f"{who} — {where}"
     return f"授權未標示，使用前請先聯繫 {who}：{where}"
+
+
+# ---------------------------------------------------------------- 穩定 ID
+
+def asset_id(platform: str, vid: str) -> str:
+    """一支影片的穩定 id。
+
+    刻意用「平台 + 平台自己的 id」，不用資料庫序號：
+    重新掃描、搬專案、重建清單都不會變，agent 可以長期引用。
+    """
+    return f"{platform}:{vid}" if vid else ""
+
+
+def clip_id(platform: str, vid: str, start: float | None, end: float | None) -> str:
+    """一個片段的穩定 id：影片 id + 秒數範圍。
+
+    同一個範圍重下載會得到同一個 id（因為檔名也是這樣定的），
+    所以 agent 可以用它做「這個抓過了嗎」的判斷。
+    """
+    base = asset_id(platform, vid)
+    if not base:
+        return ""
+    if start is None:
+        return f"{base}#full"
+    return f"{base}#{_ts_key(start)}-{_ts_key(end)}"
+
+
+def _ts_key(seconds: float | None) -> str:
+    """秒數轉成固定寬度的鍵，避免 10 與 10.0 變成兩個 id。"""
+    if seconds is None:
+        return "0"
+    return f"{float(seconds):.3f}".rstrip("0").rstrip(".")
+
+
+# ---------------------------------------------------------------- 結構化錯誤
+
+class VidgrabError(Exception):
+    """所有可預期錯誤的基底。帶機器可讀的 code 與可重試性。"""
+
+    code = "error"
+    retryable = False
+
+    def __init__(self, message: str, *, code: str | None = None,
+                 retryable: bool | None = None, hint: str = ""):
+        super().__init__(message)
+        if code:
+            self.code = code
+        if retryable is not None:
+            self.retryable = retryable
+        self.hint = hint
+
+    def to_dict(self) -> dict[str, Any]:
+        out = {
+            "code": self.code,
+            "message": str(self),
+            "retryable": self.retryable,
+        }
+        if self.hint:
+            out["hint"] = self.hint
+        return out
+
+
+class NotFound(VidgrabError):
+    code = "not_found"
+
+
+class BadInput(VidgrabError):
+    code = "bad_input"
+
+
+class NoProject(VidgrabError):
+    code = "no_project"
+    hint = "先跑一次 search 建立專案"
+
+
+class DownloadFailed(VidgrabError):
+    code = "download_failed"
+    retryable = True
+    hint = "可能是網路或影片暫時不可用，稍後重試"
+
+
+class LoginRequired(VidgrabError):
+    code = "login_required"
+    hint = "跑 ./vidgrab login 掃碼登入 B 站（高畫質／會員片需要）"
+
+
+class MissingFFmpeg(VidgrabError):
+    code = "missing_ffmpeg"
+    hint = "brew install ffmpeg"

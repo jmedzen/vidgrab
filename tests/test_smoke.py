@@ -13,6 +13,9 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 from vidgrab import __version__, report
 from vidgrab.models import (
@@ -860,3 +863,197 @@ def test_theme_menu_labels_use_fixed_light_color():
     assert "color:var(--text)" not in flat, (
         "選單文字不可以跟著目前主題的 --text 走，會在淺色主題下隱形"
     )
+
+
+# ---------------------------------------------------------------- agent 介面
+
+
+def test_stable_ids_are_deterministic():
+    """id 必須可重算：重新掃描、搬專案都不能變，agent 才能長期引用。"""
+    from vidgrab.models import asset_id, clip_id
+
+    assert asset_id("bilibili", "BV1xx") == "bilibili:BV1xx"
+    assert asset_id("bilibili", "") == "", "沒有 vid 就不要硬湊 id"
+
+    a = clip_id("bilibili", "BV1xx", 60, 75)
+    b = clip_id("bilibili", "BV1xx", 60.0, 75.0)
+    assert a == b, "60 與 60.0 不可以變成兩個 id"
+    assert a != clip_id("bilibili", "BV1xx", 60, 76)
+
+    assert clip_id("youtube", "abc", None, None) == "youtube:abc#full"
+
+
+def test_vault_manifest_shape(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import agent
+
+    _make_project(tmp_path, "p1", items=[{
+        "platform": "youtube", "vid": "v1", "url": "https://y/v1",
+        "title": "測試影片", "author": "作者A", "tags": ["特寫"],
+    }])
+
+    m = agent.vault_manifest(with_items=True)
+    assert m["schema"] == "vidgrab.vault/1"
+    assert m["totals"]["projects"] == 1
+    assert m["root"].startswith(str(tmp_path))
+
+    proj = m["projects"][0]
+    assert proj["name"] == "p1" and proj["missing"] is False
+    item = proj["items"][0]
+    assert item["id"] == "youtube:v1"
+    assert "credit_hint" in item
+
+
+def test_vault_clip_ids_computed_for_old_data(tmp_path, monkeypatch):
+    """舊片段沒有存 id，vault 要當場算出來，agent 才拿得到穩定鍵。"""
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import agent
+
+    _make_project(tmp_path, "p1", items=[{
+        "platform": "bilibili", "vid": "BV1", "url": "u", "title": "T",
+        "clips": [{"path": "/tmp/x.mp4", "start": 10.0, "end": 25.0, "label": "x"}],
+    }])
+    m = agent.vault_manifest(with_items=True)
+    clip = m["projects"][0]["items"][0]["clips"][0]
+    assert clip["id"] == "bilibili:BV1#10-25"
+    assert clip["asset_id"] == "bilibili:BV1"
+    assert clip["duration"] == 15.0
+
+
+def test_vault_search_finds_downloaded_assets(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import agent
+
+    _make_project(tmp_path, "p1", items=[
+        {"platform": "bilibili", "vid": "a", "url": "u", "title": "台北街景",
+         "tags": ["城市", "夜晚"]},
+        {"platform": "bilibili", "vid": "b", "url": "u", "title": "貓咪",
+         "tags": ["動物"]},
+    ])
+    m = agent.vault_manifest(with_items=True)
+    hits = agent.search_assets(m, "夜晚")
+    assert len(hits) == 1
+    assert hits[0]["item"]["id"] == "bilibili:a"
+
+    assert agent.search_assets(m, "") == []
+    assert agent.search_assets(m, "不存在") == []
+
+
+def test_vault_search_multi_term_scores(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import agent
+
+    _make_project(tmp_path, "p1", items=[
+        {"platform": "b", "vid": "1", "url": "u", "title": "台北 街景",
+         "tags": ["城市"]},
+        {"platform": "b", "vid": "2", "url": "u", "title": "台北 美食",
+         "tags": ["食物"]},
+    ])
+    m = agent.vault_manifest(with_items=True)
+    hits = agent.search_assets(m, "台北 街景")
+    assert hits[0]["item"]["id"] == "b:1", "命中兩個詞的應該排前面"
+    assert len(hits[0]["matched"]) == 2
+
+
+def test_cli_vault_json_contract(tmp_path, monkeypatch):
+    """vault 的 stdout 必須是純 JSON——agent 靠這個解析。"""
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    _make_project(tmp_path, "p1")
+
+    r = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "vault", "--no-items"],
+        capture_output=True, text=True, timeout=60,
+        env={**__import__("os").environ, "PYTHONPATH": str(_ROOT / "src")},
+    )
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)  # 有雜訊就會在這裡炸
+    assert data["schema"] == "vidgrab.vault/1"
+    assert data["totals"]["projects"] == 1
+
+
+def test_cli_error_is_json_not_traceback(tmp_path, monkeypatch):
+    """找不到專案時，JSON 模式要回結構化錯誤，不能吐 traceback。"""
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    r = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "vault", "no-such-project"],
+        capture_output=True, text=True, timeout=60,
+        env={**__import__("os").environ, "PYTHONPATH": str(_ROOT / "src")},
+    )
+    assert r.returncode != 0
+    data = json.loads(r.stdout)
+    assert data["error"]["code"] == "not_found"
+    assert data["error"]["retryable"] is False
+    assert "Traceback" not in r.stdout
+
+
+def test_cli_find_roundtrip(tmp_path, monkeypatch):
+    """用 id 找回來：這是 agent 引用素材的方式。"""
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    _make_project(tmp_path, "p1", items=[{
+        "platform": "bilibili", "vid": "BV9", "url": "u", "title": "T",
+        "clips": [{"path": str(tmp_path / "x.mp4"), "start": 5.0, "end": 20.0}],
+    }])
+
+    r = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "find", "bilibili:BV9#5-20"],
+        capture_output=True, text=True, timeout=60,
+        env={**__import__("os").environ, "PYTHONPATH": str(_ROOT / "src")},
+    )
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data["clip"]["id"] == "bilibili:BV9#5-20"
+    assert data["clip"]["duration"] == 15.0
+
+
+def test_structured_errors_have_codes():
+    from vidgrab import models
+
+    for cls, code, retry in [
+        (models.NotFound, "not_found", False),
+        (models.BadInput, "bad_input", False),
+        (models.NoProject, "no_project", False),
+        (models.DownloadFailed, "download_failed", True),
+        (models.LoginRequired, "login_required", False),
+    ]:
+        e = cls("boom")
+        d = e.to_dict()
+        assert d["code"] == code, f"{cls.__name__} code 錯了"
+        assert d["retryable"] is retry, f"{cls.__name__} retryable 錯了"
+        assert d["message"] == "boom"
+
+
+def test_normalize_strips_format_suffix(tmp_path):
+    """yt-dlp 會留下 `x.f30077.mp4`，那是噪音，要改成乾淨名字。"""
+    from vidgrab.media import _normalize_name
+
+    f = tmp_path / "abc_full_x.f30077.mp4"
+    f.write_bytes(b"x" * 100)
+    (tmp_path / "abc_full_x.info.json").write_text("{}", encoding="utf-8")
+
+    out = _normalize_name(f, "abc_full_x")
+    assert out.name == "abc_full_x.mp4"
+    assert out.exists()
+    assert not f.exists()
+
+
+def test_normalize_does_not_clobber(tmp_path):
+    """已經有同名成品時不要覆蓋，資料安全優先。"""
+    from vidgrab.media import _normalize_name
+
+    keep = tmp_path / "abc.mp4"
+    keep.write_bytes(b"original")
+    dup = tmp_path / "abc.f30077.mp4"
+    dup.write_bytes(b"dup")
+
+    out = _normalize_name(dup, "abc")
+    assert out == dup, "不該動它"
+    assert keep.read_bytes() == b"original"
