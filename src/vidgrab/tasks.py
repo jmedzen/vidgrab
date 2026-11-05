@@ -73,6 +73,7 @@ def run_search(
     sort: str = "smart",
     name: str | None = None,
     out: str | None = None,
+    replace: bool = False,
     emit: Emit = log,
 ) -> dict[str, Any]:
     queries = [q.strip() for q in queries if q and q.strip()]
@@ -144,7 +145,9 @@ def run_search(
     project_name = name or f"{today()}-{slugify(queries[0], 20)}"
     root = Path(out).expanduser() if out else projects_root()
     project = root / project_name
-    if project.exists() and (project / "results.json").exists():
+    if project.exists() and (project / "results.json").exists() and not replace:
+        # 預設不覆蓋：舊專案可能已經下載了片段，蓋掉會一起消失。
+        # 但「同一個主題重搜」很常見，所以給 --replace 明確表達意圖。
         project = Path(f"{project}-{time.strftime('%H%M%S')}")
     project.mkdir(parents=True, exist_ok=True)
 
@@ -264,13 +267,23 @@ def run_pick(
             emit("     ⚠ 沒有授權資訊：公開使用前請自行確認")
 
         if frames:
-            got = media.probe_frames(item, frames_dir, n=frame_count, opts=opts)
+            # 抽畫面只是輔助：抓不到就算了，不能讓它把整個作業帶走。
+            # 真的發生過：YouTube 長片抽幀逾時 → 整批 batch 回 internal，
+            # 明明片段已經下載成功，使用者卻收到失敗。
+            try:
+                got = media.probe_frames(item, frames_dir, n=frame_count, opts=opts)
+            except Exception as exc:  # noqa: BLE001
+                got = []
+                emit(f"     ▣ 抓畫面失敗（{type(exc).__name__}）：略過，不影響已下載的片段")
             if got:
-                media.contact_sheet(got, frames_dir / f"{item.platform}_{item.vid}_sheet.jpg")
+                try:
+                    media.contact_sheet(got, frames_dir / f"{item.platform}_{item.vid}_sheet.jpg")
+                except Exception:  # noqa: BLE001
+                    pass
                 item.thumbs = [str(f) for f in got]
                 emit(f"     ▣ 抓了 {len(got)} 格畫面")
-            else:
-                emit("     ▣ 抓畫面失敗（可能需要登入 cookies）")
+            elif frames:
+                emit("     ▣ 抓畫面失敗（可能需要登入 cookies），片段照樣保留")
 
         if dry_run or frame_only:
             continue
@@ -377,9 +390,16 @@ def run_pick(
                     "height": info.get("height"),
                     "full": start is None,
                     "cached": bool(info.get("cached")),
+                    # 直式／橫式：剪進橫式影片之前先看一眼，免得整段都是黑邊
+                    "orientation": (
+                        "portrait" if (info.get("height") or 0) > (info.get("width") or 0)
+                        else "landscape" if info.get("width") else ""
+                    ),
                 }
             )
             dims = f"{info.get('width')}×{info.get('height')}" if info.get("width") else ""
+            if (info.get("height") or 0) > (info.get("width") or 0):
+                emit(f"     ▤ 直式畫面（{dims}）：如果要剪橫式影片，記得裁切或用模糊底")
             what = "整支" if start is None else f"{fmt_ts(start)}–{fmt_ts(end or 0)}"
             grabbed += 1
             # 先存檔再回報：emit 可能拋錯（例如批次逾時），

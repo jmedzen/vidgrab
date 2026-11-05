@@ -81,7 +81,10 @@ def parse_ts(value: str) -> float:
             return int(groups[0]) * 60 + float(groups[1])
         if len(groups) == 1:
             return float(groups[0])
-    raise ValueError(f"看不懂的時間格式：{value}（可用 83、1:23、00:01:23）")
+    # 這是使用者輸入錯，不是程式壞了：要標成 bad_input 且不可重試。
+    # 原本拋裸 ValueError，被歸類成 internal + retryable，agent 會白重試一次。
+    hint = "可用 83、1:23、00:01:23；分與秒要兩位數，秒不能超過 59"
+    raise BadInput(f"看不懂的時間格式：{value}", hint=hint)
 
 
 def fmt_ts(seconds: float) -> str:

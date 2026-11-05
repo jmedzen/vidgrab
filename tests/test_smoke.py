@@ -1391,3 +1391,179 @@ def test_clip_progress_marks_estimated_flag():
     assert not real.get("estimated")
     # 沒有總量時不該謊報百分比
     assert real["percent"] is None
+
+
+def test_parse_ts_rejects_bad_input_as_user_error():
+    """時間格式寫錯要回 bad_input，不是 internal。
+
+    原本拋裸 ValueError，被包成 code=internal、retryable=true，
+    agent 會照著重試一次，然後還是同樣的錯。
+    """
+    from vidgrab.models import BadInput, parse_ts
+
+    assert parse_ts("1:23") == 83.0
+    assert parse_ts("00:01:23") == 83.0
+    assert parse_ts("12.5") == 12.5
+
+    for bad in ("0:100", "abc", "1:2:3:4", ""):
+        try:
+            parse_ts(bad)
+        except BadInput as exc:
+            assert exc.code == "bad_input"
+            assert exc.retryable is False, f"{bad} 重試也沒用，不該標成可重試"
+            assert exc.hint, "要告訴使用者正確寫法"
+        else:
+            raise AssertionError(f"{bad} 應該被拒絕")
+
+
+def test_frame_failure_does_not_kill_the_job(tmp_path, monkeypatch):
+    """抽畫面失敗不可以讓整個作業失敗。
+
+    真的發生過：YouTube 長片抽幀逾時 → 整批 batch 回 internal，
+    但片段其實已經下載好了，使用者卻收到失敗。
+    """
+    from vidgrab import media, tasks
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    proj = _make_project(tmp_path, "p1", items=[
+        {"platform": "youtube", "vid": "abc", "url": "https://x", "title": "長片",
+         "duration": 3654.0},
+    ])
+
+    def boom(*_a, **_k):
+        raise RuntimeError("模擬逾時")
+
+    monkeypatch.setattr(media, "probe_frames", boom)
+
+    logs: list[str] = []
+    result = tasks.run_pick(
+        proj, [0], frames=True, frame_count=1, frame_only=True, emit=logs.append
+    )
+    assert isinstance(result, dict), "抽幀失敗時仍然要回傳結果"
+    assert any("略過" in line or "照樣保留" in line for line in logs), (
+        "要留下降級訊息，不能靜默略過"
+    )
+
+
+def test_clip_summary_reports_orientation():
+    """直式與橫式要標出來。
+
+    直式片段（1080×1920）剪進橫式影片會整段黑邊，
+    選素材的人應該在清單上就看到，不必等下載完才發現。
+    """
+    from pathlib import Path
+
+    from vidgrab.agent import clip_summary
+
+    root = Path("/tmp")
+    portrait = clip_summary({"path": "a.mp4", "start": 10, "end": 25,
+                             "width": 1080, "height": 1920}, root)
+    assert portrait["orientation"] == "portrait"
+
+    landscape = clip_summary({"path": "b.mp4", "start": 10, "end": 25,
+                              "width": 1920, "height": 1080}, root)
+    assert landscape["orientation"] == "landscape"
+
+    # 舊資料沒有存 orientation，也要當場算得出來
+    assert portrait["width"] == 1080
+    assert landscape["height"] == 1080
+
+
+def test_vault_entry_shape_is_uniform_for_missing_projects(tmp_path, monkeypatch):
+    """資料夾消失的專案，回傳形狀也要跟正常專案一樣。
+
+    真的踩過：library 裡留著已刪除專案的記錄，vault 只回 5 個欄位，
+    呼叫方一取 items 就 KeyError，整個稽核腳本掛掉。
+    """
+    from vidgrab import agent, library, tasks
+
+    home = tmp_path / "projects"
+    monkeypatch.setenv("VIDGRAB_HOME", str(home))
+    proj = _make_project(tmp_path, "alive", items=[
+        {"platform": "b", "vid": "1", "url": "u", "title": "還活著"},
+    ])
+    agent.vault_manifest(with_items=True)   # 讓它進 library
+
+    # 第二個專案建好之後直接刪掉資料夾，模擬「清空 projects」
+    gone = _make_project(tmp_path, "gone", items=[
+        {"platform": "b", "vid": "2", "url": "u", "title": "要被刪"},
+    ])
+    agent.vault_manifest(with_items=True)
+    __import__("shutil").rmtree(gone)
+
+    v = agent.vault_manifest(with_items=True)
+    by_name = {p["name"]: p for p in v["projects"]}
+    assert "gone" in by_name, "消失的專案仍要出現在清單（叫使用者回來看）"
+    ghost = by_name["gone"]
+    assert ghost["missing"] is True
+    for key in ("items", "counts", "queries", "path", "title"):
+        assert key in ghost, f"消失的專案少了 {key}，形狀跟正常專案不一致"
+    assert ghost["items"] == []
+    assert ghost["counts"]["clips"] == 0
+    assert "items" in by_name["alive"]
+
+
+def test_search_default_keeps_old_project(tmp_path, monkeypatch):
+    """重搜同名專案時，預設**不可以**蓋掉舊的。
+
+    舊專案可能已經下載了片段，覆蓋下去片段會一起消失。
+    """
+    from vidgrab import tasks
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    proj = _make_project(tmp_path, "same", items=[
+        {"platform": "b", "vid": "keep", "url": "u", "title": "舊的"},
+    ])
+    assert (proj / "results.json").exists()
+
+    from vidgrab.models import Item
+
+    class _FakeSource:
+        name = "fake"
+        def search(self, *_a, **_k):
+            return [Item(platform="fake", vid="v1", url="https://x",
+                         title="假的素材", duration=120.0)]
+
+    monkeypatch.setattr(tasks, "get_sources", lambda _p: [_FakeSource()])
+    out = tasks.run_search(["x"], name="same", per_keyword=1, emit=lambda *_: None)
+    new_path = out["project"]
+    assert new_path.name != "same", "預設要另開一個，不能蓋掉舊專案"
+    assert proj.exists() and (proj / "results.json").exists(), "舊專案要原封不動"
+    assert "same" in new_path.name and len(new_path.name) > len("same")
+
+
+def test_forget_removes_deleted_project_from_library(tmp_path, monkeypatch):
+    """資料夾刪掉之後要能把清單記錄清掉。
+
+    forget 處理的正是「資料夾已經不見」的情況，
+    所以它不能走 resolve_project（那個要求資料夾存在，會直接報找不到）。
+    """
+    import os
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    proj = _make_project(tmp_path, "ghost", items=[
+        {"platform": "b", "vid": "1", "url": "u", "title": "會被刪"},
+    ])
+    env = {**os.environ, "PYTHONPATH": str(_ROOT / "src"),
+           "VIDGRAB_HOME": str(tmp_path / "projects")}
+
+    # 先讓它進 library
+    subprocess.run([sys.executable, "-m", "vidgrab.cli", "vault"],
+                   capture_output=True, text=True, timeout=60, env=env)
+    __import__("shutil").rmtree(proj)
+
+    r = subprocess.run([sys.executable, "-m", "vidgrab.cli", "vault"],
+                       capture_output=True, text=True, timeout=60, env=env)
+    assert "ghost" in r.stdout, "資料夾不見了，記錄還在（這是刻意的）"
+
+    r = subprocess.run([sys.executable, "-m", "vidgrab.cli", "forget", "ghost"],
+                       capture_output=True, text=True, timeout=60, env=env)
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data["removed"] == ["ghost"]
+
+    r = subprocess.run([sys.executable, "-m", "vidgrab.cli", "vault"],
+                       capture_output=True, text=True, timeout=60, env=env)
+    assert "ghost" not in r.stdout, "forget 之後記錄要消失"

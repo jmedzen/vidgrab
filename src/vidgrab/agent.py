@@ -53,6 +53,11 @@ def clip_summary(clip: dict[str, Any], root: Path, item: Item | None = None) -> 
         "size_human": human_size(clip.get("size_bytes") or 0),
         "width": clip.get("width"),
         "height": clip.get("height"),
+        # 直式片段剪進橫式影片會整段黑邊，agent 選素材時要先知道
+        "orientation": clip.get("orientation") or (
+            "portrait" if (clip.get("height") or 0) > (clip.get("width") or 0)
+            else "landscape" if clip.get("width") else ""
+        ),
         "cached": bool(clip.get("cached")),
     }
 
@@ -149,6 +154,14 @@ def vault_manifest(*, with_items: bool = False, with_description: bool = False) 
                 "pinned": meta["pinned"],
                 "missing": True,
                 "path": str(p.resolve()),
+                # 資料夾不見了：形狀仍要跟正常專案一致，
+                # 否則呼叫方取值時會 KeyError（真的發生過）。
+                "counts": {"candidates": 0, "clips": 0},
+                "bytes_on_disk": 0,
+                "size_human": "0B",
+                "queries": meta.get("queries") or [],
+                "created": meta.get("created") or "",
+                "items": [] if with_items else [],
             })
             continue
         summary = project_summary(p, with_items=with_items, with_description=with_description)

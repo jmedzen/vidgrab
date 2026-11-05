@@ -171,6 +171,7 @@ brew install ffmpeg uv
 
 ./vidgrab purge demo-taipei        # 篩掉教學／課程
 ./vidgrab prune demo-taipei        # 清孤兒檔案
+./vidgrab forget demo-taipei       # 從清單移除記錄
 ./vidgrab list          # 列出所有專案
 ./vidgrab login         # 掃碼登入 B 站
 ./vidgrab build         # 版本與 build number
@@ -355,6 +356,40 @@ yt-dlp 只在**結束時**吐一行進度，中間完全是空的。
 整支下載（不切片）走的是正常路徑，百分比是量出來的。
 
 > 進度卡出現時，底部控制台會自動往上讓，不會互相遮住。
+
+### 重搜同一個主題
+
+同名專案已存在時，`search` **預設不會覆蓋**——舊專案可能已經下載了片段，
+蓋掉會一起消失。它會另開一個帶時間戳的（`mytheme-184718`）。
+
+確定要覆蓋就明講：
+
+```bash
+./vidgrab search "香炉 寺庙" --name mytheme --replace
+```
+
+### 移除清單裡的記錄
+
+資料夾刪掉之後，清單預設**保留**記錄（暫時讀不到目錄不該讓清單消失）。
+確定不要了才移除：
+
+```bash
+./vidgrab forget mytheme
+```
+
+> `forget` 不能走一般的專案解析（那要求資料夾存在），
+> 它處理的正是「資料夾已經不見」的情況。
+
+### 直式片段會被標出來
+
+直式（1080×1920）剪進橫式影片會整段黑邊，所以下載時就會提醒：
+
+```
+▤ 直式畫面（1080×1920）：如果要剪橫式影片，記得裁切或用模糊底
+```
+
+`vault` 的 JSON 裡每個片段也帶 `orientation: portrait | landscape`，
+agent 選素材時不必自己比大小。
 
 ### 清理孤兒檔案
 

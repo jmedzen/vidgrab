@@ -195,6 +195,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         sort=values["sort"],
         name=args.name,
         out=args.out,
+        replace=getattr(args, "replace", False),
     )
     project, items = result["project"], result["items"]
     if args.json:
@@ -432,6 +433,36 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 def emit_json(payload: dict | list) -> None:
     """機器可讀輸出。agent 靠這個，不要印任何其他人類文字到 stdout。"""
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    """把專案從素材庫清單移除（資料夾已刪掉、清單還留著記錄時用）。
+
+    預設不自動移除——資料夾暫時讀不到不該讓清單消失。
+    所以要移除得自己講。
+    """
+    from . import library
+
+    lib = library.load()
+    known = set(lib.get("items") or {})
+    # 這裡**不能**用 resolve_project：它要求資料夾真的存在，
+    # 而 forget 正是用來處理「資料夾已經刪掉、清單還留著」的情況。
+    names = []
+    for raw in args.projects:
+        name = Path(raw).name if Path(raw).exists() else raw
+        names.append(name)
+
+    gone = [n for n in names if n not in known]
+    lib = library.forget(lib, names)
+    library.save(lib)
+
+    emit_json({
+        "schema": "vidgrab.forget/1",
+        "removed": [n for n in names if n not in gone],
+        "not_found": gone,
+        "remaining": len(lib.get("items") or {}),
+    })
+    return 0
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
@@ -798,6 +829,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--save", action="store_true",
                    help="把這次的參數存成預設值，之後不用再打")
     s.add_argument("--name", help="專案名稱（預設 日期-關鍵字）")
+    s.add_argument(
+        "--replace", action="store_true",
+        help="同名專案已存在時直接覆蓋（預設會另開一個帶時間戳的，避免蓋掉已下載的片段）",
+    )
     s.add_argument("--out", help="專案放哪個資料夾（預設 ./projects）")
     s.add_argument("--json", action="store_true", help="輸出 JSON（給程式用）")
     s.set_defaults(func=cmd_search)
@@ -850,6 +885,10 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--save", action="store_true", help="把這次的選項存成預設")
     bt.add_argument("--timeout", type=float, help="這個批次最多跑幾秒（超過就中止）")
     bt.set_defaults(func=cmd_batch)
+
+    pf = sub.add_parser("forget", help="把專案從素材庫清單移除（資料夾已刪掉時用）")
+    pf.add_argument("projects", nargs="+", help="專案名稱（可多個）")
+    pf.set_defaults(func=cmd_forget)
 
     pn = sub.add_parser("prune", help="清掉磁碟上沒被清單追蹤的孤兒檔案")
     pn.add_argument("project", nargs="?", help="專案名稱或路徑（省略 = 最新）")
