@@ -87,4 +87,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8310/api/version', timeout=4).status == 200 else 1)"
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["vidgrab", "web", "--no-open"]
+# 容器裡一定要綁 0.0.0.0，否然外面連不到（port 映射由 docker run 控制）。
+# 這是明確的選擇，所以帶上 --allow-lan。
+CMD ["vidgrab", "web", "--no-open", "--allow-lan"]

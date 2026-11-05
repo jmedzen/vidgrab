@@ -1846,3 +1846,27 @@ def test_job_message_log_is_capped():
         job.emit(f"line {i}")
     assert len(job.messages) <= web.MAX_JOB_MESSAGES
     assert len(job.messages) > 0
+
+
+def test_dockerfile_opts_into_lan_binding():
+    """Docker 裡綁 0.0.0.0 是對的，但必須明確帶 --allow-lan。
+
+    踩過：加了「非本機位址要 --allow-lan」的防護之後，
+    Dockerfile 的 VIDGRAB_HOST=0.0.0.0 讓容器起不來，CI 的
+    smoke test 連不上 8310。兩邊要一致。
+    """
+    dockerfile = (_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    binds_public = "VIDGRAB_HOST=0.0.0.0" in dockerfile
+    assert binds_public, "前提：容器需要綁 0.0.0.0 才連得到"
+
+    cmd_line = next(
+        (ln for ln in dockerfile.splitlines()
+         if ln.strip().startswith("CMD") and "vidgrab" in ln),
+        "",
+    )
+    assert "web" in cmd_line, f"找不到 web 的 CMD：{cmd_line!r}"
+    assert "--allow-lan" in cmd_line, (
+        "容器綁 0.0.0.0 卻沒帶 --allow-lan，會啟動失敗："
+        f"{cmd_line!r}"
+    )
