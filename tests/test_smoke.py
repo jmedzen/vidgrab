@@ -485,3 +485,73 @@ def test_unpin_keeps_order_sane():
     library.set_pinned(data, "c", False)
     assert set(data["order"]) == {"a", "b", "c"}
     assert not any(data["items"][f]["pinned"] for f in data["order"])
+
+
+def test_no_hardcoded_browser():
+    """開瀏覽器一律走 webbrowser.open()＝系統預設，不可以寫死特定瀏覽器。
+
+    這條是有代價換來的：驗證工具曾經用假的 HOME 硬開 Chrome，
+    在 macOS 上跳出「Keychain Not Found」的視窗嚇到使用者。
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "vidgrab"
+    banned = re.compile(
+        r"Google Chrome\.app|chrome\.exe|msedge\.exe|start\s+chrome|open\s+-a\s+[\"']?"
+        r"|subprocess\.[a-z_]*\(\s*\[?\s*[\"'][^\"']*chrome"
+    )
+    offenders = []
+    for py in src.rglob("*.py"):
+        text = py.read_text(encoding="utf-8")
+        for m in banned.finditer(text):
+            # UA 字串與 --cookies-from-browser 只是「假裝成 Chrome」，不是開瀏覽器
+            line = text[: m.start()].count("\n") + 1
+            context = text.splitlines()[line - 1]
+            if "Chrome/1" in context or "cookies" in context.lower():
+                continue
+            offenders.append(f"{py.name}:{line}: {context.strip()}")
+    assert not offenders, "發現寫死瀏覽器的地方：\n" + "\n".join(offenders)
+
+
+def test_check_ui_never_fakes_home():
+    """驗證工具不可以覆寫 HOME 去硬開瀏覽器（會破壞 macOS 鑰匙圈）。"""
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] / "tools" / "check_ui.py").read_text(
+        encoding="utf-8"
+    )
+    code_lines = [
+        ln for ln in script.splitlines()
+        if not ln.strip().startswith("#") and "HOME" in ln
+    ]
+    # 只允許註解裡提到 HOME（解釋為什麼不能用），不可以真的設定 env
+    for ln in code_lines:
+        assert not ln.strip().startswith(("env", "os.environ")), f"不該覆寫 HOME：{ln}"
+        assert '"HOME"' not in ln and "'HOME'" not in ln, f"不該覆寫 HOME：{ln}"
+
+
+def test_check_ui_launcher_is_safe():
+    """啟動器要安全：不寫死單一瀏覽器、要有 --no-sandbox、要能優雅跳過。"""
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] / "tools" / "check_ui.py").read_text(
+        encoding="utf-8"
+    )
+    # 找多個 Chromium（不要只認 Chrome）
+    for name in ("Edge", "Brave", "Chromium"):
+        assert name in script, f"啟動器應該也認 {name}"
+    # 沙箱環境裡 Chrome sandbox 起不來會崩潰
+    assert '"--no-sandbox"' in script
+    # 找不到瀏覽器要回傳 2（呼叫端可據此視為「略過」而不是「失敗」）
+    assert "return 2" in script
+
+
+def test_dev_extra_has_websocket_client():
+    """check_ui 需要 websocket-client，必須在 dev extras 裡，否則乾淨環境跑不動。"""
+    from pathlib import Path
+
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    assert "websocket-client" in pyproject

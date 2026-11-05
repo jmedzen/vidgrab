@@ -24,7 +24,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4", "ruff>=0.6"]
+dev = [
+  "pytest>=7.4",
+  "ruff>=0.6",
+  # 介面自我驗證（tools/check_ui.py）要透過 CDP 遙控瀏覽器
+  "websocket-client>=1.6",
+]
 
 [project.scripts]
 vidgrab = "vidgrab.cli:main"

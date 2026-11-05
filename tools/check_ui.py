@@ -1,19 +1,125 @@
 #!/usr/bin/env python3
-"""用 CDP 在真的 Chrome 裡驗證介面：主題、側欄寬度、播放器、JS 錯誤。
+"""用 CDP 驗證介面：主題、側欄寬度、播放器、素材庫、JS 錯誤。
 
 比截圖可靠（截圖在 headless 常常逾時），而且能直接斷言。
+
+⚠️ 這是「開發時的自我驗證」，不是程式執行的一部分。
+   vidgrab 本身開介面用的是 webbrowser.open()，也就是**系統預設瀏覽器**，
+   完全不需要 Chrome。
+
+CDP 是 Chromium 系專有的協定（Firefox／Safari 用的是別的機制），
+所以這個檢查工具只認 Chromium 系（Chrome／Edge／Brave／Chromium）。
+沒偵測到就直接跳過，不會幫你亂開瀏覽器。
+
+用法：
+    python tools/check_ui.py                # 連現有的 CDP（9222）
+    python tools/check_ui.py --launch       # 自己起一個隔離的 Chromium
+    python tools/check_ui.py --launch --headful   # 想看畫面就加這個
 """
 
 from __future__ import annotations
 
 import json
+import os
+import platform
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
-import websocket
+try:
+    import websocket
+except ImportError:  # pragma: no cover - 只在使用者環境缺套件時觸發
+    print("✗ 缺少 websocket-client（介面驗證要用它透過 CDP 遙控瀏覽器）")
+    print("  安裝： pip install websocket-client")
+    print("  或：   pip install -e '.[dev]'")
+    raise SystemExit(2)
 
 CDP = "http://127.0.0.1:9222"
+
+# Chromium 系的候選路徑。順序＝偏好順序，全都不是預設瀏覽器也無妨，
+# 因為這只是驗證用的臨時實例，跑完就關掉。
+_CHROMIUM = {
+    "Darwin": [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ],
+    "Linux": [
+        "google-chrome", "google-chrome-stable", "chromium",
+        "chromium-browser", "microsoft-edge", "brave-browser",
+    ],
+    "Windows": [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    ],
+}
+
+
+def find_chromium() -> str | None:
+    """找一個 Chromium 系執行檔；找不到回 None（不猜、不亂裝）。"""
+    for cand in _CHROMIUM.get(platform.system(), []):
+        if os.path.sep in cand and os.path.exists(cand):
+            return cand
+        found = shutil.which(cand)
+        if found:
+            return found
+    # 最後試 PATH 裡的通用名稱
+    for name in ("chrome", "chromium", "msedge", "brave"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def cdp_alive(timeout: float = 1.5) -> bool:
+    try:
+        with urllib.request.urlopen(f"{CDP}/json/version", timeout=timeout) as r:
+            json.loads(r.read())
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def launch_chromium(headful: bool = False) -> subprocess.Popen | None:
+    """起一個隔離的 Chromium 實例。
+
+    兩個關鍵點，都是踩過的坑：
+
+    1. **不要動 HOME**。用假的 HOME 會讓瀏覽器找不到系統鑰匙圈，
+       macOS 就跳出「Keychain Not Found」的視窗。用 --user-data-dir 隔離就夠了。
+    2. 需要 --no-sandbox。在沙箱化的環境裡，Chrome 自己的 sandbox 初始化會失敗
+       （sandbox initialization failed: Operation not permitted）然後直接崩潰。
+       這裡只是跑驗證、開本機頁面，關掉 sandbox 沒有額外風險。
+    """
+    exe = find_chromium()
+    if not exe:
+        return None
+
+    profile = tempfile.mkdtemp(prefix="vidgrab-cdp-")
+    args = [
+        exe,
+        f"--user-data-dir={profile}",
+        "--remote-debugging-port=9222",
+        "--no-sandbox",  # 沙箱環境裡 Chrome 自己的 sandbox 起不來會崩潰
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "http://127.0.0.1:8310/",  # 直接開目標頁，避免 about:blank 被取代時斷線
+    ]
+    if not headful:
+        args.insert(1, "--headless=new")
+    return subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,  # 不要跟著終端機一起被砍
+    )
 
 
 def get(url: str):
@@ -86,6 +192,53 @@ class Tab:
 def main() -> int:
     import urllib.parse as up
 
+    argv = sys.argv[1:]
+    launch = "--launch" in argv
+    headful = "--headful" in argv
+
+    # 先確認 Web UI 有在跑，否則後面的失敗訊息會很誤導
+    try:
+        urllib.request.urlopen("http://127.0.0.1:8310/api/version", timeout=3).read()
+    except Exception:  # noqa: BLE001
+        print("✗ 找不到正在跑的 vidgrab Web UI（http://127.0.0.1:8310）")
+        print("  請先在另一個終端機執行：./vidgrab web")
+        return 2
+
+    proc = None
+    if not cdp_alive():
+        if not launch:
+            print("✗ 沒有偵測到 CDP（http://127.0.0.1:9222）")
+            print("  這是介面的自我驗證工具，需要一個 Chromium 系的瀏覽器提供 CDP。")
+            print("  要讓它自己起一個臨時實例：python tools/check_ui.py --launch")
+            print("  （vidgrab 本身開介面用的是系統預設瀏覽器，不需要 Chrome）")
+            return 2
+        print("… 啟動臨時 Chromium（跑完會關掉）")
+        proc = launch_chromium(headful=headful)
+        if not proc:
+            print("✗ 找不到 Chromium 系瀏覽器（Chrome／Edge／Brave／Chromium）")
+            print("  這個檢查需要 CDP，Firefox／Safari 不支援。")
+            return 2
+        for _ in range(40):  # 最多等 8 秒
+            if cdp_alive(0.5):
+                break
+            time.sleep(0.2)
+        else:
+            print("✗ Chromium 起來了但 CDP 沒就緒")
+            proc.terminate()
+            return 2
+
+    try:
+        return _run()
+    finally:
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                proc.kill()
+
+
+def _run() -> int:
     tab_id = new_tab("http://127.0.0.1:8310/")
     with urllib.request.urlopen(f"{CDP}/json/list", timeout=10) as r:
         tabs = json.loads(r.read())

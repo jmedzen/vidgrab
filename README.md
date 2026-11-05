@@ -361,9 +361,26 @@ Docker 建置會自動帶入，容器內 `vidgrab build` 就知道跑的是哪�
 
 ```bash
 ./vidgrab test                     # pytest + Dockerfile 靜態檢查
-./vidgrab test --ui                # 另外用真的 Chrome 驗證介面
+./vidgrab test --ui                # 另外驗證介面（自動起臨時 Chromium）
 python tools/stamp_build.py        # 手動寫入 build number
 python tools/check_docker.py       # 只跑 Dockerfile 檢查
+```
+
+### 關於瀏覽器
+
+vidgrab 開介面、開報告、開 QR 圖，一律用 `webbrowser.open()`，
+也就是**你系統的預設瀏覽器** —— 不需要 Chrome，也沒有任何寫死的瀏覽器路徑。
+（有測試 `test_no_hardcoded_browser` 盯著這件事。）
+
+只有 `--ui` 的介面自我驗證需要 CDP，那是 Chromium 系專有的協定
+（Firefox／Safari 不支援）。它會自己起一個**臨時的、用完就關**的 Chromium；
+找不到就直接跳過並說明原因，不會擅自幫你開瀏覽器、也不會改動你的 HOME
+或既有瀏覽器設定。
+
+```bash
+python tools/check_ui.py                 # 連現有的 CDP（9222）
+python tools/check_ui.py --launch        # 自己起一個臨時的（建議）
+python tools/check_ui.py --launch --headful   # 想看到畫面就加這個
 ```
 
 專案結構：

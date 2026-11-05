@@ -388,10 +388,17 @@ def cmd_test(args: argparse.Namespace) -> int:
     # 介面檢查要開瀏覽器，不是每次都需要；用 --ui 明確要求
     if getattr(args, "ui", False):
         ui = root / "tools" / "check_ui.py"
-        if ui.exists():
+        if not ui.exists():
+            print("! 找不到 tools/check_ui.py，略過介面檢查")
+        else:
             print()
-            rc = subprocess.call([sys.executable, str(ui)])
-            if rc != 0:
+            # --launch：沒偵測到 CDP 就自己起一個臨時 Chromium。
+            # 注意這不是「幫你開瀏覽器看介面」——vidgrab 開介面用的是系統預設瀏覽器，
+            # 這裡只是為了能下斷言而需要一個可遙控的 Chromium。
+            rc = subprocess.call([sys.executable, str(ui), "--launch"])
+            if rc == 2:
+                print("! 介面檢查需要 Chromium 系瀏覽器（CDP），這台機器上找不到，已略過")
+            elif rc != 0:
                 code = rc
     return code
 
@@ -562,7 +569,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     tst = sub.add_parser("test", help="跑煙霧測試")
     tst.add_argument("--ui", action="store_true",
-                     help="另外用真的 Chrome 驗證介面（需要 Chrome 在 9222 開 CDP）")
+                     help="另外驗證介面（會自動起一個臨時的 Chromium，跑完關掉）")
     tst.set_defaults(func=cmd_test)
 
     bd = sub.add_parser("build", help="顯示版本與 build number")
