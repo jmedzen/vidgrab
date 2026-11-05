@@ -814,6 +814,22 @@ def cmd_web(args: argparse.Namespace) -> int:
     saved = config.load()
     host = args.host or os.environ.get("VIDGRAB_HOST") or saved.get("host") or "127.0.0.1"
     port = args.port or int(os.environ.get("VIDGRAB_PORT") or saved.get("port") or 8310)
+
+    # 這個服務沒有任何登入機制，綁到 0.0.0.0 等於把素材庫、
+    # 下載能力、B 站登入狀態開放給整個區網。要這樣做必須自己明講。
+    exposed = host not in ("127.0.0.1", "localhost", "::1")
+    if exposed and not getattr(args, "allow_lan", False):
+        sys.stderr.write(
+            f"✗ 拒絕綁定到 {host}：這個介面沒有登入機制。\n"
+            "  綁到區網等於讓同網段的任何人下載／修改你的素材。\n"
+            "  真的要這樣做，加 --allow-lan 表示你知道風險。\n"
+        )
+        return 2
+    if exposed:
+        sys.stderr.write(
+            f"⚠ 綁定到 {host}：同網段的人都能打開這個介面（沒有密碼）。\n"
+        )
+
     serve(host=host, port=port, open_browser=not args.no_open)
     return 0
 
@@ -986,6 +1002,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     w = sub.add_parser("web", help="開 Web UI（本機網頁介面）")
     w.add_argument("--host", default=None, help="預設讀 VIDGRAB_HOST，否則 127.0.0.1")
+    w.add_argument(
+        "--allow-lan", action="store_true",
+        help="允許綁定到非本機位址（這個介面沒有登入機制，開放區網請自行評估）",
+    )
     w.add_argument("--port", type=int, default=None, help="預設讀 VIDGRAB_PORT，否則 8310")
     w.add_argument("--no-open", action="store_true", help="不要自動開瀏覽器")
     w.set_defaults(func=cmd_web)

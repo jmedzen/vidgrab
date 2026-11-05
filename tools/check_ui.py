@@ -555,6 +555,43 @@ def _run() -> int:
         time.sleep(0.6)
         check("按 Esc 會關閉播放器", not _is_open())
 
+    print("── 可及性")
+    no_alt = tab.js(
+        "Array.from(document.querySelectorAll('img'))"
+        ".filter(i=>!i.hasAttribute('alt')).length"
+    )
+    check("圖片都有 alt", no_alt == 0, f"{no_alt} 張沒有")
+
+    no_name = tab.js("""
+      JSON.stringify(Array.from(document.querySelectorAll('button'))
+        .filter(b => !(b.textContent||'').trim()
+                     && !b.getAttribute('aria-label')
+                     && !b.getAttribute('title'))
+        .map(b => b.id || b.className))
+    """)
+    check("按鈕都有可讀名稱", json.loads(no_name or "[]") == [], no_name or "")
+
+    unnamed = tab.js("""
+      Array.from(document.querySelectorAll('input,select,textarea')).filter(el => {
+        if (el.getAttribute('aria-label') || el.getAttribute('placeholder')) return false;
+        if (el.id && document.querySelector(`label[for="${el.id}"]`)) return false;
+        return !el.closest('label');
+      }).length
+    """)
+    check("輸入元件都有標籤", (unnamed or 0) <= 3, f"{unnamed} 個沒有")
+
+    live = tab.js("document.querySelectorAll('[aria-live]').length")
+    check("有 aria-live 區域（進度會被唸出來）", (live or 0) >= 2, f"{live} 個")
+
+    # 可點區域：真正的按鈕不該小到難點
+    # （卡片標題那種容器式 <a> 不算操作目標，排除掉）
+    small = tab.js("""
+      Array.from(document.querySelectorAll('button, a.mini'))
+        .filter(e => { const r = e.getBoundingClientRect();
+                       return r.width > 0 && (r.height < 28 || r.width < 26); }).length
+    """)
+    check("按鈕不會小到難點", (small or 0) == 0, f"{small} 個偏小")
+
     print("── 素材庫面板")
     # 先從 API 取狀態（面板還沒開，DOM 是空的），測完再還原
     snap = get("http://127.0.0.1:8310/api/projects")

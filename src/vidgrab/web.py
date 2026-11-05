@@ -5,6 +5,8 @@ from __future__ import annotations
 import html
 import json
 import queue
+import select
+import socket
 import threading
 import time
 import traceback
@@ -45,18 +47,23 @@ class Job:
         self.result: dict[str, Any] = {}
         self.queue: queue.Queue = queue.Queue()
         self.started = time.time()
+        self.finished = 0.0
 
     def emit(self, message: str) -> None:
-        self.messages.append(message)
+        # 日誌限長：長時間下載會產生上萬行，全留在記憶體裡沒有意義
+        if len(self.messages) < MAX_JOB_MESSAGES:
+            self.messages.append(message)
         self.queue.put(("log", message))
 
     def finish(self, result: dict[str, Any]) -> None:
         self.done = True
+        self.finished = time.time()
         self.result = result
         self.queue.put(("done", result))
 
     def fail(self, message: str) -> None:
         self.done = True
+        self.finished = time.time()
         self.error = message
         self.queue.put(("error", message))
 
@@ -85,7 +92,39 @@ def _jsonable(data: Any) -> Any:
     return data
 
 
+MAX_FINISHED_JOBS = 40
+JOB_TTL = 30 * 60          # 完成後保留 30 分鐘，足夠你回頭看結果
+MAX_JOB_MESSAGES = 2000    # 單一 job 的日誌上限，避免長時間下載把記憶體吃光
+
+
+def _prune_jobs() -> None:
+    """清掉已經結束的舊 job。
+
+    這裡原本只寫不刪：每跑一次搜尋／下載就留一個 Job（含完整結果與日誌），
+    開著一整天會一直長大。
+    """
+    now = time.time()
+    with LOCK:
+        dead = [
+            jid for jid, job in JOBS.items()
+            if getattr(job, "done", False)
+            and now - getattr(job, "finished", getattr(job, "started", now)) > JOB_TTL
+        ]
+        for jid in dead:
+            JOBS.pop(jid, None)
+
+        # 就算都還很新，也不要無限累積
+        finished = sorted(
+            ((getattr(j, "finished", getattr(j, "started", 0)), jid)
+             for jid, j in JOBS.items() if getattr(j, "done", False)),
+            reverse=True,
+        )
+        for _, jid in finished[MAX_FINISHED_JOBS:]:
+            JOBS.pop(jid, None)
+
+
 def start_job(kind: str, label: str, fn) -> Job:
+    _prune_jobs()
     job = Job(kind, label)
     with LOCK:
         JOBS[job.id] = job
@@ -134,7 +173,10 @@ def _thumb_url(thumb: str | None, project: Path) -> str:
 
 def clip_info(clip: dict[str, Any], project: Path, root: Path) -> dict[str, Any]:
     path = Path(clip.get("path", ""))
-    rel = str(path.relative_to(project)) if str(path).startswith(str(project)) else str(path)
+    try:
+        rel = str(path.relative_to(project))
+    except ValueError:
+        rel = str(path)
     # 整支下載時 start/end 是 None（不是「沒有這個 key」），要當成整支
     start = clip.get("start")
     end = clip.get("end")
@@ -160,7 +202,10 @@ def item_payload(item: Item, index: int, project: Path) -> dict[str, Any]:
     for f in item.thumbs:
         p = Path(f)
         if p.exists():
-            rel = str(p.relative_to(project)) if str(p).startswith(str(project)) else p.name
+            try:
+                rel = str(p.relative_to(project))
+            except ValueError:
+                rel = p.name
             thumbs.append(f"/file/{urllib.parse.quote(project.name)}/{urllib.parse.quote(rel)}")
     return {
         "index": index,
@@ -753,8 +798,34 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
+    def _origin_ok(self) -> bool:
+        """擋掉跨站請求（CSRF）。
+
+        這個服務沒有登入機制，所以「瀏覽器幫你送出的請求」跟「你自己按的」
+        分不出來。做法是只認本機來源：
+        - 沒有 Origin／Referer（curl、本機程式）→ 放行
+        - 有，就必須是 127.0.0.1 / localhost / ::1 的位址
+        """
+        for header in ("Origin", "Referer"):
+            value = self.headers.get(header)
+            if not value:
+                continue
+            try:
+                host = urllib.parse.urlparse(value).hostname or ""
+            except ValueError:
+                return False
+            if host in ("127.0.0.1", "localhost", "::1", "[::1]"):
+                return True
+            return False
+        return True
+
     def do_POST(self) -> None:  # noqa: N802
         route = urllib.parse.urlparse(self.path).path
+
+        if not self._origin_ok():
+            self._json({"error": "跨站請求已被拒絕"}, 403)
+            return
+
         body = self._body()
 
         if route == "/api/library":
@@ -1010,16 +1081,35 @@ class Handler(BaseHTTPRequestHandler):
                     return
             while True:
                 try:
-                    kind, payload = job.queue.get(timeout=20)
+                    kind, payload = job.queue.get(timeout=5)
                 except queue.Empty:
+                    # 客戶端可能早就斷了。只寫 ping 的話，
+                    # 要等到下一次 flush 失敗才發現（原本是 20 秒一輪）。
+                    # 先用 select 確認連線還在，斷了就立刻收工。
+                    if self._peer_gone():
+                        return
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
                     continue
                 self._event(kind, payload)
                 if kind in ("done", "error"):
                     break
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return
+
+    def _peer_gone(self) -> bool:
+        """連線的另一端還在嗎？（不回傳資料，只問 socket 狀態）"""
+        try:
+            import select
+
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            if not readable:
+                return False
+            # 可讀但沒有資料 → 對方關閉了
+            data = self.connection.recv(1, socket.MSG_PEEK)
+            return data == b""
+        except (OSError, ValueError):
+            return True
 
     def _event(self, kind: str, payload: Any) -> None:
         data = json.dumps(_jsonable(payload), ensure_ascii=False)
@@ -1036,7 +1126,17 @@ class Handler(BaseHTTPRequestHandler):
         project_name, rel = urllib.parse.unquote(parts[0]), urllib.parse.unquote(parts[1])
         project = tasks.projects_root() / project_name
         target = (project / rel).resolve()
-        if not str(target).startswith(str(project.resolve())) or not target.exists() or target.is_dir():
+        # 不能用 str.startswith 判斷！那是路徑穿越漏洞：
+        #   /projects/victim  vs  /projects/victim-evil/secret.txt
+        #   字串前綴成立，於是 `victim` 這個專案可以讀到 `victim-evil` 的檔案。
+        # 用 relative_to 才是真的在比目錄層級。
+        try:
+            base = project.resolve()
+            target.relative_to(base)
+        except (ValueError, OSError):
+            self._send(404, b"not found", "text/plain")
+            return
+        if not target.exists() or target.is_dir():
             self._send(404, b"not found", "text/plain")
             return
         ctype = {
@@ -1361,7 +1461,11 @@ PAGE = r"""<!doctype html>
   .thumbs img { width:196px; height:110px; object-fit:cover; border-radius:7px; border:1px solid var(--line); background:#000; cursor:zoom-in; }
   .clipbox { margin-top:9px; font-size:12.5px; display:grid; gap:5px; }
   .clip-row { display:flex; align-items:center; gap:9px; color:var(--muted); }
-  .clip-row a { color:var(--accent); text-decoration:none; }
+  .clip-row a {
+    color:var(--accent); text-decoration:none;
+    /* 文字本身 20px 高不好點，用 padding 把可點範圍撐到 30px */
+    padding:5px 0; display:inline-block;
+  }
   .clip-row code { background:var(--code-bg); padding:1px 6px; border-radius:5px; font-size:11.5px; }
   .clip-thumb {
     flex:none; width:74px; height:42px; object-fit:cover; border-radius:5px;
@@ -1525,6 +1629,9 @@ PAGE = r"""<!doctype html>
   .mini {
     font-size:11.5px; padding:3px 9px; border-radius:7px; border:1px solid var(--line);
     background:var(--panel2); color:var(--muted); cursor:pointer;
+    /* 可點區域至少 32px 高：原本 26px，觸控板與小手都不好點 */
+    min-height:32px; min-width:52px; display:inline-flex; align-items:center;
+    justify-content:center;
   }
   .mini:hover { color:var(--text); border-color:var(--accent); }
   .mini.on { border-color:var(--accent); color:var(--text); background:var(--accent-soft); }
@@ -1681,7 +1788,7 @@ PAGE = r"""<!doctype html>
   <div class="row1">
     <span class="badge" id="dlbadge">下載中</span>
     <span class="name" id="dlname">準備中…</span>
-    <span class="pct" id="dlpct">0%</span>
+    <span class="pct" id="dlpct" role="status" aria-live="polite" aria-label="下載進度">0%</span>
   </div>
   <div id="dlbar"><div id="dlfill"></div></div>
   <div id="dltotal"><div id="dltotalfill"></div></div>
@@ -1690,8 +1797,8 @@ PAGE = r"""<!doctype html>
     <span id="dleta"></span>
   </div>
 </div>
-<div id="console"></div>
-<div class="toast" id="toast"></div>
+<div id="console" role="log" aria-live="polite" aria-label="執行日誌"></div>
+<div class="toast" id="toast" role="status" aria-live="assertive"></div>
 <div class="modal" id="loginmodal">
   <div class="sheet">
     <h3>掃碼登入 B 站</h3>
@@ -1707,7 +1814,7 @@ PAGE = r"""<!doctype html>
       <h2 id="libtitle">我的素材專案</h2>
       <span class="count" id="libcount"></span>
       <span class="grow"></span>
-      <select id="libsort" title="排序方式" style="width:150px">
+      <select id="libsort" aria-label="排序方式" title="排序方式" style="width:150px">
         <option value="manual">手動順序</option>
         <option value="created">建立時間</option>
         <option value="name">名稱</option>
@@ -2215,13 +2322,14 @@ function render() {
   const cards = items.map(it => {
     const sel = SELECTED.has(it.index);
     const thumbs = it.thumbs.length
-      ? `<div class="thumbs">${it.thumbs.map(t => `<img src="${esc(t)}" loading="lazy" onclick="lightbox('img','${esc(t)}')">`).join('')}</div>`
+      ? `<div class="thumbs">${it.thumbs.map(t => `<img src="${esc(t)}" loading="lazy" alt="影片畫面" onclick="lightbox('img','${esc(t)}')">`).join('')}</div>`
       : '';
     const clips = it.clips.length
       ? `<div class="clipbox">${it.clips.map((c, ci) => `
           <div class="clip-row">
             ${c.thumb
-              ? `<img class="clip-thumb" src="${esc(c.thumb)}" loading="lazy" title="這一格就是這個片段"
+              ? `<img class="clip-thumb" src="${esc(c.thumb)}" loading="lazy"
+                      alt="${esc(c.name)} 的畫面預覽" title="這一格就是這個片段"
                       onclick="lightbox('img','${esc(c.thumb)}')">`
               : `<span class="clip-thumb clip-nothumb" title="沒有縮圖">無圖</span>`}
             <a href="${esc(c.rel)}" data-play="${esc(c.rel)}" data-name="${esc(c.name)}">${esc(c.name)}</a>
@@ -2274,17 +2382,17 @@ function render() {
         <input type="checkbox" id="selall"> 全選
       </label>
       <span class="sp"></span>
-      <select id="mode" style="width:132px">
+      <select id="mode" aria-label="切片方式" style="width:132px">
         <option value="auto">切片（每段固定）</option>
         <option value="range">切片（自訂區段）</option>
         <option value="full">整支下載</option>
       </select>
       <span class="sub" id="perlabel" style="margin:0">每段</span>
-      <input type="number" id="per" value="15" min="1" step="1" style="width:66px">
+      <input type="number" id="per" value="15" min="1" step="1" aria-label="每段秒數" style="width:66px">
       <span class="sub" id="persuffix" style="margin:0">秒</span>
       <input type="text" id="starts" placeholder="指定秒數，如 90, 3:20" style="width:170px">
       <input type="text" id="ranges" placeholder="區段，如 1:00-2:30, 5:00-6:00" style="width:230px;display:none">
-      <select id="height" style="width:104px">
+      <select id="height" aria-label="解析度" style="width:104px">
         <option value="2160">4K</option>
         <option value="1440">1440p</option>
         <option value="1080" selected>1080p</option>
@@ -2359,7 +2467,7 @@ function playClip(rel, name) {
     (it.clips || []).some(c => c.rel === rel));
   const thumbList = (item && item.thumbs) || [];
   if (thumbList.length) {
-    frames.innerHTML = thumbList.map(t => `<img src="${esc(t)}" onclick="seekToFrame('${esc(t)}')">`).join('');
+    frames.innerHTML = thumbList.map(t => `<img src="${esc(t)}" alt="畫面節點" onclick="seekToFrame('${esc(t)}')">`).join('');
   }
 
   // 標記清單中正在播放的那一列
@@ -2430,7 +2538,9 @@ function initPlayer() {
 
 function lightbox(kind, src) {
   const box = $('#lightbox');
-  box.innerHTML = kind === 'img' ? `<img src="${src}">` : `<video src="${src}" controls autoplay></video>`;
+  box.innerHTML = kind === 'img'
+    ? `<img src="${src}" alt="放大檢視">`
+    : `<video src="${src}" controls autoplay></video>`;
   box.classList.add('show');
   box.onclick = () => { box.classList.remove('show'); box.innerHTML = ''; };
 }

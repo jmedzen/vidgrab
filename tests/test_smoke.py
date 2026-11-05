@@ -1682,3 +1682,167 @@ def test_agent_exposes_clip_thumb(tmp_path, monkeypatch):
         tmp_path,
     )
     assert missing["has_thumb"] is False
+
+
+def test_file_route_blocks_prefix_path_traversal(tmp_path, monkeypatch):
+    """`/file/` 不可以被前綴相同的專案名穿越。
+
+    真的踩過：判斷寫成 str(target).startswith(str(project))，
+    於是 /projects/victim 這個專案能讀到 /projects/victim-evil/secret.txt
+    ——字串前綴成立，但那是**另一個專案**的檔案。
+    """
+    import http.client
+
+    from vidgrab import web
+
+    root = tmp_path / "projects"
+    (root / "victim" / "clips").mkdir(parents=True)
+    (root / "victim" / "manifest.json").write_text("{}", encoding="utf-8")
+    (root / "victim" / "clips" / "ok.txt").write_text("INSIDE", encoding="utf-8")
+    (root / "victim-evil").mkdir(parents=True)
+    (root / "victim-evil" / "secret.txt").write_text("SECRET", encoding="utf-8")
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(root))
+
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    port = srv.server_address[1]
+    try:
+        def get(path: str) -> tuple[int, str]:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
+            c.putheader("Host", "127.0.0.1")
+            c.endheaders()
+            r = c.getresponse()
+            body = r.read().decode("utf-8", "replace")
+            c.close()
+            return r.status, body
+
+        code, body = get("/file/victim/clips/ok.txt")
+        assert code == 200 and body == "INSIDE", "專案內自己的檔案要讀得到"
+
+        for attempt in (
+            "/file/victim/../victim-evil/secret.txt",
+            "/file/victim/%2e%2e/victim-evil/secret.txt",
+        ):
+            code, body = get(attempt)
+            assert code == 404, f"前綴相同的專案被穿越了：{attempt} → {code}"
+            assert "SECRET" not in body
+    finally:
+        srv.shutdown()
+
+
+def test_cross_origin_post_is_rejected(tmp_path, monkeypatch):
+    """跨站 POST 要被擋（CSRF）。
+
+    這個服務沒有登入機制，所以「瀏覽器替別人送出的請求」
+    跟「你自己按的」在伺服器端長得一樣。
+    """
+    import http.client
+    import json as _json
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    from vidgrab import web
+
+    root = tmp_path / "projects"
+    (root / "p1").mkdir(parents=True)
+    (root / "p1" / "manifest.json").write_text('{"title":"原始"}', encoding="utf-8")
+    monkeypatch.setenv("VIDGRAB_HOME", str(root))
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+
+    def post(payload: dict, origin: str | None) -> tuple[int, str]:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        body = _json.dumps(payload).encode()
+        headers = {"Content-Type": "application/json"}
+        if origin:
+            headers["Origin"] = origin
+        c.request("POST", "/api/library", body=body, headers=headers)
+        r = c.getresponse()
+        out = r.read().decode("utf-8", "replace")
+        c.close()
+        return r.status, out
+
+    try:
+        code, body = post(
+            {"action": "rename", "project": "p1", "title": "被駭了"},
+            "http://evil.example",
+        )
+        assert code == 403, f"跨站請求應該被拒絕，卻回了 {code}"
+        assert "被駭了" not in body
+
+        # 本機來源要能用
+        code, _ = post(
+            {"action": "rename", "project": "p1", "title": "正常"},
+            f"http://127.0.0.1:{port}",
+        )
+        assert code == 200
+
+        # 沒有 Origin（curl、本機程式）也要能用，否則會擋掉自己
+        code, _ = post({"action": "rename", "project": "p1", "title": "CLI"}, None)
+        assert code == 200
+    finally:
+        srv.shutdown()
+
+
+def test_web_refuses_to_bind_publicly_without_optin(tmp_path, monkeypatch):
+    """綁到非本機位址要明確同意：這個介面沒有登入機制。"""
+    import os
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    (tmp_path / "projects").mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "PYTHONPATH": str(_ROOT / "src"),
+           "VIDGRAB_HOME": str(tmp_path / "projects")}
+
+    r = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "web", "--no-open",
+         "--host", "0.0.0.0", "--port", "0"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert r.returncode == 2, f"應該拒絕，實際 returncode={r.returncode}"
+    assert "allow-lan" in r.stderr, "要告訴使用者怎麼明確同意"
+
+
+def test_jobs_do_not_grow_without_bound():
+    """JOBS 要有上限。
+
+    真的會漏：每跑一次搜尋／下載就寫進 JOBS，但從來不刪，
+    開著用一整天就一路長大（每個 job 都帶著完整結果與日誌）。
+    """
+    from vidgrab import web
+
+    web.JOBS.clear()
+    try:
+        for i in range(150):
+            job = web.Job("test", f"job{i}")
+            job.finish({"i": i})
+            with web.LOCK:
+                web.JOBS[job.id] = job
+        assert len(web.JOBS) > web.MAX_FINISHED_JOBS, "前提：塞得比上限多"
+
+        web._prune_jobs()
+        assert len(web.JOBS) <= web.MAX_FINISHED_JOBS, (
+            f"清理後還有 {len(web.JOBS)} 個，上限是 {web.MAX_FINISHED_JOBS}"
+        )
+    finally:
+        web.JOBS.clear()
+
+
+def test_job_message_log_is_capped():
+    """單一 job 的日誌也要有上限，否則長時間下載會吃光記憶體。"""
+    from vidgrab import web
+
+    job = web.Job("test", "長跑")
+    for i in range(web.MAX_JOB_MESSAGES + 500):
+        job.emit(f"line {i}")
+    assert len(job.messages) <= web.MAX_JOB_MESSAGES
+    assert len(job.messages) > 0
