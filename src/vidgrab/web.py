@@ -1341,15 +1341,47 @@ PAGE = r"""<!doctype html>
   .empty { text-align:center; color:var(--muted); padding:70px 20px; line-height:2; }
   .empty .big { font-size:34px; opacity:.5; }
   #progressbar {
-    position:fixed; left:330px; right:0; top:0; height:3px; background:transparent; z-index:60; display:none;
+    position:fixed; left:var(--sidebar); right:0; top:0; height:3px; background:transparent; z-index:60; display:none;
   }
   #progressbar.on { display:block; }
   #progressfill {
     height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--accent-hover));
     transition:width .3s ease; box-shadow:0 0 10px var(--accent-soft);
   }
+  /* 下載進度卡：固定在下緣、看得見的實際大小（頂部 3px 細條看不出是哪支在下載） */
+  #dlcard {
+    position:fixed; left:calc(var(--sidebar) + 22px); right:22px; bottom:22px;
+    z-index:70; display:none;
+    background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    padding:14px 16px; box-shadow:var(--shadow);
+  }
+  #dlcard.on { display:block; }
+  #dlcard .row1 { display:flex; align-items:center; gap:10px; margin-bottom:9px; }
+  #dlcard .badge {
+    flex:none; font-size:11px; letter-spacing:.04em; padding:2px 8px; border-radius:999px;
+    background:var(--accent-soft); color:var(--accent); font-weight:600;
+  }
+  #dlcard .name {
+    flex:1; min-width:0; font-size:13px; color:var(--text);
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  #dlcard .pct { flex:none; font-size:14px; font-weight:600; color:var(--accent); font-variant-numeric:tabular-nums; }
+  #dlbar { height:8px; border-radius:999px; background:var(--panel2); overflow:hidden; }
+  #dlfill {
+    height:100%; width:0%; border-radius:999px;
+    background:linear-gradient(90deg,var(--accent),var(--accent-hover));
+    transition:width .25s ease;
+  }
+  /* 作業層級的總進度：3 支裡面第幾支 */
+  #dltotal { height:3px; border-radius:999px; background:var(--panel2); overflow:hidden; margin-top:6px; }
+  #dltotalfill {
+    height:100%; width:0%; background:var(--muted); border-radius:999px; transition:width .25s ease;
+  }
+  #dlmeta { display:flex; justify-content:space-between; margin-top:8px; font-size:11.5px; color:var(--muted); }
+  /* 進度卡出現時把控制台往上抬，否則會被蓋住、只露出半截字 */
+  body.dl-on #console { bottom:104px; }
   #console {
-    position:fixed; left:330px; right:0; bottom:0; max-height:190px; display:none;
+    position:fixed; left:var(--sidebar); right:0; bottom:0; max-height:190px; display:none;
     background:rgba(8,10,15,.96); border-top:1px solid var(--line); overflow-y:auto;
     font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; padding:10px 16px; z-index:50;
   }
@@ -1479,7 +1511,7 @@ PAGE = r"""<!doctype html>
     .app { grid-template-columns:1fr; height:auto; }
     aside { border-right:none; border-bottom:1px solid var(--line); }
     #progressbar {
-    position:fixed; left:330px; right:0; top:0; height:3px; background:transparent; z-index:60; display:none;
+    position:fixed; left:var(--sidebar); right:0; top:0; height:3px; background:transparent; z-index:60; display:none;
   }
   #progressbar.on { display:block; }
   #progressfill {
@@ -1609,6 +1641,20 @@ PAGE = r"""<!doctype html>
 </div>
 
 <div id="progressbar"><div id="progressfill"></div></div>
+
+<div id="dlcard">
+  <div class="row1">
+    <span class="badge" id="dlbadge">下載中</span>
+    <span class="name" id="dlname">準備中…</span>
+    <span class="pct" id="dlpct">0%</span>
+  </div>
+  <div id="dlbar"><div id="dlfill"></div></div>
+  <div id="dltotal"><div id="dltotalfill"></div></div>
+  <div id="dlmeta">
+    <span id="dlspeed"></span>
+    <span id="dleta"></span>
+  </div>
+</div>
 <div id="console"></div>
 <div class="toast" id="toast"></div>
 <div class="modal" id="loginmodal">
@@ -2085,6 +2131,36 @@ async function openProject(name) {
   } catch (e) { toast('開不起來：' + e.message); }
 }
 
+/** 靜默刷新：下載進行中定時更新，讓新片段與截圖馬上出現。
+ *  不能直接用 openProject——它會清掉使用者已勾選的項目。 */
+async function silentRefresh() {
+  if (!CURRENT || BUSY) return;
+  try {
+    const fresh = await api('/api/project/' + encodeURIComponent(CURRENT.name));
+    const before = JSON.stringify(CURRENT.stats || {});
+    CURRENT = fresh;
+    const after = JSON.stringify(CURRENT.stats || {});
+    // 只有真的變了才重繪，避免把正在捲動的清單跳回頂端
+    if (before !== after) render();
+    else updateItemClips(fresh);
+  } catch (_) { /* 下載中偶爾讀不到是正常的，下一輪再試 */ }
+}
+
+/** 逐支比對片段數，只更新有變的那幾張卡，不動整體版面。 */
+function updateItemClips(fresh) {
+  const items = fresh.items || [];
+  let changed = false;
+  for (const it of items) {
+    const idx = (CURRENT.items || []).findIndex(x => x.vid === it.vid && x.platform === it.platform);
+    if (idx < 0) continue;
+    const old = CURRENT.items[idx];
+    const oldN = (old.clips || []).length;
+    const newN = (it.clips || []).length;
+    if (oldN !== newN) { changed = true; break; }
+  }
+  if (changed) render();
+}
+
 function render() {
   if (!CURRENT) return;
   const s = CURRENT.stats;
@@ -2309,30 +2385,120 @@ function lightbox(kind, src) {
   box.onclick = () => { box.classList.remove('show'); box.innerHTML = ''; };
 }
 
+// ------------------------------------------------------------ 下載進度
+let DLCARD_ON = false;
+let DL_STAMP = 0;   // 用來讓「完成後自動收起」的定時器知道有沒有被新進度打斷
+
+function showProgressBar(pct) {
+  const bar = $('#progressbar'), fill = $('#progressfill');
+  bar.classList.add('on');
+  if (pct !== null) fill.style.width = pct + '%';
+}
+
+/** 一支影片的細進度 + 整個作業的粗進度，都畫在同一張卡上。
+ *  只畫細進度看不出「3 支裡面下到第幾支」，所以兩條都要。 */
+function updateDownload(p) {
+  const card = $('#dlcard');
+  if (!p || p.kind !== 'download') return;
+  card.classList.add('on');
+  document.body.classList.add('dl-on');
+  DLCARD_ON = true;
+
+  const pct = p.percent === null || p.percent === undefined ? null : Number(p.percent);
+  $('#dlname').textContent = p.title || '';
+  $('#dlpct').textContent = pct === null ? '…' : Math.round(pct) + '%';
+  $('#dlfill').style.width = (pct === null ? 0 : Math.min(100, pct)) + '%';
+
+  // 作業層級：position / total，例如「第 2 / 3 支」
+  const total = Number(p.total) || 0;
+  const pos = Number(p.position) || 0;
+  if (total > 0) {
+    $('#dlbadge').textContent = total > 1 ? `第 ${pos} / ${total} 支` : '下載中';
+    const overall = total > 1 ? ((pos - 1) + (pct === null ? 0 : pct / 100)) / total * 100 : 0;
+    $('#dltotalfill').style.width = Math.max(0, Math.min(100, overall)) + '%';
+  } else {
+    $('#dlbadge').textContent = '下載中';
+    $('#dltotalfill').style.width = pct === null ? 0 : Math.min(100, pct) + '%';
+  }
+
+  const bits = [];
+  if (p.speed) bits.push(p.speed);
+  if (p.fragment) bits.push('分段 ' + p.fragment);
+  $('#dlspeed').textContent = bits.join(' · ');
+  $('#dleta').textContent = p.eta ? '剩 ' + p.eta : '';
+
+  // 頂部細條保留，讓人在滾動時也知道有事在跑
+  showProgressBar(total > 1 ? ((pos - 1) + (pct === null ? 0 : pct / 100)) / total * 100 : pct);
+}
+
+function finishDownload() {
+  if (!DLCARD_ON) { $('#progressbar').classList.remove('on'); return; }
+  $('#dlfill').style.width = '100%';
+  $('#dltotalfill').style.width = '100%';
+  $('#dlpct').textContent = '100%';
+  $('#dlbadge').textContent = '完成';
+  $('#dlspeed').textContent = '';
+  $('#dleta').textContent = '';
+  $('#progressfill').style.width = '100%';
+  // 這個作業可能還有多支影片要下載，下一支會馬上把卡片打開。
+  // 定時器到的時候如果已經有新進度進來，就不要把它關掉
+  // （真的發生過：卡片在下載中變成 display:none，進度還在跑卻看不到）。
+  const stamp = ++DL_STAMP;
+  setTimeout(() => {
+    if (DL_STAMP !== stamp) return;  // 已經開始下一支了
+    hideDownload();
+    $('#progressbar').classList.remove('on');
+    $('#progressfill').style.width = '0%';
+  }, 1200);
+}
+
+function hideDownload() {
+  DLCARD_ON = false;
+  $('#dlcard').classList.remove('on');
+  document.body.classList.remove('dl-on');
+  $('#dlfill').style.width = '0%';
+  $('#dltotalfill').style.width = '0%';
+}
+
 // ------------------------------------------------------------ 執行工作
 async function follow(jobId, onDone) {
   return new Promise((resolve, reject) => {
     const es = new EventSource('/api/stream/' + jobId);
+    // 下載進行中每 2.5 秒靜默刷新一次：片段一落地就出現，不用等整個作業跑完
+    let poll = null;
+    const startPolling = () => {
+      if (poll) return;
+      poll = setInterval(() => { silentRefresh(); }, 2500);
+    };
+    const stopPolling = () => { if (poll) { clearInterval(poll); poll = null; } };
     es.addEventListener('log', e => {
       const msg = JSON.parse(e.data);
       if (msg.startsWith('\r')) {
-        // 進度行：更新頂部細條
+        // 進度行可能有結構化資料：\x00 後面是 JSON
+        const nul = msg.indexOf('\x00');
+        if (nul > 0) {
+          try {
+            updateDownload(JSON.parse(msg.slice(nul + 1)));
+            startPolling();
+          } catch (_) {}
+          consoleLine(msg.slice(0, nul));
+          return;
+        }
+        // 沒有結構化資料的舊式進度行：退回解析百分比
         const m = msg.match(/(\d+(?:\.\d+)?)%/);
-        const bar = $('#progressbar'), fill = $('#progressfill');
-        bar.classList.add('on');
-        if (m) fill.style.width = Math.min(100, Number(m[1])) + '%';
+        showProgressBar(m ? Math.min(100, Number(m[1])) : null);
       }
       consoleLine(msg);
     });
     es.addEventListener('done', e => {
-      es.close(); consoleLine('✔ 完成');
-      $('#progressfill').style.width = '100%';
-      setTimeout(() => { $('#progressbar').classList.remove('on'); $('#progressfill').style.width = '0%'; }, 900);
+      es.close(); stopPolling(); consoleLine('✔ 完成');
+      finishDownload();
       const data = JSON.parse(e.data);
       resolve(data);
     });
     es.addEventListener('error', e => {
-      es.close();
+      es.close(); stopPolling();
+      hideDownload();
       $('#progressbar').classList.remove('on');
       let msg = '發生錯誤';
       try { msg = JSON.parse(e.data); } catch (_) {}

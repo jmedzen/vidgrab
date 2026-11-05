@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -254,7 +255,9 @@ def run_pick(
     clips_dir = project / "clips"
     frames_dir = project / "frames"
     grabbed = 0
-    for n in indexes:
+    order = list(indexes)  # 預先算好位置，進度回呼會很頻繁
+    for n in order:
+        pos = order.index(n) + 1
         item = items[n]
         emit(f"[{n + 1:02d}] {item.title} · {fmt_duration(item.duration)} · {item.license_label or '授權未標示'}")
         if item.license_kind in ("unknown", "none"):
@@ -293,7 +296,23 @@ def run_pick(
                 emit(f"     ↷ 跳過 {fmt_ts(start)}：超過影片長度")
                 continue
 
-            def progress(info: dict[str, Any], _s=start) -> None:
+            # 追蹤這一段目前為止看過的最高百分比。
+            # 切片下載的心跳與 yt-dlp 的真實回報會交錯出現，
+            # 真實那筆常常沒有 percent，直接送出去會讓進度條倒退。
+            best = {"pct": 0.0, "estimated": False}
+
+            def progress(info: dict[str, Any], _s=start, _n=n, _end=end, _pos=pos) -> None:
+                pct = info.get("percent")
+                if pct is not None:
+                    if pct >= best["pct"]:
+                        best["pct"] = pct
+                        best["estimated"] = bool(info.get("estimated"))
+                    else:
+                        pct = best["pct"]  # 不讓它倒退
+                else:
+                    # 沒百分比（真實回報只有位元組數）就沿用目前進度
+                    pct = best["pct"] if best["pct"] > 0 else None
+
                 bits = []
                 if info.get("percent") is not None:
                     bits.append(f"{info['percent']:.0f}%")
@@ -303,7 +322,25 @@ def run_pick(
                     bits.append(info["speed"])
                 if info.get("eta"):
                     bits.append(f"剩 {info['eta']}")
-                _emit_over(emit, "       " + " · ".join(bits) if bits else "       下載中…")
+                # 進度行帶結構化資料：前端不必再用正則從中文裡撈百分比。
+                # 以 \r 開頭代表「覆寫同一行」，沿用既有的 console 行為。
+                payload = {
+                    "kind": "download",
+                    "index": _n,
+                    "position": _pos,
+                    "total": len(indexes),
+                    "title": item.title,
+                    "asset_id": item.asset_id(),
+                    "percent": pct,
+                    "estimated": bool(info.get("estimated", False)),
+                    "speed": info.get("speed") or "",
+                    "eta": info.get("eta") or "",
+                    "fragment": info.get("fragment") or "",
+                    "start": _s,
+                    "end": _end,
+                }
+                text = "       " + " · ".join(bits) if bits else "       下載中…"
+                _emit_over(emit, text, payload)
 
             try:
                 if start is None:
@@ -355,11 +392,19 @@ def run_pick(
     return {"project": project, "grabbed": grabbed, "items": items}
 
 
-def _emit_over(emit, text: str) -> None:
-    """進度用「覆寫同一行」的方式送出，避免日誌被幾百行洗掉。"""
+def _emit_over(emit, text: str, payload: dict | None = None) -> None:
+    """進度用「覆寫同一行」的方式送出，避免日誌被幾百行洗掉。
+
+    可以附一份結構化 payload：前端靠它畫進度條，不必解析中文。
+    """
+    line = "\r" + text
+    if payload is not None:
+        line += "\x00" + json.dumps(payload, ensure_ascii=False)
     try:
-        emit("\r" + text)
+        emit(line)
     except Exception:  # noqa: BLE001
+        # 進度行送不出去不該讓下載中斷，但也不該假裝沒事。
+        # json 沒 import 這種錯就是在這裡被吞掉的（真的發生過）。
         pass
 
 

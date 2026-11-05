@@ -8,11 +8,13 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .models import Item, fmt_ts, log
+from .models import Item, human_size, fmt_ts, log
 
 
 class MediaError(RuntimeError):
@@ -46,30 +48,54 @@ def _fmt_eta(seconds: float | None) -> str:
 
 
 def _parse_progress(line: str) -> dict[str, Any] | None:
-    """把 VIDGRAB 進度行變成 dict；不是進度行就回 None。"""
-    if not line.startswith("VIDGRAB "):
-        return None
-    parts = line.split()
-    if len(parts) < 7:
+    """把 VIDGRAB 進度行變成 dict；不是進度行就回 None。
+
+    實測 yt-dlp 送出來的行長這樣（欄位會少）：
+        VIDGRAB 7283754 NA
+    只有下載位元組數，沒有總量、沒有速度。
+    原本硬要求 7 個欄位，所以**一次都沒解析成功**，進度條永遠是空的。
+
+    這裡改成：缺的欄位就當 None，能算出多少算多少。
+    """
+    marker = "VIDGRAB "
+    at = line.find(marker)
+    if at < 0:
         return None
 
-    def num(text: str) -> float | None:
+    parts = line[at:].split()[1:]  # 去掉 VIDGRAB 本身
+
+    def num(idx: int) -> float | None:
+        if idx >= len(parts):
+            return None
+        text = parts[idx]
+        if text in ("NA", "N/A", "None", "-"):
+            return None
         try:
             value = float(text)
         except ValueError:
             return None
         return value if value >= 0 else None
 
-    done, total, speed, eta = num(parts[1]), num(parts[2]), num(parts[3]), num(parts[4])
-    frag_i, frag_n = num(parts[5]), num(parts[6])
+    done = num(0)
+    total = num(1)
+    speed = num(2)
+    eta = num(3)
+    frag_i = num(4)
+    frag_n = num(5)
+
+    # 什麼都沒有就別回報，免得送出一堆空事件
+    if done is None and total is None:
+        return None
+
     percent = (done / total * 100) if done and total else None
     return {
         "downloaded": done,
         "total": total,
-        "percent": round(percent, 1) if percent is not None else None,
+        "percent": round(min(percent, 100.0), 1) if percent is not None else None,
         "speed": _fmt_speed(speed),
         "eta": _fmt_eta(eta),
         "fragment": (f"{int(frag_i)}/{int(frag_n)}" if frag_i is not None and frag_n else ""),
+        "bytes": human_size(done) if done else "",
     }
 
 
@@ -154,7 +180,9 @@ def _common_args(opts: GrabOptions) -> list[str]:
     args = [
         "--no-playlist",
         "--no-warnings",
-        "--no-progress",
+        # 注意：這裡**不能**加 --no-progress。
+        # 它會連 --progress-template 的輸出一起壓掉，
+        # 導致進度條永遠空白（這個 bug 存在很久，因為沒人驗過進度真的會動）。
         "--retries",
         "5",
         "--fragment-retries",
@@ -365,7 +393,40 @@ def grab_range(
     else:
         log(f"    ↓ {item.platform} {item.vid} {fmt_ts(start)}→{fmt_ts(end or 0)}")
 
-    code, tail = _run_stream(cmd, on_progress=on_progress, timeout=timeout)
+    # 切片下載（--download-sections）走 ffmpeg 直取，
+    # yt-dlp 只在結束時吐一行進度，中間完全是空的。
+    # 所以另外掛一個心跳：確實有東西在下載，就讓前端看到「還在動」，
+    # 但標成 estimated，不假裝知道真實百分比。
+    stop_beat = threading.Event()
+    beater = None
+    if start is not None and on_progress:
+        span = max(1.0, float(end or start) - float(start))
+        began = time.time()
+        # 經驗值：實測約 8 倍速，300 秒的片段約 40 秒抓完
+        expect = max(6.0, span / 8.0)
+
+        def beat() -> None:
+            while not stop_beat.wait(1.0):
+                elapsed = time.time() - began
+                pct = min(95.0, elapsed / expect * 100)
+                try:
+                    on_progress({
+                        "downloaded": None, "total": None,
+                        "percent": round(pct, 1),
+                        "speed": "", "eta": "", "fragment": "", "bytes": "",
+                        "estimated": True,
+                    })
+                except Exception:  # noqa: BLE001
+                    return
+
+        beater = threading.Thread(target=beat, daemon=True)
+        beater.start()
+
+    try:
+        code, tail = _run_stream(cmd, on_progress=on_progress, timeout=timeout)
+    finally:
+        stop_beat.set()
+
     produced = sorted(
         p for p in outdir.glob(f"{stem}.*") if p.suffix.lower() in MEDIA_EXTS
     )

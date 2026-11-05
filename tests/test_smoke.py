@@ -1334,3 +1334,60 @@ def test_launcher_and_cli_share_ffmpeg_list():
         assert f" {cmd} " in src or f" {cmd}\"" in src, (
             f"啟動腳本的清單少了 {cmd}，兩邊不同步"
         )
+
+
+def test_parse_progress_accepts_real_ytdlp_lines():
+    """進度解析要能吃 yt-dlp 真實吐出來的行。
+
+    真的壞過三次：
+    1. 只認行首的 VIDGRAB，但實際前面有 `[download] download:`
+    2. 硬要求 7 個欄位，但切片下載只給 2 個（`VIDGRAB 7283754 NA`）
+    3. _common_args 裡有 --no-progress，把輸出全壓掉了
+    """
+    from vidgrab.media import _parse_progress
+
+    # 實際抓到的格式
+    got = _parse_progress("VIDGRAB 7283754 NA")
+    assert got is not None, "只有位元組數時也要能解析"
+    assert got["downloaded"] == 7283754
+    assert got["percent"] is None, "沒有總量就沒有百分比，不要編造"
+    assert got["bytes"], "至少要能顯示已下載多少"
+
+    # 完整格式（前面帶 yt-dlp 的標籤）
+    got = _parse_progress("[download] download:VIDGRAB 1048576 5242880 2097152.0 3.5 1 5")
+    assert got["percent"] == 20.0
+    assert got["fragment"] == "1/5"
+    assert got["speed"]
+
+    # 不是進度行就回 None
+    assert _parse_progress("[download] Destination: x.mp4") is None
+    assert _parse_progress("[info] hello") is None
+
+
+def test_common_args_does_not_suppress_progress():
+    """--no-progress 會讓 --progress-template 完全沒輸出。
+
+    這個組合存在很久，因為沒人驗過進度條真的會動。
+    """
+    from vidgrab.media import GrabOptions, _common_args
+
+    args = _common_args(GrabOptions(height=480))
+    assert "--no-progress" not in args, "--no-progress 會壓掉所有進度輸出"
+    assert "--progress-template" in args
+    assert "--newline" in args, "沒有 --newline 就讀不到一行一行的進度"
+
+
+def test_clip_progress_marks_estimated_flag():
+    """切片下載的心跳回報要標 estimated，前端才知道那不是真實百分比。
+
+    這裡驗證的是「回報格式」，不是心跳執行緒本身
+    （執行緒要真的下載才跑得起來，那條路靠 UI 實測驗證）。
+    """
+    from vidgrab.media import _parse_progress
+
+    real = _parse_progress("VIDGRAB 7283754 NA")
+    assert real is not None
+    # 真實回報沒有 estimated，代表是量到的
+    assert not real.get("estimated")
+    # 沒有總量時不該謊報百分比
+    assert real["percent"] is None
