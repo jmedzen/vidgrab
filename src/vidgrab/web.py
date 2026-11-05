@@ -109,15 +109,30 @@ def start_job(kind: str, label: str, fn) -> Job:
 # ---------------------------------------------------------------- 資料
 
 
+def _fmt_ts(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
 def clip_info(clip: dict[str, Any], project: Path, root: Path) -> dict[str, Any]:
     path = Path(clip.get("path", ""))
     rel = str(path.relative_to(project)) if str(path).startswith(str(project)) else str(path)
+    # 整支下載時 start/end 是 None（不是「沒有這個 key」），要當成整支
+    start = clip.get("start")
+    end = clip.get("end")
+    is_full = start is None and end is None
     return {
         "name": path.name,
         "rel": f"/file/{urllib.parse.quote(str(project.name))}/{urllib.parse.quote(rel)}",
         "url": str(path),
-        "start": clip.get("start", 0),
-        "end": clip.get("end", 0),
+        "start": 0 if start is None else start,
+        "end": 0 if end is None else end,
+        "full": is_full,
+        "span": "整支" if is_full else f"{_fmt_ts(start)}–{_fmt_ts(end)}",
         "size": human_size(clip.get("size_bytes") or 0),
         "dims": f"{clip.get('width')}×{clip.get('height')}" if clip.get("width") else "",
     }
@@ -855,36 +870,166 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d12'/%3E%3Cpath d='M9 8h4l3 9 3-9h4l-5.5 16h-3z' fill='%236cc0ff'/%3E%3C/svg%3E">
 <title>vidgrab · 素材獵人</title>
+<script>
+// 在第一次繪製之前就決定主題與側欄寬度，否則淺色主題會先閃一下深色
+(function () {
+  try {
+    var t = localStorage.getItem('vidgrab.theme');
+    if (!t && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) t = 'paper';
+    document.documentElement.dataset.theme = t || 'midnight';
+    var w = Number(localStorage.getItem('vidgrab.sidebar'));
+    if (w >= 240 && w <= 620 && window.innerWidth > 820) {
+      document.documentElement.style.setProperty('--sidebar', w + 'px');
+    }
+  } catch (e) {}
+})();
+</script>
 <style>
-  :root {
+
+  /* ---------------------------------------------------------- 主題
+     每個主題只換變數，版面不動。深淺各三組，都調過對比度。 */
+
+  /* 預設：Midnight（深） */
+  :root, [data-theme="midnight"] {
     --bg:#0b0d12; --panel:#141821; --panel2:#1a1f2b; --line:#262c3a;
     --text:#e9ecf3; --muted:#8e98ad; --accent:#6cc0ff; --ok:#5ee2a0;
     --warn:#f3c96b; --bad:#ff8b8b; --shadow:0 10px 30px rgba(0,0,0,.35);
+    --aside-bg:rgba(16,20,28,.85); --code-bg:#0b0e14;
+    --glow:radial-gradient(1200px 600px at 80% -10%, #17202e 0%, var(--bg) 55%);
+    --card-bg:linear-gradient(180deg,#161b25 0%,#131820 100%);
+    --accent-soft:rgba(108,192,255,.12); --scrim:rgba(0,0,0,.8);
+    --on-accent:#06121c; --accent-hover:#8ed1ff;
   }
+
+  /* 深 2：Ink（近黑，低飽和，適合長時間看） */
+  [data-theme="ink"] {
+    --bg:#08090b; --panel:#101114; --panel2:#16181d; --line:#232629;
+    --text:#e6e6e4; --muted:#8a8d92; --accent:#c9a227; --ok:#79c39a;
+    --warn:#d8b25a; --bad:#e08b7f; --shadow:0 10px 28px rgba(0,0,0,.55);
+    --aside-bg:rgba(10,11,13,.9); --code-bg:#0c0d10;
+    --glow:radial-gradient(1100px 560px at 78% -12%, #14161a 0%, var(--bg) 60%);
+    --card-bg:linear-gradient(180deg,#121417 0%,#101215 100%);
+    --accent-soft:rgba(201,162,39,.13); --scrim:rgba(0,0,0,.85);
+    --on-accent:#14100a; --accent-hover:#dcb63f;
+  }
+
+  /* 深 3：Forest（墨綠，柔和） */
+  [data-theme="forest"] {
+    --bg:#0a1210; --panel:#0f1a17; --panel2:#13211d; --line:#1f3330;
+    --text:#e4efe9; --muted:#87a29a; --accent:#6fd6a8; --ok:#6fd6a8;
+    --warn:#e3c46b; --bad:#ef8f8f; --shadow:0 10px 30px rgba(0,0,0,.4);
+    --aside-bg:rgba(10,18,16,.88); --code-bg:#0a1210;
+    --glow:radial-gradient(1150px 580px at 80% -10%, #10241f 0%, var(--bg) 58%);
+    --card-bg:linear-gradient(180deg,#10201c 0%,#0e1a17 100%);
+    --accent-soft:rgba(111,214,168,.13); --scrim:rgba(0,0,0,.82);
+    --on-accent:#06140f; --accent-hover:#8ee4bf;
+  }
+
+  /* 淺 1：Paper（米白，像紙） */
+  [data-theme="paper"] {
+    --bg:#f7f4ee; --panel:#fffdf9; --panel2:#f2eee6; --line:#e0d9cc;
+    --text:#232019; --muted:#6f6759; --accent:#b5651d; --ok:#2f7d4f;
+    --warn:#9a6b15; --bad:#b03a3a; --shadow:0 8px 24px rgba(80,60,30,.12);
+    --aside-bg:rgba(255,253,249,.9); --code-bg:#f0ece3;
+    --glow:radial-gradient(1200px 600px at 82% -14%, #fff9ee 0%, var(--bg) 60%);
+    --card-bg:linear-gradient(180deg,#fffdf9 0%,#fbf8f1 100%);
+    --accent-soft:rgba(181,101,29,.10); --scrim:rgba(60,45,25,.55);
+    --on-accent:#fffaf2; --accent-hover:#9c5417;
+  }
+
+  /* 淺 2：Mist（冷灰藍，乾淨） */
+  [data-theme="mist"] {
+    --bg:#eef2f7; --panel:#ffffff; --panel2:#f1f5fa; --line:#d6dee8;
+    --text:#1b2532; --muted:#68758a; --accent:#2f6fd0; --ok:#1f7a52;
+    --warn:#8a6512; --bad:#b23b4a; --shadow:0 8px 24px rgba(30,50,80,.10);
+    --aside-bg:rgba(255,255,255,.92); --code-bg:#eef3f9;
+    --glow:radial-gradient(1200px 620px at 80% -12%, #ffffff 0%, var(--bg) 62%);
+    --card-bg:linear-gradient(180deg,#ffffff 0%,#fafcff 100%);
+    --accent-soft:rgba(47,111,208,.10); --scrim:rgba(20,35,60,.55);
+    --on-accent:#ffffff; --accent-hover:#245ab0;
+  }
+
+  /* 淺 3：Sakura（暖粉，柔） */
+  [data-theme="sakura"] {
+    --bg:#fdf4f5; --panel:#fffafb; --panel2:#fbeef0; --line:#eed9de;
+    --text:#2b1f24; --muted:#7d626b; --accent:#c25a7a; --ok:#3d7f5e;
+    --warn:#96701c; --bad:#bb3b57; --shadow:0 8px 24px rgba(120,60,80,.12);
+    --aside-bg:rgba(255,250,251,.92); --code-bg:#f8ecef;
+    --glow:radial-gradient(1200px 600px at 82% -12%, #fff7f9 0%, var(--bg) 62%);
+    --card-bg:linear-gradient(180deg,#fffafb 0%,#fdf3f5 100%);
+    --accent-soft:rgba(194,90,122,.10); --scrim:rgba(70,35,48,.55);
+    --on-accent:#fff7f9; --accent-hover:#a84a66;
+  }
+
   * { box-sizing:border-box; }
+  .brandrow { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+  .theme-picker { position:relative; flex:none; }
+  .theme-btn {
+    width:32px; height:32px; padding:0; display:grid; place-items:center;
+    font-size:15px; line-height:1; border-radius:9px;
+  }
+  .theme-menu {
+    position:absolute; right:0; top:38px; z-index:60; width:206px; display:none;
+    background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:6px; box-shadow:var(--shadow);
+  }
+  .theme-menu.open { display:block; }
+  .theme-menu .group {
+    font-size:10.5px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--muted); padding:7px 9px 4px;
+  }
+  .theme-menu button {
+    width:100%; display:flex; align-items:center; gap:9px; justify-content:flex-start;
+    background:transparent; border:none; padding:7px 9px; border-radius:8px;
+    color:var(--text); font-size:13px;
+  }
+  .theme-menu button:hover { background:var(--panel2); border:none; }
+  .theme-menu button[aria-checked="true"] { background:var(--accent-soft); }
+  .swatch { width:14px; height:14px; border-radius:50%; flex:none; border:1px solid rgba(128,128,128,.35); }
   html,body { height:100%; }
   body {
-    margin:0; background:radial-gradient(1200px 600px at 80% -10%, #17202e 0%, var(--bg) 55%);
+    margin:0; background:var(--glow);
     color:var(--text); font:14.5px/1.6 -apple-system,"PingFang TC","Noto Sans TC",system-ui,sans-serif;
   }
-  .app { display:grid; grid-template-columns:330px 1fr; height:100vh; }
+  .app {
+    display:grid; grid-template-columns:var(--sidebar, 330px) 1fr;
+    height:100vh; min-height:0;
+  }
   aside {
-    border-right:1px solid var(--line); background:rgba(16,20,28,.85);
-    padding:18px 16px; overflow-y:auto;
+    position:relative; border-right:1px solid var(--line); background:var(--aside-bg);
+    padding:18px 16px; overflow-y:auto; overflow-x:hidden; min-width:0;
+    box-sizing:border-box;
+  }
+  aside * { max-width:100%; box-sizing:border-box; }
+  /* 拖曳把手：滑鼠移到邊界就出現 */
+  .resizer {
+    position:absolute; top:0; right:0; width:6px; height:100%;
+    cursor:col-resize; z-index:20; background:transparent; transition:background .15s;
+    touch-action:none;
+  }
+  .resizer:hover, .resizer.dragging { background:var(--accent); opacity:.55; }
+  body.resizing { cursor:col-resize; user-select:none; }
+  body.resizing iframe, body.resizing video { pointer-events:none; }
+  .resizer:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+  @media (max-width:820px) {
+    .app { grid-template-columns:1fr; grid-template-rows:auto 1fr; }
+    aside { border-right:none; border-bottom:1px solid var(--line); max-height:42vh; }
+    .resizer { display:none; }
   }
   main { overflow-y:auto; padding:22px 26px 80px; }
   h1 { font-size:19px; margin:0 0 2px; letter-spacing:.04em; }
   h1 span { color:var(--accent); }
   .tagline { color:var(--muted); font-size:12px; margin-bottom:4px; }
-  .buildtag { color:#5b6577; font-size:11px; margin-bottom:16px; font-variant-numeric:tabular-nums; }
+  .buildtag { color:var(--muted); opacity:.72; font-size:11px; margin-bottom:16px; font-variant-numeric:tabular-nums; }
   label.field { display:block; margin-bottom:12px; }
   label.field > span { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; }
   input[type=text], input[type=number], select, textarea {
     width:100%; background:var(--panel2); border:1px solid var(--line); color:var(--text);
     border-radius:9px; padding:8px 10px; font:inherit; font-size:13.5px; outline:none;
   }
-  input:focus, select:focus, textarea:focus { border-color:#3d7fae; box-shadow:0 0 0 3px rgba(108,192,255,.12); }
+  input:focus, select:focus, textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
   textarea { resize:vertical; min-height:64px; }
   .row { display:flex; gap:8px; }
   .row > * { flex:1; }
@@ -895,13 +1040,16 @@ PAGE = r"""<!doctype html>
     font:inherit; border-radius:9px; border:1px solid var(--line); background:var(--panel2);
     color:var(--text); padding:8px 14px; cursor:pointer; transition:.15s;
   }
-  button:hover:not(:disabled) { border-color:#3d7fae; color:#fff; }
+  button:hover:not(:disabled) { border-color:var(--accent); color:var(--text); }
   button:disabled { opacity:.45; cursor:not-allowed; }
   button.primary {
-    width:100%; background:linear-gradient(180deg,#2b7fbe,#1f6398); border-color:#3a8fd0;
+    width:100%; background:var(--accent); border-color:var(--accent);
+    color:var(--on-accent);
     font-weight:600; padding:10px; letter-spacing:.05em;
   }
-  button.primary:hover:not(:disabled) { background:linear-gradient(180deg,#3490d6,#2470ab); }
+  button.primary:hover:not(:disabled) {
+    background:var(--accent-hover); border-color:var(--accent-hover); color:var(--on-accent);
+  }
   button.ghost { background:transparent; }
   button.tiny { padding:4px 9px; font-size:12px; border-radius:7px; }
   .hint { color:var(--muted); font-size:11.5px; margin-top:-4px; }
@@ -910,8 +1058,8 @@ PAGE = r"""<!doctype html>
     background:var(--panel2); border:1px solid var(--line); border-radius:9px;
     padding:7px 10px; margin-bottom:12px; font-size:12.5px; color:var(--muted);
   }
-  .authbox.ok { color:var(--ok); border-color:#265c44; }
-  .modal { position:fixed; inset:0; background:#000b; display:none; align-items:center; justify-content:center; z-index:120; }
+  .authbox.ok { color:var(--ok); border-color:var(--ok); opacity:.92; }
+  .modal { position:fixed; inset:0; background:var(--scrim); display:none; align-items:center; justify-content:center; z-index:120; }
   .modal.show { display:flex; }
   .modal .sheet { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:22px 26px; text-align:center; box-shadow:var(--shadow); }
   .modal h3 { margin:0 0 6px; font-size:16px; }
@@ -921,20 +1069,21 @@ PAGE = r"""<!doctype html>
   .proj-list { margin-top:22px; border-top:1px solid var(--line); padding-top:14px; }
   .proj-list h3 { font-size:12px; color:var(--muted); font-weight:600; letter-spacing:.08em; margin:0 0 8px; }
   .proj {
+    overflow:hidden;
     padding:7px 9px; border-radius:8px; cursor:pointer; font-size:13px;
     display:flex; justify-content:space-between; gap:8px; color:var(--muted);
   }
   .proj:hover { background:var(--panel2); color:var(--text); }
-  .proj.active { background:#1d2a38; color:var(--text); border:1px solid #2f4c66; }
+  .proj.active { background:var(--accent-soft); color:var(--text); border:1px solid var(--accent); }
   .proj small { color:var(--muted); font-size:11px; white-space:nowrap; }
   header.bar { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; margin-bottom:4px; }
   header.bar h2 { margin:0; font-size:18px; font-weight:600; }
   .sub { color:var(--muted); font-size:12.5px; margin-bottom:16px; }
   .pills { display:flex; gap:7px; flex-wrap:wrap; margin-bottom:16px; }
   .pill { font-size:11.5px; padding:3px 9px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
-  .lic-free { color:var(--ok); border-color:#265c44; }
-  .lic-check { color:var(--warn); border-color:#5a4a24; }
-  .lic-unknown { color:var(--bad); border-color:#5c3030; }
+  .lic-free { color:var(--ok); border-color:currentColor; }
+  .lic-check { color:var(--warn); border-color:currentColor; }
+  .lic-unknown { color:var(--bad); border-color:currentColor; }
   .toolbar {
     display:flex; gap:8px; align-items:center; flex-wrap:wrap;
     padding:10px 12px; background:var(--panel); border:1px solid var(--line);
@@ -946,8 +1095,8 @@ PAGE = r"""<!doctype html>
     background:var(--panel); border:1px solid var(--line); border-radius:13px;
     padding:13px 15px; margin-bottom:11px; transition:.15s;
   }
-  .card:hover { border-color:#33445a; }
-  .card.sel { border-color:#3d7fae; background:#151f2b; }
+  .card:hover { border-color:var(--accent); }
+  .card.sel { border-color:var(--accent); background:var(--accent-soft); }
   .card input[type=checkbox] { accent-color:var(--accent); width:16px; height:16px; margin-top:4px; cursor:pointer; }
   .card h3 { margin:0 0 5px; font-size:14.5px; font-weight:600; line-height:1.45; }
   .card h3 a { color:var(--text); text-decoration:none; }
@@ -959,7 +1108,7 @@ PAGE = r"""<!doctype html>
   .clipbox { margin-top:9px; font-size:12.5px; display:grid; gap:5px; }
   .clip-row { display:flex; align-items:center; gap:9px; color:var(--muted); }
   .clip-row a { color:var(--accent); text-decoration:none; }
-  .clip-row code { background:#0b0e14; padding:1px 6px; border-radius:5px; font-size:11.5px; }
+  .clip-row code { background:var(--code-bg); padding:1px 6px; border-radius:5px; font-size:11.5px; }
   .warnline { font-size:12px; color:var(--warn); margin-top:7px; }
   .empty { text-align:center; color:var(--muted); padding:70px 20px; line-height:2; }
   .empty .big { font-size:34px; opacity:.5; }
@@ -968,32 +1117,69 @@ PAGE = r"""<!doctype html>
   }
   #progressbar.on { display:block; }
   #progressfill {
-    height:100%; width:0%; background:linear-gradient(90deg,#2b7fbe,#6cc0ff);
-    transition:width .3s ease; box-shadow:0 0 10px #6cc0ff88;
+    height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--accent-hover));
+    transition:width .3s ease; box-shadow:0 0 10px var(--accent-soft);
   }
   #console {
     position:fixed; left:330px; right:0; bottom:0; max-height:190px; display:none;
     background:rgba(8,10,15,.96); border-top:1px solid var(--line); overflow-y:auto;
     font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; padding:10px 16px; z-index:50;
   }
-  #console .ln { color:#9fb0c6; white-space:pre-wrap; }
+  #console .ln { color:var(--muted); white-space:pre-wrap; }
   #console .ln.err { color:var(--bad); }
   #console .prog { color:var(--accent); white-space:pre-wrap; }
   .spinner {
-    display:inline-block; width:12px; height:12px; border:2px solid #ffffff33; border-top-color:var(--accent);
+    display:inline-block; width:12px; height:12px; border:2px solid var(--line); border-top-color:var(--accent);
     border-radius:50%; animation:spin .8s linear infinite; vertical-align:-2px; margin-right:6px;
   }
   @keyframes spin { to { transform:rotate(360deg); } }
   .toast {
     position:fixed; top:18px; left:50%; transform:translateX(-50%);
-    background:#1b2534; border:1px solid #35506b; color:var(--text);
+    background:var(--panel); border:1px solid var(--line); color:var(--text);
     padding:9px 18px; border-radius:10px; box-shadow:var(--shadow); z-index:99; font-size:13px;
     opacity:0; transition:opacity .25s; pointer-events:none;
   }
   .toast.show { opacity:1; }
-  .lightbox { position:fixed; inset:0; background:#000c; display:none; z-index:100; align-items:center; justify-content:center; cursor:zoom-out; }
+  .lightbox { position:fixed; inset:0; background:var(--scrim); display:none; z-index:100; align-items:center; justify-content:center; cursor:zoom-out; }
   .lightbox img, .lightbox video { max-width:92vw; max-height:92vh; border-radius:10px; }
   .lightbox.show { display:flex; }
+
+  /* ---- 播放器 ---- */
+  .player {
+    position:sticky; top:-22px; z-index:30; margin:0 0 14px;
+    background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px;
+    box-shadow:var(--shadow);
+  }
+  .player video {
+    width:100%; max-height:min(46vh, 460px); border-radius:8px; background:#000; display:block;
+  }
+  /* 很寬的螢幕上，播放器靠左、不要拉滿整個寬度 */
+  .player .stage { max-width:980px; margin:0 auto; }
+  .player .ptitle { font-size:12.5px; color:var(--muted); margin-bottom:7px; display:flex; justify-content:space-between; gap:10px; }
+  .player .ptitle b { color:var(--text); font-weight:600; }
+  .player .prow { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  .player .prow a, .player .prow button { font-size:12px; }
+  .clip-actions { display:flex; gap:6px; margin-left:auto; }
+  .mini {
+    font-size:11.5px; padding:3px 9px; border-radius:7px; border:1px solid var(--line);
+    background:var(--panel2); color:var(--muted); cursor:pointer;
+  }
+  .mini:hover { color:var(--text); border-color:var(--accent); }
+  .mini.on { border-color:var(--accent); color:var(--text); background:var(--accent-soft); }
+  .frames { display:flex; gap:6px; margin-top:8px; overflow-x:auto; }
+  .frames img { height:58px; border-radius:6px; cursor:pointer; border:1px solid var(--line); }
+
+  /* ---- 媒體庫 ---- */
+  .library { margin-top:18px; border-top:1px solid var(--line); padding-top:14px; }
+  .lib-row {
+    display:flex; gap:10px; align-items:center; padding:7px 9px; border-radius:9px;
+    cursor:pointer; font-size:12.5px; color:var(--muted);
+  }
+  .lib-row:hover { background:var(--panel2); color:var(--text); }
+  .lib-row.playing { background:var(--accent-soft); color:var(--text); }
+  .lib-row .dot { width:6px; height:6px; border-radius:50%; background:var(--accent); flex:none; opacity:0; }
+  .lib-row.playing .dot { opacity:1; }
+  .lib-row .nm { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   @media (max-width: 900px) {
     .app { grid-template-columns:1fr; height:auto; }
     aside { border-right:none; border-bottom:1px solid var(--line); }
@@ -1002,8 +1188,8 @@ PAGE = r"""<!doctype html>
   }
   #progressbar.on { display:block; }
   #progressfill {
-    height:100%; width:0%; background:linear-gradient(90deg,#2b7fbe,#6cc0ff);
-    transition:width .3s ease; box-shadow:0 0 10px #6cc0ff88;
+    height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--accent-hover));
+    transition:width .3s ease; box-shadow:0 0 10px var(--accent-soft);
   }
   #console { left:0; }
     main { padding:18px 14px 120px; }
@@ -1013,8 +1199,18 @@ PAGE = r"""<!doctype html>
 <body>
 <div class="app">
   <aside>
-    <h1>vid<span>grab</span></h1>
-    <div class="tagline">打關鍵字 → 挑片 → 只切你要的那幾秒</div>
+    <div class="brandrow">
+      <div>
+        <h1>vid<span>grab</span></h1>
+        <div class="tagline">打關鍵字 → 挑片 → 只切你要的那幾秒</div>
+      </div>
+      <div class="theme-picker">
+        <button class="theme-btn" id="themebtn" title="切換主題" aria-haspopup="true" aria-expanded="false">
+          <span id="themeicon">◐</span>
+        </button>
+        <div class="theme-menu" id="thememenu" role="menu"></div>
+      </div>
+    </div>
     <div class="buildtag" id="buildtag"></div>
 
     <label class="field">
@@ -1091,9 +1287,20 @@ PAGE = r"""<!doctype html>
       <h3>我的素材專案</h3>
       <div id="projects"></div>
     </div>
+    <div class="resizer" id="resizer" role="separator" aria-orientation="vertical"
+         tabindex="0" title="拖曳調整寬度（雙擊還原）"></div>
   </aside>
 
   <main>
+    <div class="player" id="player" style="display:none">
+      <div class="ptitle"><b id="playername">—</b><span id="playermeta"></span></div>
+      <div class="stage"><video id="videoplayer" controls preload="metadata" playsinline></video></div>
+      <div class="prow">
+        <button class="mini" id="playerclose">關閉</button>
+        <a class="mini" id="playerdownload" href="#" download>下載這個檔案</a>
+        <span id="playerframes" class="frames"></span>
+      </div>
+    </div>
     <div id="view">
       <div class="empty">
         <div class="big">🎬</div>
@@ -1115,10 +1322,132 @@ PAGE = r"""<!doctype html>
     <div class="stat" id="loginstat">等待掃碼…</div>
   </div>
 </div>
+
 <div class="lightbox" id="lightbox"></div>
 
 <script>
 const $ = (s) => document.querySelector(s);
+
+// ------------------------------------------------------------ 主題與側欄寬度
+const THEMES = [
+  {id:'midnight', name:'Midnight', kind:'dark',  dot:'#0b0d12', accent:'#6cc0ff'},
+  {id:'ink',      name:'Ink',      kind:'dark',  dot:'#08090b', accent:'#c9a227'},
+  {id:'forest',   name:'Forest',   kind:'dark',  dot:'#0a1210', accent:'#6fd6a8'},
+  {id:'paper',    name:'Paper',    kind:'light', dot:'#f7f4ee', accent:'#b5651d'},
+  {id:'mist',     name:'Mist',     kind:'light', dot:'#eef2f7', accent:'#2f6fd0'},
+  {id:'sakura',   name:'Sakura',   kind:'light', dot:'#fdf4f5', accent:'#c25a7a'},
+];
+const THEME_KEY = 'vidgrab.theme';
+const SIDEBAR_KEY = 'vidgrab.sidebar';
+const SIDEBAR_MIN = 240, SIDEBAR_MAX = 620, SIDEBAR_DEFAULT = 330;
+
+function applyTheme(id) {
+  const t = THEMES.find(x => x.id === id) || THEMES[0];
+  document.documentElement.dataset.theme = t.id;
+  $('#themeicon').textContent = t.kind === 'dark' ? '◐' : '◑';
+  // 讓瀏覽器把捲軸、表單控件也跟著換色
+  document.documentElement.style.colorScheme = t.kind;
+  document.querySelectorAll('#thememenu button').forEach(b => {
+    b.setAttribute('aria-checked', String(b.dataset.theme === t.id));
+  });
+  try { localStorage.setItem(THEME_KEY, t.id); } catch (e) {}
+}
+
+function buildThemeMenu() {
+  const menu = $('#thememenu');
+  const groups = [['dark', '深色'], ['light', '淺色']];
+  menu.innerHTML = groups.map(([kind, label]) => `
+    <div class="group">${label}</div>
+    ${THEMES.filter(t => t.kind === kind).map(t => `
+      <button role="menuitemradio" data-theme="${t.id}" aria-checked="false">
+        <span class="swatch" style="background:${t.dot};box-shadow:inset 0 0 0 2px ${t.accent}"></span>
+        ${t.name}
+      </button>`).join('')}
+  `).join('');
+  menu.querySelectorAll('button').forEach(b => {
+    b.onclick = () => { applyTheme(b.dataset.theme); menu.classList.remove('open'); };
+  });
+}
+
+function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
+  // 沒存過就跟著系統的深淺
+  if (!saved && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+    saved = 'paper';
+  }
+  buildThemeMenu();
+  applyTheme(saved || 'midnight');
+
+  const btn = $('#themebtn'), menu = $('#thememenu');
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    const open = menu.classList.toggle('open');
+    btn.setAttribute('aria-expanded', String(open));
+  };
+  document.addEventListener('click', () => {
+    menu.classList.remove('open');
+    btn.setAttribute('aria-expanded', 'false');
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { menu.classList.remove('open'); btn.setAttribute('aria-expanded', 'false'); }
+  });
+}
+
+function setSidebar(px, persist) {
+  const width = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, Math.round(px)));
+  document.documentElement.style.setProperty('--sidebar', width + 'px');
+  if (persist) { try { localStorage.setItem(SIDEBAR_KEY, String(width)); } catch (e) {} }
+  return width;
+}
+
+function initResizer() {
+  const bar = $('#resizer');
+  if (!bar) return;
+  let saved = null;
+  try { saved = Number(localStorage.getItem(SIDEBAR_KEY)); } catch (e) {}
+  // 視窗太窄時不要沿用太寬的側欄
+  const maxForViewport = Math.min(SIDEBAR_MAX, Math.round(window.innerWidth * 0.55));
+  setSidebar(saved || Math.min(SIDEBAR_DEFAULT, maxForViewport), false);
+
+  let dragging = false;
+  const onMove = (e) => {
+    if (!dragging) return;
+    setSidebar(e.clientX, false);
+  };
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    bar.classList.remove('dragging');
+    document.body.classList.remove('resizing');
+    const cur = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar'), 10);
+    if (cur) setSidebar(cur, true);
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', stop);
+  };
+  bar.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    dragging = true;
+    bar.classList.add('dragging');
+    document.body.classList.add('resizing');
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', stop);
+  });
+  // 雙擊還原
+  bar.addEventListener('dblclick', () => setSidebar(SIDEBAR_DEFAULT, true));
+  // 鍵盤也能調（無障礙）
+  bar.addEventListener('keydown', (e) => {
+    const cur = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar'), 10) || SIDEBAR_DEFAULT;
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); setSidebar(cur - 16, true); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); setSidebar(cur + 16, true); }
+    if (e.key === 'Home')       { e.preventDefault(); setSidebar(SIDEBAR_DEFAULT, true); }
+  });
+  window.addEventListener('resize', () => {
+    const cur = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar'), 10) || SIDEBAR_DEFAULT;
+    if (window.innerWidth > 820) setSidebar(Math.min(cur, Math.round(window.innerWidth * 0.55)), false);
+  });
+}
+
 let CURRENT = null;      // 目前專案 payload
 let SELECTED = new Set(); // 勾選的 index
 let BUSY = false;
@@ -1206,11 +1535,15 @@ function render() {
       ? `<div class="thumbs">${it.thumbs.map(t => `<img src="${esc(t)}" loading="lazy" onclick="lightbox('img','${esc(t)}')">`).join('')}</div>`
       : '';
     const clips = it.clips.length
-      ? `<div class="clipbox">${it.clips.map(c => `
+      ? `<div class="clipbox">${it.clips.map((c, ci) => `
           <div class="clip-row">
-            <a href="${esc(c.rel)}" onclick="lightbox('video','${esc(c.rel)}');return false;">${esc(c.name)}</a>
-            <code>${esc(c.start)}s–${esc(c.end)}s</code>
+            <a href="${esc(c.rel)}" data-play="${esc(c.rel)}" data-name="${esc(c.name)}">${esc(c.name)}</a>
+            <code>${esc(c.span)}</code>
             <span>${esc(c.dims)} · ${esc(c.size)}</span>
+            <span class="clip-actions">
+              <button class="mini" data-play="${esc(c.rel)}" data-name="${esc(c.name)}">▶ 播放</button>
+              <a class="mini" href="${esc(c.rel)}" download>下載</a>
+            </span>
           </div>`).join('')}</div>`
       : '';
     const licenseCls = LIC_CLASS[it.license_kind] || 'lic-unknown';
@@ -1310,6 +1643,89 @@ function render() {
   $('#grab').onclick = grabClips;
   $('#refresh').onclick = refreshProject;
   $('#openlist').onclick = () => api('/api/open', {method:'POST', body: JSON.stringify({project: CURRENT.name})});
+}
+
+
+// ------------------------------------------------------------ 播放已下載的片段
+let PLAYING = null;   // 目前播放的檔案路徑
+
+function playClip(rel, name) {
+  const box = $('#player'), vid = $('#videoplayer');
+  if (PLAYING === rel) {            // 再按一次就收起
+    closePlayer();
+    return;
+  }
+  PLAYING = rel;
+  box.style.display = '';
+  $('#playername').textContent = name || rel.split('/').pop();
+  $('#playermeta').textContent = '';
+  vid.src = rel;
+  vid.play().catch(() => { /* 瀏覽器可能擋自動播放，讓使用者自己按 */ });
+  $('#playerdownload').href = rel;
+
+  // 顯示這支影片的幀圖（如果有）
+  const frames = $('#playerframes');
+  frames.innerHTML = '';
+  const item = (CURRENT && CURRENT.items || []).find(it =>
+    (it.clips || []).some(c => c.rel === rel));
+  const thumbList = (item && item.thumbs) || [];
+  if (thumbList.length) {
+    frames.innerHTML = thumbList.map(t => `<img src="${esc(t)}" onclick="seekToFrame('${esc(t)}')">`).join('');
+  }
+
+  // 標記清單中正在播放的那一列
+  document.querySelectorAll('[data-play]').forEach(el => {
+    el.classList.toggle('on', el.dataset.play === rel);
+  });
+
+  vid.onloadedmetadata = () => {
+    const d = vid.duration;
+    $('#playermeta').textContent = `${fmtSec(d)} · ${vid.videoWidth}×${vid.videoHeight}`;
+  };
+  box.scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+// 點幀圖 → 跳到那個時間點（近似：平均分配在片長裡）
+function seekToFrame(src) {
+  const vid = $('#videoplayer');
+  const item = (CURRENT && CURRENT.items || []).find(it =>
+    (it.thumbs || []).some(t => t === src));
+  if (!item || !vid.duration) return;
+  const idx = item.thumbs.indexOf(src);
+  const total = item.thumbs.length || 1;
+  // 幀圖是從整支影片抓的，這裡依比例換算
+  vid.currentTime = (vid.duration * idx) / Math.max(1, total - 1 || 1);
+  vid.pause();
+}
+
+function fmtSec(s) {
+  if (!isFinite(s)) return '—';
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
+
+function closePlayer() {
+  const vid = $('#videoplayer');
+  vid.pause(); vid.removeAttribute('src'); vid.load();
+  $('#player').style.display = 'none';
+  PLAYING = null;
+  document.querySelectorAll('[data-play]').forEach(el => el.classList.remove('on'));
+}
+
+function initPlayer() {
+  $('#playerclose').onclick = closePlayer;
+  $('#videoplayer').addEventListener('error', () => {
+    $('#playermeta').textContent = '這個格式瀏覽器可能不支援，請按「下載這個檔案」';
+  });
+  // 事件委派：影片清單是動態重繪的，不能在元素上綁
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest('[data-play]');
+    if (!el) return;
+    e.preventDefault();
+    playClip(el.dataset.play, el.dataset.name);
+  });
 }
 
 function lightbox(kind, src) {
@@ -1521,6 +1937,9 @@ async function showBuild() {
   } catch (e) { /* 忽略 */ }
 }
 async function boot() {
+  initTheme();
+  initResizer();
+  initPlayer();
   showBuild();
   await loadProjects();
   try {

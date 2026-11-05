@@ -384,6 +384,15 @@ def cmd_test(args: argparse.Namespace) -> int:
         rc = subprocess.call([sys.executable, str(checker)])
         if rc != 0 and code == 0:
             code = rc
+
+    # 介面檢查要開瀏覽器，不是每次都需要；用 --ui 明確要求
+    if getattr(args, "ui", False):
+        ui = root / "tools" / "check_ui.py"
+        if ui.exists():
+            print()
+            rc = subprocess.call([sys.executable, str(ui)])
+            if rc != 0:
+                code = rc
     return code
 
 
@@ -552,6 +561,8 @@ def build_parser() -> argparse.ArgumentParser:
     cfg.set_defaults(func=cmd_config)
 
     tst = sub.add_parser("test", help="跑煙霧測試")
+    tst.add_argument("--ui", action="store_true",
+                     help="另外用真的 Chrome 驗證介面（需要 Chrome 在 9222 開 CDP）")
     tst.set_defaults(func=cmd_test)
 
     bd = sub.add_parser("build", help="顯示版本與 build number")
