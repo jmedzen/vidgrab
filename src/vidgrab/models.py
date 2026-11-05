@@ -495,3 +495,35 @@ class LoginRequired(VidgrabError):
 class MissingFFmpeg(VidgrabError):
     code = "missing_ffmpeg"
     hint = "brew install ffmpeg"
+
+
+# ---------------------------------------------------------------- 內容類型
+
+# 這些字出現在標題裡，通常代表「教學／課程／解說」，不是可直接剪的畫面素材。
+# 刻意保守：只收幾乎不可能出現在實拍素材標題裡的詞。
+_TUTORIAL_TITLE = re.compile(
+    r"(教程|教学|課程|课程|公开课|公開課|全集|第[\d一二三四五六七八九十百]+[讲讲講課课]|"
+    r"零基础|零基礎|入门|入門|从入门到|從入門到|"
+    r"讲解|講解|解析|测评|評測|开箱|開箱|"
+    r"建模|渲染|插画|插畫|MC动画|\bVlog\b|"
+    r"直播回放|直播录像|直播錄像)",
+    re.IGNORECASE,
+)
+
+# 明顯是長篇講課／節目的標題特徵
+_TUTORIAL_DURATION_HINT = 3600.0  # 超過一小時且標題像課程，就當課程
+
+
+def looks_like_tutorial(item: "Item") -> bool:
+    """這支是不是「教學／課程」而非可剪的素材畫面？
+
+    用標題判斷，因為 B 站的分區（tname）太粗，
+    而「公開課」「建模教學」這類字幾乎不出現在空鏡素材上。
+    """
+    title = item.title or ""
+    if _TUTORIAL_TITLE.search(title):
+        return True
+    # 標題含「講」「课」又特別長，多半是整堂課
+    if (item.duration or 0) > _TUTORIAL_DURATION_HINT and re.search(r"[講讲課课]", title):
+        return True
+    return False

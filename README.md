@@ -169,6 +169,8 @@ brew install ffmpeg uv
 # 只要聲音
 ./vidgrab pick demo-taipei --select 2 --audio --per 60
 
+./vidgrab purge demo-taipei        # 篩掉教學／課程
+./vidgrab prune demo-taipei        # 清孤兒檔案
 ./vidgrab list          # 列出所有專案
 ./vidgrab login         # 掃碼登入 B 站
 ./vidgrab build         # 版本與 build number
@@ -188,6 +190,8 @@ brew install ffmpeg uv
 ./vidgrab vault --query "夜晚 街景"    # 在「已下載的素材」裡搜尋
 ./vidgrab batch <專案> --top 3 --range 1:00-1:30   # 批次抓片
 ./vidgrab find "bilibili:BV1xx#60-75"              # 用 id 找回素材
+./vidgrab purge <專案> --dry-run                   # 篩掉教學（先看會刪什麼）
+./vidgrab prune <專案> --dry-run                   # 清孤兒檔案
 ```
 
 ### 穩定 id
@@ -296,6 +300,52 @@ agent 可以把它存進自己的記憶，之後永遠找得回來。
 
 比對標題、作者、標籤、素材關鍵字，回傳帶 `score` 與 `matched` 的排序結果。
 這是 agent 最常用的一步——先問「我手上有什麼可以用」，再決定要不要去抓新的。
+
+### 繁體關鍵字會自動轉簡體
+
+B 站是簡體站，用繁體字搜尋常常一支都搜不到：
+
+```
+搜「寺廟 建築」→ 0 支      ← 繁體
+搜「寺庙 建筑」→ 12 支     ← 簡體
+```
+
+現在 `search` 會**原文與簡體都搜、取聯集**。原文一定排第一，
+所以就算對照表不完整，原本能搜到的結果也不會消失。
+英文與已經是簡體的關鍵字不會多搜（不浪費請求）。
+
+內建對照表在 `zh.py`，刻意不引入 opencc／zhconv——那會讓 Docker 映像大一倍。
+
+### 自動濾掉教學／課程
+
+素材庫要的是**可剪的畫面**，不是公開課。標題含「教程」「公開課」「第 N 講」
+「建模」「零基礎」這類字眼的會自動排除：
+
+| 會濾掉 | 會保留 |
+|---|---|
+| 【清华大学公开课】中国建筑史 全集 | 山西悬空寺 航拍 4K 空镜 |
+| 【3dmax建模】古建筑场景制作教程 | 雨后深山鸟鸣声，云雾缭绕 |
+| 佛教建筑第一讲｜亚洲佛教建筑总序 | 冬夜寺院燃烧的香烛 |
+
+舊專案（過濾規則加入前搜的）可以用 `./vidgrab purge` 重新整理，
+`--dry-run` 先看會刪什麼。
+
+### 清理孤兒檔案
+
+`purge` 只清清單，磁碟上的檔案還在。`prune` 清掉沒被清單追蹤的孤兒：
+
+```bash
+./vidgrab prune <專案> --dry-run   # 先看會刪什麼
+./vidgrab prune <專案>             # 實際清（含 .info.json sidecar）
+```
+
+實測：一個專案從 17MB 降到 3MB，清單在用的檔案一個都沒動。
+
+> **風控要注意**
+>
+> 短時間搜太多次，B 站會回 `v_voucher`（風控），這時**換 cookie 沒用**，
+> 要等冷卻。原本的訊息寫「換 cookie」會把人帶去重掃碼，已經改正。
+> 繁簡雙搜會讓請求數翻倍，搜尋量大時要留意。
 
 ### 常用篩選
 

@@ -434,6 +434,74 @@ def emit_json(payload: dict | list) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
+def cmd_prune(args: argparse.Namespace) -> int:
+    """清掉磁碟上沒被清單追蹤的孤兒檔案（purge 之後、或手動刪清單留下的）。
+
+    不做的話素材庫會越用越肥：清單只剩 2 支，磁碟上還躺著 7 個檔。
+    """
+    from . import agent
+
+    project = resolve_project(args.project)
+    manifest, items = tasks.load_project(project)
+    clips_dir = project / "clips"
+
+    tracked = {Path(c["path"]).name for it in items for c in it.clips}
+    orphans = []
+    if clips_dir.exists():
+        for p in sorted(clips_dir.iterdir()):
+            if not p.is_file():
+                continue
+            # info.json 跟著 mp4 一起判斷，避免留下孤兒 sidecar
+            stem_mp4 = p.name[:-10] if p.name.endswith(".info.json") else p.name
+            if stem_mp4 not in tracked and p.name not in tracked:
+                orphans.append(p)
+
+    freed = sum(p.stat().st_size for p in orphans)
+    if not args.dry_run:
+        for p in orphans:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    emit_json({
+        "schema": "vidgrab.prune/1",
+        "project": project.name,
+        "orphans": len(orphans),
+        "freed_bytes": freed,
+        "freed_human": __import__("vidgrab.models", fromlist=["human_size"]).human_size(freed),
+        "dry_run": bool(args.dry_run),
+        "files": [p.name for p in orphans],
+    })
+    return 0
+
+
+def cmd_purge(args: argparse.Namespace) -> int:
+    """把清單裡的教學／課程篩掉。過濾規則改了以後，舊專案可以用它重新整理。"""
+    from . import agent
+    from .models import looks_like_tutorial
+
+    project = resolve_project(args.project)
+    manifest, items = tasks.load_project(project)
+
+    dropped = [i for i in items if looks_like_tutorial(i)]
+    if not args.dry_run and dropped:
+        keep = [i for i in items if not looks_like_tutorial(i)]
+        tasks.save_project(project, manifest, keep)
+        items = keep
+
+    emit_json({
+        "schema": "vidgrab.purge/1",
+        "project": project.name,
+        "dropped": 0 if args.dry_run else len(dropped),
+        "would_drop": len(dropped),
+        "remaining": len(items),
+        "dry_run": bool(args.dry_run),
+        "titles": [i.title for i in dropped],
+    })
+    return 0
+
+
 def cmd_vault(args: argparse.Namespace) -> int:
     """整個素材庫的快照——agent 的主要入口。"""
     from . import agent
@@ -782,6 +850,16 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--save", action="store_true", help="把這次的選項存成預設")
     bt.add_argument("--timeout", type=float, help="這個批次最多跑幾秒（超過就中止）")
     bt.set_defaults(func=cmd_batch)
+
+    pn = sub.add_parser("prune", help="清掉磁碟上沒被清單追蹤的孤兒檔案")
+    pn.add_argument("project", nargs="?", help="專案名稱或路徑（省略 = 最新）")
+    pn.add_argument("--dry-run", action="store_true", help="只回報會刪什麼")
+    pn.set_defaults(func=cmd_prune)
+
+    pg = sub.add_parser("purge", help="篩掉清單裡的教學／課程")
+    pg.add_argument("project", nargs="?", help="專案名稱或路徑（省略 = 最新）")
+    pg.add_argument("--dry-run", action="store_true", help="只回報會刪什麼，不動資料")
+    pg.set_defaults(func=cmd_purge)
 
     vt = sub.add_parser("vault", help="素材庫快照（agent 的主要入口）")
     vt.add_argument("project", nargs="?", help="只看某個專案")

@@ -170,7 +170,10 @@ class BilibiliSource:
             # 只回 v_voucher = 被要求驗證，換一組 cookie 再試一次
             if not results and data.get("v_voucher") and not retried:
                 retried = True
-                log("· B 站要求驗證，換 cookie 重試…")
+                # v_voucher 是風控（短時間搜太多次最常見），不是 cookie 壞掉。
+                # 原本寫「換 cookie」會把使用者帶去重掃碼，白忙一場。
+                log("· B 站風控攔住了（短時間搜太多次），冷卻後再試；"
+                    "換 cookie 通常沒用，除非真的掉登入。")
                 self._bootstrap()
                 time.sleep(1.5)
                 payload = self._search_page(params_base, page, force_key=True)

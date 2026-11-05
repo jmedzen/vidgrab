@@ -28,12 +28,16 @@ Emit = Callable[[str], None]
 
 def _apply_filters(items: list[Item], *, fresh_days: int, min_duration: float,
                    max_duration: float, min_views: int, only_free: bool,
-                   drop_reposts: bool) -> list[Item]:
+                   drop_reposts: bool, drop_tutorials: bool = True) -> list[Item]:
     fresh_after = ""
     if fresh_days:
         fresh_after = time.strftime("%Y%m%d", time.localtime(time.time() - fresh_days * 86400))
+    from .models import looks_like_tutorial
+
     out = []
     for item in items:
+        if drop_tutorials and looks_like_tutorial(item):
+            continue
         if fresh_after and item.pubdate and item.pubdate < fresh_after:
             continue
         if min_duration and (item.duration or 0) < min_duration * 60:
@@ -79,25 +83,37 @@ def run_search(
         raise SystemExit("沒有可用的來源。")
     exclude = [w for w in (exclude or []) if w]
 
+    from .zh import search_forms, to_simplified
+
     collected: list[Item] = []
     for keyword in queries:
         for src in sources:
-            emit(f"· 搜尋「{keyword}」（{src.name}）…")
-            try:
-                found = src.search(
-                    keyword,
-                    limit=per_keyword,
-                    order=order,
-                    duration=duration,
-                    exclude=exclude,
-                    min_seconds=min_duration * 60 if min_duration else 0,
-                    max_seconds=max_duration * 60 if max_duration else 0,
-                )
-            except SourceError as exc:
-                emit(f"! {src.name} 搜「{keyword}」失敗：{exc}")
-                continue
-            emit(f"· {src.name} 「{keyword}」→ {len(found)} 支")
-            collected.extend(found)
+            # B 站是簡體站：繁體關鍵字常常一支都搜不到。
+            # 原文與簡體都搜、取聯集，任一寫法命中都算數。
+            forms = search_forms(keyword) if src.name == "bilibili" else [keyword]
+            merged: list[Item] = []
+            for form in forms:
+                emit(f"· 搜尋「{form}」（{src.name}）…")
+                try:
+                    found = src.search(
+                        form,
+                        limit=per_keyword,
+                        order=order,
+                        duration=duration,
+                        exclude=exclude,
+                        min_seconds=min_duration * 60 if min_duration else 0,
+                        max_seconds=max_duration * 60 if max_duration else 0,
+                    )
+                except SourceError as exc:
+                    emit(f"! {src.name} 搜「{form}」失敗：{exc}")
+                    continue
+                emit(f"· {src.name} 「{form}」→ {len(found)} 支")
+                merged.extend(found)
+
+            if len(forms) > 1:
+                total = len(iter_unique(merged))
+                emit(f"· {src.name} 「{keyword}」合計 → {total} 支（含簡體 {to_simplified(keyword)}）")
+            collected.extend(merged)
 
     collected = iter_unique(collected)
     if not collected:

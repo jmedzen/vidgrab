@@ -1105,3 +1105,175 @@ def test_build_env_wins(monkeypatch):
         assert version.build() == "42.cafe000"
     finally:
         version.build.cache_clear()
+
+
+# ---------------------------------------------------------------- 繁簡與內容過濾
+
+
+def test_traditional_to_simplified():
+    """B 站是簡體站，繁體關鍵字搜不到東西。這是真實踩到的問題。"""
+    from vidgrab.zh import to_simplified
+
+    assert to_simplified("寺廟") == "寺庙"
+    assert to_simplified("寺廟 建築") == "寺庙 建筑"
+    assert to_simplified("山林 雲霧") == "山林 云雾"
+    assert to_simplified("燭光 香爐 特寫") == "烛光 香炉 特写"
+
+
+def test_conversion_leaves_unknown_alone():
+    """沒收錄的字要原樣通過——寧可漏轉，不要轉錯。"""
+    from vidgrab.zh import to_simplified
+
+    assert to_simplified("handpan") == "handpan"
+    assert to_simplified("台北") == "台北", "台北本來就不變"
+    assert to_simplified("") == ""
+    assert to_simplified("ABC 123") == "ABC 123"
+
+
+def test_search_forms_always_keeps_original():
+    """原文一定排第一：對照表不完整時，原本能搜到的不能消失。"""
+    from vidgrab.zh import search_forms
+
+    forms = search_forms("寺廟")
+    assert forms[0] == "寺廟", "原文必須在"
+    assert "寺庙" in forms
+
+    # 已經是簡體，就不用多搜一次
+    assert search_forms("寺庙") == ["寺庙"]
+    assert search_forms("handpan") == ["handpan"]
+
+
+def test_tutorial_detection():
+    """公開課／建模教學不是可剪的素材。"""
+    from vidgrab.models import Item, looks_like_tutorial
+
+    def mk(title, dur=600.0):
+        return Item(platform="b", vid="1", url="u", title=title, duration=dur)
+
+    assert looks_like_tutorial(mk("【清华大学公开课】中国建筑史 全集"))
+    assert looks_like_tutorial(mk("【3dmax建模】经典古建筑场景模型制作教程"))
+    assert looks_like_tutorial(mk("Houdini制作山林云雾（附带树木课程）"))
+    assert looks_like_tutorial(mk("佛教建筑第一讲｜亚洲佛教建筑总序"))
+
+    # 不能誤殺真正的素材
+    assert not looks_like_tutorial(mk("雨后深山鸟鸣声，云雾缭绕的仙境"))
+    assert not looks_like_tutorial(mk("山西悬空寺 航拍 4K 空镜"))
+    assert not looks_like_tutorial(mk("冬夜寺院燃烧的香烛 晚课的木鱼声"))
+
+
+def test_purge_removes_tutorials(tmp_path, monkeypatch):
+    """purge 要能清掉舊專案裡的教學，留下真正素材。"""
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    _make_project(tmp_path, "p1", items=[
+        {"platform": "b", "vid": "1", "url": "u",
+         "title": "【清华大学公开课】中国建筑史 全集"},
+        {"platform": "b", "vid": "2", "url": "u",
+         "title": "山西悬空寺 航拍 4K 空镜"},
+    ])
+
+    env = {**__import__("os").environ, "PYTHONPATH": str(_ROOT / "src")}
+    r = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "purge", "p1"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data["dropped"] == 1
+    assert data["remaining"] == 1
+
+    r2 = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "vault", "p1"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    left = json.loads(r2.stdout)["items"]
+    assert len(left) == 1
+    assert "悬空寺" in left[0]["title"]
+
+
+def test_purge_dry_run_changes_nothing(tmp_path, monkeypatch):
+    """--dry-run 只回報，不能動資料。"""
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    _make_project(tmp_path, "p1", items=[
+        {"platform": "b", "vid": "1", "url": "u", "title": "某某教程"},
+        {"platform": "b", "vid": "2", "url": "u", "title": "空镜 航拍"},
+    ])
+
+    env = {**__import__("os").environ, "PYTHONPATH": str(_ROOT / "src")}
+    r = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "purge", "p1", "--dry-run"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    data = json.loads(r.stdout)
+    assert data["dry_run"] is True
+    assert data["would_drop"] == 1
+    assert data["dropped"] == 0
+
+    from vidgrab import tasks
+    _, items = tasks.load_project(tmp_path / "projects" / "p1")
+    assert len(items) == 2, "dry-run 不可以刪東西"
+
+
+def test_prune_removes_orphan_files(tmp_path, monkeypatch):
+    """purge 之後磁碟上會留孤兒檔；prune 要清掉，但不能碰清單在用的。"""
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    proj = _make_project(tmp_path, "p1", items=[{
+        "platform": "b", "vid": "keep", "url": "u", "title": "要留的",
+    }])
+    clips = proj / "clips"
+    clips.mkdir(parents=True, exist_ok=True)
+
+    kept = clips / "keep.mp4"
+    kept.write_bytes(b"k" * 100)
+    orphan = clips / "orphan.mp4"
+    orphan.write_bytes(b"o" * 200)
+    orphan_side = clips / "orphan.info.json"
+    orphan_side.write_text("{}", encoding="utf-8")
+
+    # 讓清單指向 kept
+    from vidgrab import tasks
+    manifest, items = tasks.load_project(proj)
+    items[0].clips = [{"path": str(kept), "start": 0.0, "end": 5.0}]
+    tasks.save_project(proj, manifest, items)
+
+    env = {**__import__("os").environ, "PYTHONPATH": str(_ROOT / "src")}
+    r = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "prune", "p1"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data["orphans"] == 2, data["files"]
+    assert kept.exists(), "清單在用的不可以刪"
+    assert not orphan.exists()
+    assert not orphan_side.exists()
+
+
+def test_prune_dry_run_keeps_files(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    proj = _make_project(tmp_path, "p1")
+    clips = proj / "clips"
+    clips.mkdir(parents=True, exist_ok=True)
+    f = clips / "orphan.mp4"
+    f.write_bytes(b"x" * 10)
+
+    env = {**__import__("os").environ, "PYTHONPATH": str(_ROOT / "src")}
+    r = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "prune", "p1", "--dry-run"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    data = json.loads(r.stdout)
+    assert data["dry_run"] is True
+    assert data["orphans"] == 1
+    assert f.exists(), "dry-run 不可以刪檔"
