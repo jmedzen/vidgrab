@@ -1135,6 +1135,7 @@ PAGE = r"""<!doctype html>
     --text:#e9ecf3; --muted:#8e98ad; --accent:#6cc0ff; --ok:#5ee2a0;
     --warn:#f3c96b; --bad:#ff8b8b; --shadow:0 10px 30px rgba(0,0,0,.35);
     --aside-bg:rgba(16,20,28,.85); --code-bg:#0b0e14;
+    --console-bg:rgba(16,20,28,.97);
     --glow:radial-gradient(1200px 600px at 80% -10%, #17202e 0%, var(--bg) 55%);
     --card-bg:linear-gradient(180deg,#161b25 0%,#131820 100%);
     --accent-soft:rgba(108,192,255,.12); --scrim:rgba(0,0,0,.8);
@@ -1147,6 +1148,7 @@ PAGE = r"""<!doctype html>
     --text:#e6e6e4; --muted:#8a8d92; --accent:#c9a227; --ok:#79c39a;
     --warn:#d8b25a; --bad:#e08b7f; --shadow:0 10px 28px rgba(0,0,0,.55);
     --aside-bg:rgba(10,11,13,.9); --code-bg:#0c0d10;
+    --console-bg:rgba(14,15,18,.97);
     --glow:radial-gradient(1100px 560px at 78% -12%, #14161a 0%, var(--bg) 60%);
     --card-bg:linear-gradient(180deg,#121417 0%,#101215 100%);
     --accent-soft:rgba(201,162,39,.13); --scrim:rgba(0,0,0,.85);
@@ -1159,6 +1161,7 @@ PAGE = r"""<!doctype html>
     --text:#e4efe9; --muted:#87a29a; --accent:#6fd6a8; --ok:#6fd6a8;
     --warn:#e3c46b; --bad:#ef8f8f; --shadow:0 10px 30px rgba(0,0,0,.4);
     --aside-bg:rgba(10,18,16,.88); --code-bg:#0a1210;
+    --console-bg:rgba(14,26,22,.97);
     --glow:radial-gradient(1150px 580px at 80% -10%, #10241f 0%, var(--bg) 58%);
     --card-bg:linear-gradient(180deg,#10201c 0%,#0e1a17 100%);
     --accent-soft:rgba(111,214,168,.13); --scrim:rgba(0,0,0,.82);
@@ -1171,6 +1174,7 @@ PAGE = r"""<!doctype html>
     --text:#232019; --muted:#6f6759; --accent:#b5651d; --ok:#2f7d4f;
     --warn:#9a6b15; --bad:#b03a3a; --shadow:0 8px 24px rgba(80,60,30,.12);
     --aside-bg:rgba(255,253,249,.9); --code-bg:#f0ece3;
+    --console-bg:rgba(250,246,238,.97);
     --glow:radial-gradient(1200px 600px at 82% -14%, #fff9ee 0%, var(--bg) 60%);
     --card-bg:linear-gradient(180deg,#fffdf9 0%,#fbf8f1 100%);
     --accent-soft:rgba(181,101,29,.10); --scrim:rgba(60,45,25,.55);
@@ -1183,6 +1187,10 @@ PAGE = r"""<!doctype html>
     --text:#1b2532; --muted:#68758a; --accent:#2f6fd0; --ok:#1f7a52;
     --warn:#8a6512; --bad:#b23b4a; --shadow:0 8px 24px rgba(30,50,80,.10);
     --aside-bg:rgba(255,255,255,.92); --code-bg:#eef3f9;
+    --console-bg:rgba(246,249,253,.97);
+    /* Mist 的 --muted 放在淺底上只有 4.42:1，差一點不到 AA。
+       只調 console 用的文字色，不動整個介面的 --muted。 */
+    --console-fg:#5b6880;
     --glow:radial-gradient(1200px 620px at 80% -12%, #ffffff 0%, var(--bg) 62%);
     --card-bg:linear-gradient(180deg,#ffffff 0%,#fafcff 100%);
     --accent-soft:rgba(47,111,208,.10); --scrim:rgba(20,35,60,.55);
@@ -1195,6 +1203,7 @@ PAGE = r"""<!doctype html>
     --text:#2b1f24; --muted:#7d626b; --accent:#c25a7a; --ok:#3d7f5e;
     --warn:#96701c; --bad:#bb3b57; --shadow:0 8px 24px rgba(120,60,80,.12);
     --aside-bg:rgba(255,250,251,.92); --code-bg:#f8ecef;
+    --console-bg:rgba(253,246,247,.97);
     --glow:radial-gradient(1200px 600px at 82% -12%, #fff7f9 0%, var(--bg) 62%);
     --card-bg:linear-gradient(180deg,#fffafb 0%,#fdf3f5 100%);
     --accent-soft:rgba(194,90,122,.10); --scrim:rgba(70,35,48,.55);
@@ -1407,10 +1416,11 @@ PAGE = r"""<!doctype html>
   body.dl-on #console { bottom:104px; }
   #console {
     position:fixed; left:var(--sidebar); right:0; bottom:0; max-height:190px; display:none;
-    background:rgba(8,10,15,.96); border-top:1px solid var(--line); overflow-y:auto;
+    background:var(--console-bg); border-top:1px solid var(--line); overflow-y:auto;
+    /* 跟著主題走：原本寫死深色，淺色主題下會變成深灰字印在黑底上（對比只有 3.5:1） */
     font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; padding:10px 16px; z-index:50;
   }
-  #console .ln { color:var(--muted); white-space:pre-wrap; }
+  #console .ln { color:var(--console-fg, var(--muted)); white-space:pre-wrap; }
   #console .ln.err { color:var(--bad); }
   #console .prog { color:var(--accent); white-space:pre-wrap; }
   .spinner {

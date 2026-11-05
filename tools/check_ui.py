@@ -294,6 +294,51 @@ def _run() -> int:
     dark_bg = tab.js("getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()")
     check("淺色與深色底色不同", light_bg != dark_bg, f"{light_bg} vs {dark_bg}")
 
+    # log 視窗要跟著主題：底色曾經寫死 rgba(8,10,15,.96)，
+    # 淺色主題下變成深灰字印在黑底上（對比只有 3.5:1）
+    console_bgs = {}
+    for tid in ids:
+        tab.js(f"applyTheme('{tid}')")
+        tab.js("consoleLine('主題檢查')")
+        time.sleep(0.15)
+        info = tab.js("""JSON.stringify((() => {
+          const c = document.querySelector('#console');
+          const ln = c.querySelector('.ln');
+          return {bg: getComputedStyle(c).backgroundColor,
+                  fg: ln ? getComputedStyle(ln).color : ''};
+        })())""")
+        console_bgs[tid] = json.loads(info) if info else {}
+
+    distinct = {v.get("bg") for v in console_bgs.values()}
+    check("log 視窗底色跟著主題變", len(distinct) >= 5,
+          f"{len(distinct)} 種底色")
+
+    def _ratio(fg: str, bg: str) -> float:
+        import re as _re
+
+        def _rgb(t: str):
+            n = [int(x) for x in _re.findall(r"\d+", t)[:3]]
+            return n if len(n) == 3 else [0, 0, 0]
+
+        def _lin(c: float) -> float:
+            c /= 255
+            return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+        def _L(t):
+            r, g, b = _rgb(t)
+            return 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
+
+        la, lb = _L(fg), _L(bg)
+        hi, lo = max(la, lb), min(la, lb)
+        return (hi + 0.05) / (lo + 0.05)
+
+    worst = min(
+        ((t, _ratio(v["fg"], v["bg"])) for t, v in console_bgs.items() if v.get("fg")),
+        key=lambda x: x[1], default=("", 0.0),
+    )
+    check("log 文字對比 ≥ WCAG AA (4.5:1)", worst[1] >= 4.5,
+          f"最低 {worst[0]} {worst[1]:.2f}:1")
+
     # 選單尺寸：曾經被 `aside * {max-width:100%}` 壓成 32px 的一條縫
     tab.js("$('#themebtn').click()")
     time.sleep(0.4)
