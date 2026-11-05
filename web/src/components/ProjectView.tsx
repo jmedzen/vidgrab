@@ -23,7 +23,7 @@ interface Props {
   onToggle: (index: number) => void
   onSelectAll: (on: boolean) => void
   onPlay: (rel: string, name: string) => void
-  onLightbox: (src: string) => void
+  onLightbox: (kind: 'img' | 'video', src: string) => void
   onGrab: () => void
   onRefresh: () => void
   onOpenList: () => void

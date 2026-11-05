@@ -835,6 +835,76 @@ def _run() -> int:
         check("設定面板關閉",
               tab.js("getComputedStyle(document.querySelector('#adminmodal')).display === 'none'"))
 
+    print("── 大圖／影片預覽")
+    thumb = tab.js("!!document.querySelector('.clip-thumb')")
+    check("片段有縮圖可點", thumb)
+    if thumb:
+        tab.js("document.querySelector('.clip-thumb').click()")
+        time.sleep(1.8)
+        check("放大預覽打開",
+              tab.js("document.querySelector('#lightbox').classList.contains('show')"))
+
+        # 使用者要的是「放大看影片」，不是放大看圖
+        check("放大後是影片（不是靜態圖）",
+              tab.js("!!document.querySelector('#lightbox video')"))
+
+        played = tab.js("""(async () => {
+          const v = document.querySelector('#lightbox video');
+          if (!v) return 'no-video';
+          if (v.readyState < 2) {
+            await new Promise(r => {
+              v.addEventListener('loadedmetadata', r, {once:true});
+              v.addEventListener('error', r, {once:true});
+              setTimeout(r, 9000);
+            });
+          }
+          if (v.error) return 'error:' + v.error.code;
+          const t0 = v.currentTime;
+          await new Promise(r => setTimeout(r, 1100));
+          return JSON.stringify({
+            rs: v.readyState, dur: Math.round(v.duration*100)/100,
+            w: v.videoWidth, h: v.videoHeight,
+            advancing: v.currentTime > t0,
+          });
+        })()""", await_promise=True)
+        ok_play = False
+        try:
+            info = json.loads(played)
+            ok_play = info["rs"] >= 2 and info["dur"] > 0 and info["advancing"]
+        except Exception:  # noqa: BLE001
+            info = played
+        check("放大後影片真的在播", ok_play, str(played)[:70])
+
+        # 點影片本身不該關掉（才拉得到進度條）
+        before = tab.js("document.querySelector('#lightbox').classList.contains('show')")
+        tab.js("(() => { const v=document.querySelector('#lightbox video'); if(v) v.click(); })()")
+        time.sleep(0.5)
+        check("點影片不會關掉預覽",
+              tab.js("document.querySelector('#lightbox').classList.contains('show')") == before)
+
+        # 點背景關閉（用真的滑鼠事件，JS .click() 會被 stopPropagation 繞過）
+        box = tab.js("""(() => { const b=document.querySelector('#lightbox').getBoundingClientRect();
+          return JSON.stringify({x: Math.round(b.x+8), y: Math.round(b.y+8)}); })()""")
+        pos = json.loads(box)
+        for kind in ("mousePressed", "mouseReleased"):
+            tab.send("Input.dispatchMouseEvent", type=kind, x=pos["x"], y=pos["y"],
+                     button="left", clickCount=1)
+        time.sleep(0.8)
+        check("點背景關掉預覽",
+              tab.js("!document.querySelector('#lightbox').classList.contains('show')"))
+
+        # Esc 也要能關
+        tab.js("document.querySelector('.clip-thumb').click()")
+        time.sleep(1.0)
+        tab.send("Input.dispatchKeyEvent", type="keyDown", key="Escape", windowsVirtualKeyCode=27)
+        time.sleep(0.6)
+        check("Esc 關掉預覽",
+              tab.js("!document.querySelector('#lightbox').classList.contains('show')"))
+
+    # admin 面板不可以被包進 lightbox（會蓋住整個預覽區）
+    check("設定面板不在預覽容器裡",
+          not tab.js("!!document.querySelector('#lightbox #adminmodal')"))
+
     print("── 沒有 JS 錯誤")
     real_errors = [e for e in tab.errors if e and "favicon" not in e.lower()]
     check("console 乾淨", not real_errors, str(real_errors[:3]))

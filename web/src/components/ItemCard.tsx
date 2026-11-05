@@ -6,7 +6,7 @@ interface Props {
   selected: boolean
   onToggle: (index: number) => void
   onPlay: (rel: string, name: string) => void
-  onLightbox: (src: string) => void
+  onLightbox: (kind: 'img' | 'video', src: string) => void
 }
 
 export default function ItemCard({ item, selected, onToggle, onPlay, onLightbox }: Props) {
@@ -50,7 +50,7 @@ export default function ItemCard({ item, selected, onToggle, onPlay, onLightbox 
             <div className="thumbs">
               {item.thumbs.map((t) => (
                 <img key={t} src={t} loading="lazy" alt="影片畫面"
-                     onClick={() => onLightbox(t)} />
+                     onClick={() => onLightbox('img', t)} />
               ))}
             </div>
           )
@@ -68,8 +68,9 @@ export default function ItemCard({ item, selected, onToggle, onPlay, onLightbox 
                   {c.thumb
                     ? (
                       <img className="clip-thumb" src={c.thumb} loading="lazy"
-                           alt={`${c.name} 的畫面預覽`} title="這一格就是這個片段"
-                           onClick={() => onLightbox(c.thumb)} />
+                           alt={`${c.name} 的畫面預覽`}
+                           title="點一下放大播放這個片段"
+                           onClick={() => onLightbox('video', c.rel)} />
                     )
                     : <span className="clip-thumb clip-nothumb" title="沒有縮圖">無圖</span>}
                   <a href={c.rel} data-play={c.rel} data-name={c.name}
@@ -81,6 +82,8 @@ export default function ItemCard({ item, selected, onToggle, onPlay, onLightbox 
                   <span className="clip-actions">
                     <button className="mini" data-play={c.rel} data-name={c.name}
                             onClick={() => onPlay(c.rel, c.name)}>▶ 播放</button>
+                    <button className="mini" title="放大播放"
+                            onClick={() => onLightbox('video', c.rel)}>⤢</button>
                     <a className="mini" href={c.rel} download>下載</a>
                   </span>
                 </div>

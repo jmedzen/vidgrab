@@ -58,7 +58,7 @@ export default function App() {
   const [project, setProject] = useState<Project | null>(null)
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set())
   const [playing, setPlaying] = useState<{ rel: string; name: string } | null>(null)
-  const [lightbox, setLightbox] = useState<string | null>(null)
+  const [lightbox, setLightbox] = useState<{ kind: 'img' | 'video'; src: string } | null>(null)
   const [library, setLibrary] = useState<LibraryProject[]>([])
   const [libOpen, setLibOpen] = useState(false)
   const [libSort, setLibSort] = useState('manual')
@@ -565,7 +565,7 @@ export default function App() {
                     on ? new Set(project.items.map((i) => i.index)) : new Set(),
                   )}
                   onPlay={(rel, name) => setPlaying({ rel, name })}
-                  onLightbox={setLightbox}
+                  onLightbox={(kind, src) => setLightbox({ kind, src })}
                   onGrab={() => { void doGrab() }}
                   onRefresh={() => { void doRefresh() }}
                   onOpenList={doOpenList}
@@ -617,9 +617,7 @@ export default function App() {
         onForget={(f) => { void doForget(f) }}
       />
 
-      <div className={`lightbox${lightbox ? ' show' : ''}`} id="lightbox"
-           onClick={() => setLightbox(null)}>
-        <AdminPanel
+      <AdminPanel
         open={adminOpen}
         config={config}
         onClose={() => setAdminOpen(false)}
@@ -627,7 +625,16 @@ export default function App() {
         onReset={(k) => { void doResetConfig(k) }}
       />
 
-      {lightbox ? <img src={lightbox} alt="放大預覽" /> : null}
+      <div className={`lightbox${lightbox ? ' show' : ''}`} id="lightbox"
+           onClick={() => setLightbox(null)}>
+        {lightbox ? (
+          lightbox.kind === 'video' ? (
+            <video src={lightbox.src} controls autoPlay playsInline muted
+                   onClick={(e) => e.stopPropagation()} />
+          ) : (
+            <img src={lightbox.src} alt="放大檢視" />
+          )
+        ) : null}
       </div>
 
       <div className="sr-only" aria-live="polite">
