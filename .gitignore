@@ -5,3 +5,9 @@ auth/
 __pycache__/
 *.pyc
 .DS_Store
+src/vidgrab/_build_info.py
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/

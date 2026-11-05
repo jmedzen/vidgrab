@@ -29,11 +29,12 @@ if [ "$need_install" = "1" ]; then
     echo "✗ 找不到 uv。請先安裝：brew install uv" >&2
     exit 1
   fi
-  echo "▶ 第一次執行：建立 venv 並安裝 yt-dlp（約 1 分鐘）…" >&2
+  echo "▶ 第一次執行：建立 venv 並安裝依賴（約 1 分鐘）…" >&2
   PY="$(command -v python3)"
   rm -rf "$VENV"
   uv venv --python "$PY" "$VENV" >&2
-  uv pip install --python "$VENV/bin/python" "yt-dlp>=2024.1.1" "requests>=2.28" "qrcode[pil]>=7.4" >&2
+  # 依賴只在 pyproject.toml 宣告一次，這裡直接照著裝
+  uv pip install --python "$VENV/bin/python" -e "$HERE" >&2
   echo "✔ 環境就緒" >&2
 fi
 

@@ -10,7 +10,8 @@ import traceback
 import webbrowser
 from pathlib import Path
 
-from . import __version__, media, report, tasks
+from . import media, report, tasks
+from .version import __version__, build, full_version
 from .models import (
     Item,
     fmt_duration,
@@ -149,6 +150,25 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_ranges(specs: list[str]) -> list[tuple[float, float]]:
+    """把 "1:00-2:30" 這種寫法轉成 (start, end) 秒數。"""
+    from .models import parse_ts as _ts
+
+    out: list[tuple[float, float]] = []
+    for spec in specs:
+        for chunk in spec.replace(" ", "").split(","):
+            if not chunk:
+                continue
+            if "-" not in chunk:
+                raise SystemExit(f"區段要寫成 開始-結束，例如 1:00-2:30（收到 {chunk}）")
+            lo, _, hi = chunk.partition("-")
+            start, end = _ts(lo), _ts(hi)
+            if end <= start:
+                raise SystemExit(f"區段結束要比開始晚：{chunk}")
+            out.append((start, end))
+    return out
+
+
 def cmd_pick(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     if args.select:
@@ -169,6 +189,8 @@ def cmd_pick(args: argparse.Namespace) -> int:
         idxs,
         per=float(args.per),
         starts=[parse_ts(a) for a in (args.at or [])],
+        ranges=_parse_ranges(args.range or []),
+        full=bool(args.full),
         frames=args.frames,
         frame_count=args.frame_count,
         height=args.height,
@@ -244,6 +266,33 @@ def cmd_open(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_test(args: argparse.Namespace) -> int:
+    """跑煙霧測試；沒裝 pytest 就給清楚的提示。"""
+    import subprocess
+
+    try:
+        import pytest  # noqa: F401
+    except ImportError:
+        print("需要 pytest：pip install pytest（或 uv pip install -e '.[dev]'）", file=sys.stderr)
+        return 2
+    root = Path(__file__).resolve().parents[2]
+    target = root / "tests"
+    if not target.exists():
+        print("找不到 tests/ 目錄（容器映像裡不含測試）", file=sys.stderr)
+        return 2
+    return subprocess.call([sys.executable, "-m", "pytest", str(target), "-q"])
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    from .version import full_version as _full
+
+    if args.json:
+        print(json.dumps({"version": __version__, "build": build(), "full": _full()}, ensure_ascii=False))
+    else:
+        print(f"vidgrab {_full()}")
+    return 0
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     from . import auth
 
@@ -261,7 +310,7 @@ def cmd_login(args: argparse.Namespace) -> int:
     print("用手機 B 站 App →「我的」→ 右上角掃一掃，掃這張 QR：")
     print(f"  {png}")
     print("（約 180 秒內有效）")
-    if args.open or True:
+    if not args.no_open:
         import webbrowser
 
         webbrowser.open(f"file://{png}")
@@ -296,7 +345,11 @@ def cmd_logout(args: argparse.Namespace) -> int:
 def cmd_web(args: argparse.Namespace) -> int:
     from .web import serve
 
-    serve(host=args.host, port=args.port, open_browser=not args.no_open)
+    import os
+
+    host = args.host or os.environ.get("VIDGRAB_HOST") or "127.0.0.1"
+    port = args.port or int(os.environ.get("VIDGRAB_PORT") or 8310)
+    serve(host=host, port=port, open_browser=not args.no_open)
     return 0
 
 
@@ -317,7 +370,7 @@ def build_parser() -> argparse.ArgumentParser:
   ./vidgrab pick 20261105-台北 --select 2,5-6 --at 1:30 --per 12
         """,
     )
-    parser.add_argument("--version", action="version", version=f"vidgrab {__version__}")
+    parser.add_argument("--version", action="version", version=f"vidgrab {full_version()}")
     parser.add_argument("--debug", action="store_true", help="出錯時印出完整追蹤")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -349,6 +402,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, help="自動取排序前 N 支")
     p.add_argument("--at", action="append", help="從第幾秒開始切（可重複）；省略 = 自動挑一段")
     p.add_argument("--per", default="15", help="每段幾秒（預設 15）")
+    p.add_argument("--full", action="store_true", help="下載整支影片（不切片）")
+    p.add_argument("--range", action="append", metavar="開始-結束",
+                   help="自訂區段，如 1:00-2:30；可重複、也可逗號分隔多段")
     p.add_argument("--height", type=int, default=1080, help="最高解析度（預設 1080）")
     p.add_argument("--audio", action="store_true", help="只要聲音")
     p.add_argument("--audio-format", default="m4a", help="m4a/mp3/wav/opus")
@@ -377,16 +433,24 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("project", nargs="?")
     o.set_defaults(func=cmd_open)
 
+    tst = sub.add_parser("test", help="跑煙霧測試")
+    tst.set_defaults(func=cmd_test)
+
+    bd = sub.add_parser("build", help="顯示版本與 build number")
+    bd.add_argument("--json", action="store_true", help="輸出 JSON")
+    bd.set_defaults(func=cmd_build)
+
     lg = sub.add_parser("login", help="掃碼登入 B 站（存 cookie，高畫質與會員片必備）")
     lg.add_argument("--force", action="store_true", help="已經登入也重新登入")
+    lg.add_argument("--no-open", action="store_true", help="不要自動開圖（容器／無圖形介面用）")
     lg.set_defaults(func=cmd_login)
 
     lo = sub.add_parser("logout", help="登出 B 站並刪除 cookie")
     lo.set_defaults(func=cmd_logout)
 
     w = sub.add_parser("web", help="開 Web UI（本機網頁介面）")
-    w.add_argument("--host", default="127.0.0.1")
-    w.add_argument("--port", type=int, default=8310)
+    w.add_argument("--host", default=None, help="預設讀 VIDGRAB_HOST，否則 127.0.0.1")
+    w.add_argument("--port", type=int, default=None, help="預設讀 VIDGRAB_PORT，否則 8310")
     w.add_argument("--no-open", action="store_true", help="不要自動開瀏覽器")
     w.set_defaults(func=cmd_web)
 

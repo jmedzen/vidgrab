@@ -4,4 +4,4 @@
      → 可選探查（抓幾格畫面看實際拍了什麼）→ 切片段／抽音 → 產生清單與對照頁。
 """
 
-__version__ = "0.1.0"
+from .version import __version__, banner, build, full_version  # noqa: F401

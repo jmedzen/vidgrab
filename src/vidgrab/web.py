@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from . import media, report, tasks
+from . import __version__, media, report, tasks
 from .models import Item, fmt_duration, human_size, log, slugify, today
 
 PLATFORM_LABEL = {"bilibili": "B 站", "youtube": "YouTube"}
@@ -273,6 +273,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, png.read_bytes(), "image/png")
             return
+        if route == "/api/version":
+            from .version import build, full_version
+
+            self._json({"version": __version__, "build": build(), "full": full_version()})
+            return
         if route == "/api/login/status":
             from . import auth
 
@@ -330,9 +335,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "請先勾選影片"}, 400)
             per = float(body.get("per") or 15)
             starts = [float(s) for s in (body.get("starts") or [])]
+            ranges = [tuple(float(x) for x in pair) for pair in (body.get("ranges") or [])]
+            full = bool(body.get("full"))
             opts = {
                 "per": per,
                 "starts": starts,
+                "ranges": ranges,
+                "full": full,
                 "frames": bool(body.get("frames")),
                 "frame_count": int(body.get("frame_count") or 3),
                 "height": int(body.get("height") or 1080),
@@ -524,7 +533,10 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
-def serve(host: str = "127.0.0.1", port: int = 8310, open_browser: bool = True) -> None:
+def serve(host: str | None = None, port: int = 8310, open_browser: bool = True) -> None:
+    import os
+
+    host = host or os.environ.get("VIDGRAB_HOST") or "127.0.0.1"
     root = tasks.projects_root()
     root.mkdir(parents=True, exist_ok=True)
     httpd = ThreadingHTTPServer((host, port), Handler)
@@ -568,7 +580,8 @@ PAGE = r"""<!doctype html>
   main { overflow-y:auto; padding:22px 26px 80px; }
   h1 { font-size:19px; margin:0 0 2px; letter-spacing:.04em; }
   h1 span { color:var(--accent); }
-  .tagline { color:var(--muted); font-size:12px; margin-bottom:18px; }
+  .tagline { color:var(--muted); font-size:12px; margin-bottom:4px; }
+  .buildtag { color:#5b6577; font-size:11px; margin-bottom:16px; font-variant-numeric:tabular-nums; }
   label.field { display:block; margin-bottom:12px; }
   label.field > span { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; }
   input[type=text], input[type=number], select, textarea {
@@ -654,6 +667,14 @@ PAGE = r"""<!doctype html>
   .warnline { font-size:12px; color:var(--warn); margin-top:7px; }
   .empty { text-align:center; color:var(--muted); padding:70px 20px; line-height:2; }
   .empty .big { font-size:34px; opacity:.5; }
+  #progressbar {
+    position:fixed; left:330px; right:0; top:0; height:3px; background:transparent; z-index:60; display:none;
+  }
+  #progressbar.on { display:block; }
+  #progressfill {
+    height:100%; width:0%; background:linear-gradient(90deg,#2b7fbe,#6cc0ff);
+    transition:width .3s ease; box-shadow:0 0 10px #6cc0ff88;
+  }
   #console {
     position:fixed; left:330px; right:0; bottom:0; max-height:190px; display:none;
     background:rgba(8,10,15,.96); border-top:1px solid var(--line); overflow-y:auto;
@@ -661,6 +682,7 @@ PAGE = r"""<!doctype html>
   }
   #console .ln { color:#9fb0c6; white-space:pre-wrap; }
   #console .ln.err { color:var(--bad); }
+  #console .prog { color:var(--accent); white-space:pre-wrap; }
   .spinner {
     display:inline-block; width:12px; height:12px; border:2px solid #ffffff33; border-top-color:var(--accent);
     border-radius:50%; animation:spin .8s linear infinite; vertical-align:-2px; margin-right:6px;
@@ -679,7 +701,15 @@ PAGE = r"""<!doctype html>
   @media (max-width: 900px) {
     .app { grid-template-columns:1fr; height:auto; }
     aside { border-right:none; border-bottom:1px solid var(--line); }
-    #console { left:0; }
+    #progressbar {
+    position:fixed; left:330px; right:0; top:0; height:3px; background:transparent; z-index:60; display:none;
+  }
+  #progressbar.on { display:block; }
+  #progressfill {
+    height:100%; width:0%; background:linear-gradient(90deg,#2b7fbe,#6cc0ff);
+    transition:width .3s ease; box-shadow:0 0 10px #6cc0ff88;
+  }
+  #console { left:0; }
     main { padding:18px 14px 120px; }
   }
 </style>
@@ -689,6 +719,7 @@ PAGE = r"""<!doctype html>
   <aside>
     <h1>vid<span>grab</span></h1>
     <div class="tagline">打關鍵字 → 挑片 → 只切你要的那幾秒</div>
+    <div class="buildtag" id="buildtag"></div>
 
     <label class="field">
       <span>關鍵字（一行一個，或用逗號分隔）</span>
@@ -777,6 +808,7 @@ PAGE = r"""<!doctype html>
   </main>
 </div>
 
+<div id="progressbar"><div id="progressfill"></div></div>
 <div id="console"></div>
 <div class="toast" id="toast"></div>
 <div class="modal" id="loginmodal">
@@ -800,9 +832,22 @@ function toast(msg, ms = 2200) {
   const el = $('#toast'); el.textContent = msg; el.classList.add('show');
   clearTimeout(el._t); el._t = setTimeout(() => el.classList.remove('show'), ms);
 }
+let PROG_LINE = null;
 function consoleLine(text, isErr) {
   const box = $('#console');
   box.style.display = 'block';
+  // 以 \r 開頭 = 覆寫同一行的進度，不要一行行堆
+  if (text.startsWith('\r')) {
+    if (!PROG_LINE || !PROG_LINE.isConnected) {
+      PROG_LINE = document.createElement('div');
+      PROG_LINE.className = 'ln prog';
+      box.appendChild(PROG_LINE);
+    }
+    PROG_LINE.textContent = text.slice(1);
+    box.scrollTop = box.scrollHeight;
+    return;
+  }
+  PROG_LINE = null;
   const div = document.createElement('div');
   div.className = 'ln' + (isErr ? ' err' : '');
   div.textContent = text;
@@ -811,6 +856,14 @@ function consoleLine(text, isErr) {
 }
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function tsToSec(s) {
+  s = String(s).trim();
+  if (s.includes(':')) {
+    const p = s.split(':').map(Number);
+    return p.length === 3 ? p[0]*3600 + p[1]*60 + p[2] : p[0]*60 + p[1];
+  }
+  return Number(s);
 }
 const LIC_CLASS = {free:'lic-free','free-attribution':'lic-free',check:'lic-check',unknown:'lic-unknown',none:'lic-unknown'};
 
@@ -903,10 +956,16 @@ function render() {
         <input type="checkbox" id="selall"> 全選
       </label>
       <span class="sp"></span>
-      <span class="sub" style="margin:0">每段</span>
+      <select id="mode" style="width:132px">
+        <option value="auto">切片（每段固定）</option>
+        <option value="range">切片（自訂區段）</option>
+        <option value="full">整支下載</option>
+      </select>
+      <span class="sub" id="perlabel" style="margin:0">每段</span>
       <input type="number" id="per" value="15" min="1" step="1" style="width:66px">
-      <span class="sub" style="margin:0">秒</span>
+      <span class="sub" id="persuffix" style="margin:0">秒</span>
       <input type="text" id="starts" placeholder="指定秒數，如 90, 3:20" style="width:170px">
+      <input type="text" id="ranges" placeholder="區段，如 1:00-2:30, 5:00-6:00" style="width:230px;display:none">
       <select id="height" style="width:104px">
         <option value="2160">4K</option>
         <option value="1440">1440p</option>
@@ -937,6 +996,17 @@ function render() {
     SELECTED = e.target.checked ? new Set(items.map(i => i.index)) : new Set();
     render();
   };
+  const mode = $('#mode');
+  const syncMode = () => {
+    const m = mode.value;
+    $('#ranges').style.display = m === 'range' ? '' : 'none';
+    $('#starts').style.display = m === 'auto' ? '' : 'none';
+    $('#per').style.display = m === 'full' ? 'none' : '';
+    $('#perlabel').style.display = m === 'full' ? 'none' : '';
+    $('#persuffix').style.display = m === 'full' ? 'none' : '';
+  };
+  mode.onchange = syncMode;
+  syncMode();
   $('#grab').onclick = grabClips;
   $('#refresh').onclick = refreshProject;
   $('#openlist').onclick = () => api('/api/open', {method:'POST', body: JSON.stringify({project: CURRENT.name})});
@@ -955,15 +1025,25 @@ async function follow(jobId, onDone) {
     const es = new EventSource('/api/stream/' + jobId);
     es.addEventListener('log', e => {
       const msg = JSON.parse(e.data);
+      if (msg.startsWith('\r')) {
+        // 進度行：更新頂部細條
+        const m = msg.match(/(\d+(?:\.\d+)?)%/);
+        const bar = $('#progressbar'), fill = $('#progressfill');
+        bar.classList.add('on');
+        if (m) fill.style.width = Math.min(100, Number(m[1])) + '%';
+      }
       consoleLine(msg);
     });
     es.addEventListener('done', e => {
       es.close(); consoleLine('✔ 完成');
+      $('#progressfill').style.width = '100%';
+      setTimeout(() => { $('#progressbar').classList.remove('on'); $('#progressfill').style.width = '0%'; }, 900);
       const data = JSON.parse(e.data);
       resolve(data);
     });
     es.addEventListener('error', e => {
       es.close();
+      $('#progressbar').classList.remove('on');
       let msg = '發生錯誤';
       try { msg = JSON.parse(e.data); } catch (_) {}
       consoleLine('✗ ' + msg, true);
@@ -1008,21 +1088,30 @@ async function grabClips() {
   if (BUSY || !CURRENT) return;
   if (!SELECTED.size) { toast('先勾選要的影片'); return; }
   const starts = $('#starts').value.split(/[,，]/).map(s => s.trim()).filter(Boolean)
-    .map(s => {
-      if (s.includes(':')) { const p = s.split(':').map(Number); return p.length === 3 ? p[0]*3600+p[1]*60+p[2] : p[0]*60+p[1]; }
-      return Number(s);
-    }).filter(n => !isNaN(n));
+    .map(tsToSec).filter(n => !isNaN(n));
+  const mode = $('#mode').value;
+  const rangeSpec = $('#ranges').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+  const ranges = rangeSpec.map(spec => {
+    const m = spec.split(/[-~]/);
+    return m.length === 2 ? [tsToSec(m[0]), tsToSec(m[1])] : null;
+  }).filter(Boolean);
+  if (mode === 'range' && !ranges.length) { toast('請填區段，例如 1:00-2:30'); return; }
+
   const body = {
     project: CURRENT.name,
     indexes: [...SELECTED],
-    per: Number($('#per').value) || 8,
-    starts,
+    per: Number($('#per').value) || 15,
+    starts: mode === 'auto' ? starts : [],
+    ranges: mode === 'range' ? ranges : [],
+    full: mode === 'full',
     height: Number($('#height').value) || 1080,
     frames: $('#frames').checked,
     audio: $('#audio').checked,
   };
   busy(true, '下載中');
-  consoleLine(`▶ 切 ${body.indexes.length} 支，每段 ${body.per} 秒`);
+  consoleLine(mode === 'full'
+    ? `▶ 整支下載 ${body.indexes.length} 支（${body.height}p）`
+    : `▶ 下載 ${body.indexes.length} 支，${mode === 'range' ? ranges.length + ' 個區段' : '每段 ' + body.per + ' 秒'}`);
   try {
     const {job} = await api('/api/pick', {method:'POST', body: JSON.stringify(body)});
     const res = await follow(job);
@@ -1124,7 +1213,14 @@ $('#keywords').addEventListener('keydown', e => {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { const b = $('#lightbox'); b.classList.remove('show'); b.innerHTML = ''; }
 });
+async function showBuild() {
+  try {
+    const v = await api('/api/version');
+    $('#buildtag').textContent = 'build ' + v.build;
+  } catch (e) { /* 忽略 */ }
+}
 async function boot() {
+  showBuild();
   await loadProjects();
   try {
     const list = await api('/api/projects');

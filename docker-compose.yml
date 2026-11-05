@@ -1,0 +1,22 @@
+services:
+  vidgrab:
+    build:
+      context: .
+      args:
+        VIDGRAB_BUILD: ${VIDGRAB_BUILD:-dev}
+    image: vidgrab:latest
+    container_name: vidgrab
+    ports:
+      - "8310:8310"
+    volumes:
+      # 專案、下載的素材、B 站 cookie 都在這裡
+      - vidgrab-data:/data
+    environment:
+      VIDGRAB_HOST: 0.0.0.0
+      VIDGRAB_PORT: "8310"
+    restart: unless-stopped
+    # 下載大檔需要時間，健康檢查放寬一點
+    stop_grace_period: 30s
+
+volumes:
+  vidgrab-data:

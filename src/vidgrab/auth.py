@@ -29,10 +29,19 @@ COOKIE_FIELDS = ("SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid
 
 
 def home() -> Path:
+    """登入資料放哪。
+
+    優先吃 VIDGRAB_AUTH_DIR，這樣 Docker 只要掛一個 /data 就同時保住
+    專案與 cookie。沒設時才退回 VIDGRAB_HOME 的上一層。
+    """
     import os
 
-    root = Path(os.environ.get("VIDGRAB_HOME") or Path.cwd() / "projects").parent
-    path = root / "auth"
+    explicit = os.environ.get("VIDGRAB_AUTH_DIR")
+    if explicit:
+        path = Path(explicit).expanduser()
+    else:
+        root = Path(os.environ.get("VIDGRAB_HOME") or Path.cwd() / "projects").parent
+        path = root / "auth"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

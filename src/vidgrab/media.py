@@ -18,6 +18,103 @@ class MediaError(RuntimeError):
     pass
 
 
+MEDIA_EXTS = (".mp4", ".mkv", ".webm", ".flv", ".m4v", ".mov",
+              ".m4a", ".mp3", ".opus", ".flac", ".wav")
+
+# yt-dlp 的進度輸出格式：分行、好解析，比啃它的人類可讀進度條可靠
+PROGRESS_TEMPLATE = (
+    "download:VIDGRAB %(progress.downloaded_bytes)s %(progress.total_bytes_estimate)s "
+    "%(progress.speed)s %(progress.eta)s %(progress.fragment_index)s %(progress.fragment_count)s"
+)
+
+
+def _fmt_speed(value: float | None) -> str:
+    if not value or value <= 0:
+        return ""
+    if value >= 1024 * 1024:
+        return f"{value / 1024 / 1024:.1f}MB/s"
+    return f"{value / 1024:.0f}KB/s"
+
+
+def _fmt_eta(seconds: float | None) -> str:
+    if not seconds or seconds <= 0:
+        return ""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _parse_progress(line: str) -> dict[str, Any] | None:
+    """把 VIDGRAB 進度行變成 dict；不是進度行就回 None。"""
+    if not line.startswith("VIDGRAB "):
+        return None
+    parts = line.split()
+    if len(parts) < 7:
+        return None
+
+    def num(text: str) -> float | None:
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+
+    done, total, speed, eta = num(parts[1]), num(parts[2]), num(parts[3]), num(parts[4])
+    frag_i, frag_n = num(parts[5]), num(parts[6])
+    percent = (done / total * 100) if done and total else None
+    return {
+        "downloaded": done,
+        "total": total,
+        "percent": round(percent, 1) if percent is not None else None,
+        "speed": _fmt_speed(speed),
+        "eta": _fmt_eta(eta),
+        "fragment": (f"{int(frag_i)}/{int(frag_n)}" if frag_i is not None and frag_n else ""),
+    }
+
+
+def _run_stream(cmd: list[str], on_progress=None, timeout: float = 7200) -> tuple[int, str]:
+    """邊跑邊送進度；回傳 (returncode, 最後幾行錯誤)。"""
+    import threading
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, errors="replace",
+    )
+    tail: list[str] = []
+    state = {"last_emit": 0.0, "last_pct": -1.0}
+
+    def reader() -> None:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            if line.startswith("VIDGRAB ") or line.startswith("[download]") or "[Merger]" in line:
+                parsed = _parse_progress(line)
+                if parsed and on_progress:
+                    import time as _t
+
+                    now = _t.time()
+                    pct = parsed.get("percent")
+                    # 每 1% 或每 2 秒回報一次，避免洗畫面
+                    if pct is None or pct - state["last_pct"] >= 1 or now - state["last_emit"] >= 2:
+                        state["last_pct"] = pct if pct is not None else state["last_pct"]
+                        state["last_emit"] = now
+                        on_progress(parsed)
+            tail.append(line)
+            del tail[:-40]
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    try:
+        code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise MediaError(f"逾時（>{int(timeout)}s）")
+    thread.join(timeout=5)
+    return code, "\n".join(tail[-12:])
+
+
 def ytdlp_bin() -> str:
     env = os.environ.get("VIDGRAB_YTDLP")
     if env and Path(env).exists():
@@ -65,6 +162,13 @@ def _common_args(opts: GrabOptions) -> list[str]:
         "30",
         "--concurrent-fragments",
         "4",
+        # B 站的音訊 CDN 只認 Range 請求，直接 GET 會回 567；
+        # 這道設定強迫 yt-dlp 分段抓，是整支下載成功的關鍵
+        "--http-chunk-size",
+        "10M",
+        "--newline",
+        "--progress-template",
+        PROGRESS_TEMPLATE,
     ]
     if opts.cookies:
         args += ["--cookies", opts.cookies]
@@ -76,10 +180,14 @@ def _common_args(opts: GrabOptions) -> list[str]:
 def _format_selector(opts: GrabOptions) -> str:
     if opts.extra_format:
         return opts.extra_format
-    h = opts.height
-    if opts.audio_only:
-        return "ba/b"
-    return f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
+    return "ba/b" if opts.audio_only else "bv*+ba/b"
+
+
+def _sort_args(opts: GrabOptions) -> list[str]:
+    """用 -S 讓 yt-dlp 自己挑解析度：直式 1080x1920 和橫式 1920x1080 都對得上。"""
+    if opts.extra_format or opts.audio_only:
+        return []
+    return ["-S", f"res:{opts.height},fps"]
 
 
 def probe_video(url: str, opts: GrabOptions | None = None, timeout: float = 300) -> dict[str, Any]:
@@ -121,7 +229,9 @@ def probe_frames(item: Item, outdir: Path, n: int = 3, opts: GrabOptions | None 
                                        cookies_from_browser=opts.cookies_from_browser))
             + [
                 "-f",
-                "bv*[height<=480]/b[height<=480]/bv*/b",
+                "bv*+ba/b",
+                "-S",
+                "res:480,fps",
                 "--download-sections",
                 f"*{point:.1f}-{point + 1.2:.1f}",
                 "-o",
@@ -181,44 +291,87 @@ def grab_clip(
     outdir: Path,
     opts: GrabOptions | None = None,
     label: str = "",
-    timeout: float = 900,
+    timeout: float = 7200,
+    on_progress=None,
 ) -> dict[str, Any]:
-    """下載 start→end 這一段，回傳檔案資訊。"""
+    """下載 start→end 這一段。"""
     opts = opts or GrabOptions()
-    outdir.mkdir(parents=True, exist_ok=True)
-    stem = f"{item.platform}_{item.vid}_{fmt_ts(start).replace(':', '')}-{fmt_ts(end).replace(':', '')}"
-    if label:
-        stem += f"_{label}"
-    target = outdir / f"{stem}.{'m4a' if opts.audio_only else 'mp4'}"
-    if target.exists() and target.stat().st_size > 0:
-        info = ffprobe(target)
-        return {"path": str(target), "cached": True, **info}
-
     if end <= start:
         raise MediaError(f"片段長度必須大於 0（{start} → {end}）")
+    return grab_range(item, start, end, outdir, opts, label=label,
+                      timeout=timeout, on_progress=on_progress)
 
-    cmd = [ytdlp_bin()] + _common_args(opts) + [
-        "-f", _format_selector(opts),
-        "--download-sections", f"*{start:.2f}-{end:.2f}",
-    ]
+
+def grab_full(
+    item: Item,
+    outdir: Path,
+    opts: GrabOptions | None = None,
+    label: str = "",
+    timeout: float = 14400,
+    on_progress=None,
+) -> dict[str, Any]:
+    """整支影片下載（不切片）。"""
+    opts = opts or GrabOptions()
+    return grab_range(item, None, None, outdir, opts, label=label,
+                      timeout=timeout, on_progress=on_progress)
+
+
+def grab_range(
+    item: Item,
+    start: float | None,
+    end: float | None,
+    outdir: Path,
+    opts: GrabOptions | None = None,
+    label: str = "",
+    timeout: float = 7200,
+    on_progress=None,
+) -> dict[str, Any]:
+    """核心：start/end 都給 None = 整支，否則只抓那一段。"""
+    opts = opts or GrabOptions()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if start is None:
+        stem = f"{item.platform}_{item.vid}_full"
+    else:
+        stem = f"{item.platform}_{item.vid}_{fmt_ts(start).replace(':', '')}-{fmt_ts(end or 0).replace(':', '')}"
+    if label:
+        stem += f"_{label}"
+
+    # 已經抓過就直接回報
+    for ext in MEDIA_EXTS:
+        existing = outdir / f"{stem}{ext}"
+        if existing.exists() and existing.stat().st_size > 0:
+            return {"path": str(existing), "cached": True, **ffprobe(existing)}
+
+    cmd = [ytdlp_bin()] + _common_args(opts) + ["-f", _format_selector(opts)] + _sort_args(opts)
+    if start is not None:
+        cmd += ["--download-sections", f"*{float(start):.2f}-{float(end):.2f}"]
+        if not opts.audio_only:
+            cmd += ["--force-keyframes-at-cuts"]
     if not opts.audio_only:
-        cmd += ["--force-keyframes-at-cuts", "--merge-output-format", "mp4"]
+        cmd += ["--merge-output-format", "mp4"]
     else:
         cmd += ["-x", "--audio-format", opts.audio_format]
     cmd += ["-o", str(outdir / f"{stem}.%(ext)s"), item.url]
 
-    log(f"    ↓ {item.platform} {item.vid} {fmt_ts(start)}→{fmt_ts(end)}")
-    proc = _run(cmd, timeout=timeout)
+    if start is None:
+        log(f"    ↓ {item.platform} {item.vid} 整支")
+    else:
+        log(f"    ↓ {item.platform} {item.vid} {fmt_ts(start)}→{fmt_ts(end or 0)}")
+
+    code, tail = _run_stream(cmd, on_progress=on_progress, timeout=timeout)
     produced = sorted(
-        p for p in outdir.glob(f"{stem}.*")
-        if p.suffix.lower() in (".mp4", ".mkv", ".webm", ".m4a", ".mp3", ".opus", ".flac", ".wav")
+        p for p in outdir.glob(f"{stem}.*") if p.suffix.lower() in MEDIA_EXTS
     )
-    if proc.returncode != 0 or not produced:
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        raise MediaError(tail[-1] if tail else "yt-dlp 沒有產出檔案")
+    if code != 0 or not produced:
+        lines = [ln for ln in tail.splitlines() if ln.strip()]
+        raise MediaError(lines[-1] if lines else "yt-dlp 沒有產出檔案")
     final = produced[0]
-    sized = ffprobe(final)
-    return {"path": str(final), "cached": False, **sized}
+    # 合併音視訊時，yt-dlp 會留下暫存軌；這裡只留成品
+    for leftover in outdir.glob(f"{stem}.f*"):
+        if leftover != final:
+            leftover.unlink(missing_ok=True)
+    return {"path": str(final), "cached": False, **ffprobe(final)}
 
 
 def ffprobe(path: Path) -> dict[str, Any]:

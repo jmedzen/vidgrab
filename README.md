@@ -1,22 +1,46 @@
 # vidgrab · 關鍵字找素材
 
-打幾個關鍵字 → 看得到實際畫面 → **只下載你要的那幾秒**，連同授權資訊整理成一份清單。
+打幾個關鍵字 → 看得到實際畫面 → **整支下載或只切你要的那幾秒**，連同授權資訊整理成一份清單。
 
 給剪片用的：找 B 站／YouTube 上的長素材（街景、空景、寺廟、人物走動…），
-不必把兩小時的片整支抓下來，只切需要的片段，順手記下出處與授權狀態。
+要整支留檔就整支抓，只要幾秒就只切那幾秒，順手記下出處與授權狀態。
+
+三種下載方式：**整支**、**固定長度切片**、**自訂區段**（例如 1:00-2:30）。
 
 ---
 
 ## 快速開始
 
+### 用 Docker（推薦）
+
+```bash
+docker compose up -d          # 或 ./tools/docker-build.sh && docker run ...
+```
+
+開 <http://127.0.0.1:8310>。專案、下載的素材、B 站 cookie 都在 `vidgrab-data` 這個 volume 裡。
+
+```bash
+# 不用 compose 的話
+docker build -t vidgrab .
+docker run --rm -p 8310:8310 -v vidgrab-data:/data vidgrab
+```
+
+登入 B 站（容器內）：
+
+```bash
+docker exec -it vidgrab vidgrab login --no-open
+# QR 在容器內的 /data/auth/bilibili-qr.png，或直接用網頁上的「掃碼登入」
+```
+
+### 用本機 Python
+
 ```bash
 cd vidgrab
-
 ./vidgrab web          # 開網頁介面（推薦）
 ./vidgrab login        # 掃碼登入 B 站（高畫質／會員片需要）
 ```
 
-第一次執行會自己建 venv、裝 yt-dlp，約一分鐘。需要 `ffmpeg` 與 `uv`：
+第一次執行會自己建 venv、照 `pyproject.toml` 裝依賴，約一分鐘。需要 `ffmpeg` 與 `uv`：
 
 ```bash
 brew install ffmpeg uv
@@ -33,8 +57,17 @@ brew install ffmpeg uv
 勾選要的 → 設定每段秒數（預設 15 秒）→ 按「切片段」。
 切好的檔案在 `projects/<專案>/clips/`，直接拖進剪輯軟體。
 
+上方選單決定下載方式：
+
+| 模式 | 意思 |
+|---|---|
+| **切片（每段固定）** | 從自動挑的時間點（或你指定的 `90, 3:20`）切固定長度 |
+| **切片（自訂區段）** | 填 `1:00-2:30, 5:00-6:00`，只抓這幾段 |
+| **整支下載** | 整支影片原樣抓下來，不切 |
+
+其他開關：
+
 - **抓畫面**：不必下載整支，只抓那個時間點的 1 秒畫面（成本極低）
-- **指定秒數**：填 `90, 3:20, 1:05:30`，就從這些位置各切一段
 - **只要聲音**：勾起來就只留音軌（做環境音、白噪音）
 - **重新確認授權**：回頭再查一次平台上的授權欄位與影片是否還在
 
@@ -54,6 +87,12 @@ brew install ffmpeg uv
 
 # 指定時間點
 ./vidgrab pick demo-taipei --select 1,3-4 --at 2:00 --at 25:30 --per 20
+
+# 整支下載
+./vidgrab pick demo-taipei --select 2 --full
+
+# 自訂區段（可重複、可逗號分隔）
+./vidgrab pick demo-taipei --select 1 --range 1:00-2:30 --range 8:00-8:30
 
 # 只要聲音
 ./vidgrab pick demo-taipei --select 2 --audio --per 60
@@ -107,6 +146,19 @@ projects/<專案名>/
 
 ---
 
+## 版本與 build number
+
+```bash
+./vidgrab build          # vidgrab 0.2.0+2.8436bba
+./vidgrab build --json   # {"version": "0.2.0", "build": "2.8436bba", "full": "..."}
+```
+
+build number 的來源依序是：環境變數 `VIDGRAB_BUILD` → 打包時寫入的 `_build_info.py` → git commit 數與短 hash → `dev`。
+Docker 建置時會自動帶入，容器內執行 `vidgrab build` 就能知道跑的是哪一次建置。
+網頁左上角也會顯示。
+
+---
+
 ## 登入 B 站
 
 ```bash
@@ -137,4 +189,6 @@ cookie 存在 `auth/bilibili-cookies.txt`（已列在 `.gitignore`）。
 | B 站只抓到 360p | 沒登入。`./vidgrab login` |
 | YouTube 說要驗證機器人 | `./vidgrab pick ... --cookies-from-browser chrome` |
 | 抓畫面失敗 | 該片可能需要登入或有地區限制，先 `./vidgrab login` |
+| 整支下載卡住／567 錯誤 | 已內建 `--http-chunk-size` 繞過 B 站音訊 CDN 的限制；若仍失敗，先確認 `./vidgrab login` 有效 |
+| 容器裡抓不到 1080p | 容器內也要登入：網頁按「掃碼登入」，或 `docker exec -it vidgrab vidgrab login` |
 | 想換 port | `./vidgrab web --port 8080` |

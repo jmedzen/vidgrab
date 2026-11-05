@@ -1,12 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "vidgrab"
-version = "0.1.0"
-description = "關鍵字找素材：搜 B 站／YouTube，只切你要的幾秒，連同授權資訊整理成清單"
+version = "0.2.0"
+description = "關鍵字找素材：搜 B 站／YouTube，整支或切片下載，連同授權資訊整理成清單"
+readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["yt-dlp>=2024.1.1"]
+license = { text = "MIT" }
+keywords = ["video", "b-roll", "yt-dlp", "bilibili", "youtube", "stock-footage"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Video",
+]
+
+# 執行期依賴：這裡就是唯一真相，啟動器與 Docker 都靠它
+dependencies = [
+    "yt-dlp>=2024.10.1",
+    "requests>=2.28",
+    "qrcode[pil]>=7.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "ruff>=0.6"]
 
 [project.scripts]
 vidgrab = "vidgrab.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/jmedzen/vidgrab"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"

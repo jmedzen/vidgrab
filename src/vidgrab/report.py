@@ -76,8 +76,7 @@ def write_csv(path: Path, items: list[Item], root: Path) -> None:
         )
         for idx, item in enumerate(items, 1):
             files = "; ".join(
-                _rel(Path(c["path"]), root) + f" [{fmt_ts(c.get('start', 0))}-{fmt_ts(c.get('end', 0))}]"
-                for c in item.clips
+                _rel(Path(c["path"]), root) + f" [{span_label(c)}]" for c in item.clips
             )
             writer.writerow(
                 [
@@ -99,6 +98,14 @@ def write_csv(path: Path, items: list[Item], root: Path) -> None:
 
 
 # ---------------------------------------------------------------- HTML
+
+
+def span_label(clip: dict[str, Any]) -> str:
+    """整支下載沒有起訖時間，顯示成「整支」。"""
+    start, end = clip.get("start"), clip.get("end")
+    if start is None or end is None:
+        return "整支"
+    return f"{fmt_ts(start)}–{fmt_ts(end)}"
 
 
 def _rel(path: Path, root: Path) -> str:
@@ -201,9 +208,10 @@ def _card(item: Item, idx: int, root: Path) -> str:
             rel = _rel(Path(clip["path"]), root)
             size = human_size(clip.get("size_bytes") or 0)
             dims = f"{clip.get('width')}×{clip.get('height')}" if clip.get("width") else ""
+            span = span_label(clip)
             rows.append(
                 f"<a href='{html.escape(rel)}'>{html.escape(clip.get('label') or Path(rel).name)}</a>"
-                f" <code>{fmt_ts(clip.get('start', 0))}–{fmt_ts(clip.get('end', 0))}</code>"
+                f" <code>{html.escape(span)}</code>"
                 f" <span class='empty'>{dims} · {size}</span>"
             )
         clips = "<div class='clips'>已下載：" + "<br>".join(rows) + "</div>"

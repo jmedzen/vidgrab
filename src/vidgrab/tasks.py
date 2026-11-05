@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import media, report
+from .version import full_version
 from .models import (
     Item,
     fmt_duration,
@@ -136,7 +137,7 @@ def run_search(
         "order": order,
         "per_keyword": per_keyword,
         "created": now_iso(),
-        "tool": "vidgrab 0.1.0",
+        "tool": f"vidgrab {full_version()}",
         "filters": {
             "fresh_days": fresh_days,
             "min_duration": min_duration,
@@ -176,6 +177,8 @@ def run_pick(
     *,
     per: float = 15.0,
     starts: list[float] | None = None,
+    ranges: list[tuple[float, float]] | None = None,
+    full: bool = False,
     frames: bool = False,
     frame_count: int = 3,
     height: int = 1080,
@@ -240,43 +243,82 @@ def run_pick(
                 item.duration = info.get("duration") or item.duration
             except Exception as exc:  # noqa: BLE001
                 item.error = f"取不到影片資訊：{exc}"
-        points = starts or [_auto_point(item, per)]
-        for start in points:
-            if item.duration and start + per > item.duration + 1:
+        # 要下載哪幾段：(start, end)；None = 整支
+        jobs: list[tuple[float | None, float | None]] = []
+        if full:
+            jobs.append((None, None))
+        if ranges:
+            jobs.extend(ranges)
+        if not full and not ranges:
+            for start in (starts or [_auto_point(item, per)]):
+                jobs.append((start, start + per))
+
+        for start, end in jobs:
+            if start is not None and item.duration and end and end > item.duration + 1:
                 emit(f"     ↷ 跳過 {fmt_ts(start)}：超過影片長度")
                 continue
+
+            def progress(info: dict[str, Any], _s=start) -> None:
+                bits = []
+                if info.get("percent") is not None:
+                    bits.append(f"{info['percent']:.0f}%")
+                if info.get("fragment"):
+                    bits.append(f"分段 {info['fragment']}")
+                if info.get("speed"):
+                    bits.append(info["speed"])
+                if info.get("eta"):
+                    bits.append(f"剩 {info['eta']}")
+                _emit_over(emit, "       " + " · ".join(bits) if bits else "       下載中…")
+
             try:
-                info = media.grab_clip(
-                    item, start, start + per, clips_dir, opts,
-                    label=slugify(item.author or "", 12),
-                )
+                if start is None:
+                    info = media.grab_full(
+                        item, clips_dir, opts, label=slugify(item.author or "", 12),
+                        on_progress=progress,
+                    )
+                else:
+                    info = media.grab_clip(
+                        item, start, end, clips_dir, opts,
+                        label=slugify(item.author or "", 12), on_progress=progress,
+                    )
             except media.MediaError as exc:
                 item.error = str(exc)
                 emit(f"     ✗ {exc}")
                 continue
+
             item.clips = [
                 c for c in item.clips
-                if not (c.get("start") == start and c.get("end") == start + per)
+                if not (c.get("start") == start and c.get("end") == end)
             ]
             item.clips.append(
                 {
                     "path": info["path"],
                     "start": start,
-                    "end": start + per,
+                    "end": end,
                     "label": Path(info["path"]).name,
                     "size_bytes": info.get("size_bytes", 0),
                     "width": info.get("width"),
                     "height": info.get("height"),
+                    "full": start is None,
                 }
             )
             dims = f"{info.get('width')}×{info.get('height')}" if info.get("width") else ""
-            emit(f"     ✓ {Path(info['path']).name} {dims} {human_size(info.get('size_bytes', 0))}")
+            what = "整支" if start is None else f"{fmt_ts(start)}–{fmt_ts(end or 0)}"
+            emit(f"     ✓ {what} → {Path(info['path']).name} {dims} {human_size(info.get('size_bytes', 0))}")
             grabbed += 1
             save_project(project, manifest, items)
 
     save_project(project, manifest, items)
     emit(f"✔ 完成：{grabbed} 段 → {clips_dir}")
     return {"project": project, "grabbed": grabbed, "items": items}
+
+
+def _emit_over(emit, text: str) -> None:
+    """進度用「覆寫同一行」的方式送出，避免日誌被幾百行洗掉。"""
+    try:
+        emit("\r" + text)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _auto_point(item: Item, per: float) -> float:
