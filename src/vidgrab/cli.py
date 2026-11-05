@@ -133,22 +133,53 @@ def parse_selector(text: str, total: int) -> list[int]:
 # ---------------------------------------------------------------- 指令
 
 
+SEARCH_KEYS = (
+    "platform", "per_keyword", "order", "duration", "min_duration", "max_duration",
+    "fresh_days", "min_views", "only_free", "drop_reposts", "verify_license", "sort",
+)
+
+
+def effective(args: argparse.Namespace, keys: tuple[str, ...]) -> dict:
+    """使用者有給就用給的，沒給就吃設定檔；另外把明確給的記下來給 --save 用。"""
+    from . import config
+
+    saved = config.load()
+    values = {}
+    for key in keys:
+        attr = key.replace("-", "_")
+        given = getattr(args, attr, None)
+        values[key] = saved.get(key) if given is None else given
+    return values
+
+
 def cmd_search(args: argparse.Namespace) -> int:
+    from . import config
+
+    values = effective(args, SEARCH_KEYS)
+    exclude = args.exclude if args.exclude else config.load().get("exclude")
+
+    if args.save:
+        patch = {k: v for k, v in values.items() if getattr(args, k, None) is not None}
+        if args.exclude:
+            patch["exclude"] = args.exclude
+        config.save_patch(patch)
+        print(f"✔ 已存成預設：{', '.join(sorted(patch))}（{config.config_path()}）")
+
     result = tasks.run_search(
         args.keywords,
-        platform=args.platform,
-        per_keyword=args.per_keyword,
-        order=args.order,
-        duration=args.duration,
-        exclude=args.exclude,
-        fresh_days=args.fresh_days,
-        min_duration=args.min_duration,
-        max_duration=args.max_duration,
-        min_views=args.min_views,
-        only_free=args.only_free,
-        drop_reposts=args.drop_reposts,
-        verify_license=args.verify_license,
-        sort=args.sort,
+        platform=values["platform"],
+        per_keyword=values["per_keyword"],
+        order=values["order"],
+        duration=values["duration"],
+        exclude=exclude,
+        fresh_days=values["fresh_days"],
+        min_duration=values["min_duration"],
+        max_duration=values["max_duration"],
+        min_views=values["min_views"],
+        only_free=values["only_free"],
+        drop_reposts=values["drop_reposts"],
+        verify_license=values["verify_license"],
+        sort=values["sort"],
         name=args.name,
         out=args.out,
     )
@@ -199,20 +230,27 @@ def cmd_pick(args: argparse.Namespace) -> int:
     if not idxs:
         raise SystemExit("選到的編號都是空的。")
 
+    from . import config
     from .models import parse_ts
+
+    values = effective(args, ("per", "height", "audio", "audio_format", "frames", "frame_count"))
+    if args.save:
+        patch = {k: v for k, v in values.items() if getattr(args, k, None) is not None}
+        config.save_patch(patch)
+        print(f"✔ 已存成預設：{', '.join(sorted(patch))}（{config.config_path()}）")
 
     result = tasks.run_pick(
         project,
         idxs,
-        per=float(args.per),
+        per=float(values["per"]),
         starts=[parse_ts(a) for a in (args.at or [])],
         ranges=_parse_ranges(args.range or []),
         full=bool(args.full),
-        frames=args.frames,
-        frame_count=args.frame_count,
-        height=args.height,
-        audio=args.audio,
-        audio_format=args.audio_format,
+        frames=values["frames"],
+        frame_count=int(values["frame_count"]),
+        height=int(values["height"]),
+        audio=values["audio"],
+        audio_format=values["audio_format"],
         cookies=args.cookies,
         cookies_from_browser=args.cookies_from_browser,
         fmt=args.format,
@@ -280,6 +318,45 @@ def cmd_open(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     webbrowser.open(f"file://{project / 'index.html'}")
     print(project / "index.html")
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    from . import config
+
+    if args.reset:
+        values = config.reset(args.reset if args.reset is not True else None)
+        print(f"✔ 已還原預設（{config.config_path()}）")
+        print(json.dumps(values, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.set:
+        patch = {}
+        for item in args.set:
+            if "=" not in item:
+                raise SystemExit(f"要寫成 key=value，收到：{item}")
+            key, _, value = item.partition("=")
+            patch[key.strip()] = value.strip()
+        try:
+            values = config.save_patch(patch)
+        except config.ConfigError as exc:
+            raise SystemExit(f"✗ {exc}") from exc
+        print(f"✔ 已更新：{', '.join(sorted(patch))}")
+        if args.json:
+            print(json.dumps(values, ensure_ascii=False, indent=2))
+        return 0
+
+    info = config.describe()
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0
+    print(f"設定檔：{info['path']}")
+    print()
+    for key in sorted(info["values"]):
+        value = info["values"][key]
+        default = info["defaults"][key]
+        mark = "" if value == default else "  (已改)"
+        print(f"  {pad(key, 16)}{value!r}{mark}")
     return 0
 
 
@@ -374,8 +451,11 @@ def cmd_web(args: argparse.Namespace) -> int:
 
     import os
 
-    host = args.host or os.environ.get("VIDGRAB_HOST") or "127.0.0.1"
-    port = args.port or int(os.environ.get("VIDGRAB_PORT") or 8310)
+    from . import config
+
+    saved = config.load()
+    host = args.host or os.environ.get("VIDGRAB_HOST") or saved.get("host") or "127.0.0.1"
+    port = args.port or int(os.environ.get("VIDGRAB_PORT") or saved.get("port") or 8310)
     serve(host=host, port=port, open_browser=not args.no_open)
     return 0
 
@@ -403,21 +483,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("search", help="用關鍵字搜一輪，建立素材專案")
     s.add_argument("keywords", nargs="+", help="一個或多個關鍵字（多個 = 分開搜再合併）")
-    s.add_argument("--platform", default="both", choices=["both", "bilibili", "youtube"])
-    s.add_argument("--per-keyword", type=int, default=12, help="每個關鍵字抓幾支（預設 12）")
-    s.add_argument("--order", default="smart", choices=["smart", "relevance", "views", "new"])
-    s.add_argument("--duration", default="any",
-                   choices=["any", "short", "medium", "long", "verylong"],
+    s.add_argument("--platform", choices=["both", "bilibili", "youtube"],
+                   help="預設讀設定（出廠 both）")
+    s.add_argument("--per-keyword", type=int, help="每個關鍵字抓幾支（出廠 12）")
+    s.add_argument("--order", choices=["smart", "relevance", "views", "new"])
+    s.add_argument("--duration", choices=["any", "short", "medium", "long", "verylong"],
                    help="平台端時長：short<10分、medium 10-30分、long 30-60分、verylong>60分")
     s.add_argument("--exclude", action="append", help="標題含這些詞就跳過（可重複）")
-    s.add_argument("--fresh-days", type=int, default=0, help="只看最近 N 天發布")
-    s.add_argument("--min-duration", type=float, default=10, help="最短幾分鐘（預設 10）")
-    s.add_argument("--max-duration", type=float, default=0, help="最長幾分鐘（0 = 不限）")
-    s.add_argument("--min-views", type=int, default=0, help="至少幾個觀看")
-    s.add_argument("--only-free", action="store_true", help="只留授權明確的")
-    s.add_argument("--drop-reposts", action="store_true", help="丟掉轉載／非原始出處")
-    s.add_argument("--verify-license", action="store_true", help="逐支抓詳情確認授權（慢，但準）")
-    s.add_argument("--sort", default="smart", choices=["smart", "license", "views", "new"])
+    s.add_argument("--fresh-days", type=int, help="只看最近 N 天發布")
+    s.add_argument("--min-duration", type=float, help="最短幾分鐘（出廠 10）")
+    s.add_argument("--max-duration", type=float, help="最長幾分鐘（0 = 不限）")
+    s.add_argument("--min-views", type=int, help="至少幾個觀看")
+    s.add_argument("--only-free", action="store_true", default=None, help="只留授權明確的")
+    s.add_argument("--drop-reposts", action="store_true", default=None, help="丟掉轉載／非原始出處")
+    s.add_argument("--verify-license", action="store_true", default=None, help="逐支抓詳情確認授權（慢，但準）")
+    s.add_argument("--sort", choices=["smart", "license", "views", "new"])
+    s.add_argument("--save", action="store_true",
+                   help="把這次的參數存成預設值，之後不用再打")
     s.add_argument("--name", help="專案名稱（預設 日期-關鍵字）")
     s.add_argument("--out", help="專案放哪個資料夾（預設 ./projects）")
     s.add_argument("--json", action="store_true", help="輸出 JSON（給程式用）")
@@ -428,21 +510,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--select", help="編號，如 1,3,5-7")
     p.add_argument("--top", type=int, help="自動取排序前 N 支")
     p.add_argument("--at", action="append", help="從第幾秒開始切（可重複）；省略 = 自動挑一段")
-    p.add_argument("--per", default="15", help="每段幾秒（預設 15）")
+    p.add_argument("--per", help="每段幾秒（出廠 15）")
     p.add_argument("--full", action="store_true", help="下載整支影片（不切片）")
     p.add_argument("--range", action="append", metavar="開始-結束",
                    help="自訂區段，如 1:00-2:30；可重複、也可逗號分隔多段")
-    p.add_argument("--height", type=int, default=1080, help="最高解析度（預設 1080）")
-    p.add_argument("--audio", action="store_true", help="只要聲音")
-    p.add_argument("--audio-format", default="m4a", help="m4a/mp3/wav/opus")
+    p.add_argument("--height", type=int, help="最高解析度（出廠 1080）")
+    p.add_argument("--audio", action="store_true", default=None, help="只要聲音")
+    p.add_argument("--audio-format", help="m4a/mp3/wav/opus（出廠 m4a）")
     p.add_argument("--format", help="自訂 yt-dlp 格式字串")
-    p.add_argument("--frames", action="store_true", help="順便抓幾格畫面（不必下載整支）")
-    p.add_argument("--frame-count", type=int, default=3, help="抓幾格（預設 3）")
+    p.add_argument("--frames", action="store_true", default=None, help="順便抓幾格畫面")
+    p.add_argument("--frame-count", type=int, help="抓幾格（出廠 3）")
     p.add_argument("--frame-only", action="store_true", help="只抓畫面，不切片段")
     p.add_argument("--cookies", help="cookies.txt 路徑（B 站高畫質／會員片需要）")
     p.add_argument("--cookies-from-browser", help="例如 chrome / safari / firefox")
     p.add_argument("--dry-run", action="store_true", help="只印出會做什麼，不下載")
     p.add_argument("--open", action="store_true", help="做完自動開清單")
+    p.add_argument("--save", action="store_true", help="把這次的參數（per/height/audio…）存成預設值")
     p.set_defaults(func=cmd_pick)
 
     r = sub.add_parser("refresh", help="回頭確認授權與影片還在不在")
@@ -459,6 +542,14 @@ def build_parser() -> argparse.ArgumentParser:
     o = sub.add_parser("open", help="用瀏覽器打開清單")
     o.add_argument("project", nargs="?")
     o.set_defaults(func=cmd_open)
+
+    cfg = sub.add_parser("config", help="看／改預設設定（存過就一直是預設）")
+    cfg.add_argument("--set", action="append", metavar="KEY=VALUE",
+                     help="改設定，可重複，如 --set per=30 --set height=720")
+    cfg.add_argument("--reset", nargs="*", metavar="KEY",
+                     help="還原預設（不給 key = 全部還原）")
+    cfg.add_argument("--json", action="store_true")
+    cfg.set_defaults(func=cmd_config)
 
     tst = sub.add_parser("test", help="跑煙霧測試")
     tst.set_defaults(func=cmd_test)

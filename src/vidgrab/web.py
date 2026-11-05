@@ -189,6 +189,224 @@ def projects_payload() -> list[dict[str, Any]]:
     return out
 
 
+
+
+def resolve_pick_options(body: dict, saved: dict) -> dict[str, Any]:
+    """把 API 請求與設定檔合成 run_pick 的參數。
+
+    刻意抽成獨立函式：body 沒給的欄位一律回退到設定值，
+    這樣「設定一次就變預設」才有單一正確來源，也才測得動。
+    """
+    from . import config as cfg
+
+    def pick(key: str) -> Any:
+        return body.get(key) if body.get(key) is not None else saved.get(key, cfg.DEFAULTS[key])
+
+    return {
+        "per": float(pick("per")),
+        "starts": [float(s) for s in (body.get("starts") or [])],
+        "ranges": [tuple(float(x) for x in pair) for pair in (body.get("ranges") or [])],
+        "full": bool(body.get("full")),
+        "frames": bool(pick("frames")),
+        "frame_count": int(pick("frame_count")),
+        "height": int(pick("height")),
+        "audio": bool(pick("audio")),
+        "audio_format": str(pick("audio_format")),
+        "frame_only": bool(body.get("frame_only")),
+        "cookies_from_browser": body.get("cookies_from_browser") or None,
+    }
+
+
+# ---------------------------------------------------------------- OpenAPI
+
+OPENAPI: dict[str, Any] = {
+    "openapi": "3.0.3",
+    "info": {
+        "title": "vidgrab API",
+        "version": __version__,
+        "description": (
+            "關鍵字找素材：搜 B 站／YouTube，整支或切片下載。\n\n"
+            "長時間的工作（搜尋、下載）是非同步的：先 POST 取得 job id，"
+            "再 GET /api/job/{id} 輪詢，或訂閱 /api/stream/{id} 的 SSE 即時進度。"
+        ),
+    },
+    "servers": [{"url": "http://127.0.0.1:8310"}],
+    "tags": [
+        {"name": "meta", "description": "版本與設定"},
+        {"name": "search", "description": "搜尋"},
+        {"name": "download", "description": "下載與切片"},
+        {"name": "project", "description": "素材專案"},
+        {"name": "auth", "description": "B 站登入"},
+        {"name": "job", "description": "非同步工作"},
+    ],
+    "paths": {
+        "/api/version": {
+            "get": {"tags": ["meta"], "summary": "版本與 build number",
+                    "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/openapi.json": {
+            "get": {"tags": ["meta"], "summary": "這份 OpenAPI 規格",
+                    "responses": {"200": {"description": "OpenAPI 3.0"}}},
+        },
+        "/file/{project}/{path}": {
+            "get": {
+                "tags": ["project"], "summary": "取回片段檔或縮圖（支援 HTTP Range）",
+                "parameters": [
+                    {"name": "project", "in": "path", "required": True,
+                     "schema": {"type": "string"}},
+                    {"name": "path", "in": "path", "required": True,
+                     "schema": {"type": "string"}, "description": "例如 clips/xxx.mp4"},
+                ],
+                "responses": {"200": {"description": "檔案內容"},
+                              "404": {"description": "找不到"}},
+            },
+        },
+        "/api/config": {
+            "get": {"tags": ["meta"], "summary": "讀設定（含預設值）",
+                    "responses": {"200": {"description": "OK"}}},
+            "post": {
+                "tags": ["meta"], "summary": "改設定，存過就成為預設",
+                "requestBody": {
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "example": {"set": {"per": 30, "height": 720, "platform": "bilibili"}},
+                    }}}
+                },
+                "responses": {"200": {"description": "已更新"}, "400": {"description": "值不合法"}},
+            },
+        },
+        "/api/search": {
+            "post": {
+                "tags": ["search"], "summary": "搜尋並建立專案（非同步）",
+                "requestBody": {
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["keywords"],
+                        "properties": {
+                            "keywords": {"type": "array", "items": {"type": "string"},
+                                         "example": ["台北 街景", "北歐 空景"]},
+                            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube"]},
+                            "per_keyword": {"type": "integer"},
+                            "order": {"type": "string", "enum": ["smart", "relevance", "views", "new"]},
+                            "min_duration": {"type": "number", "description": "分鐘"},
+                            "max_duration": {"type": "number", "description": "分鐘，0=不限"},
+                            "fresh_days": {"type": "integer"},
+                            "min_views": {"type": "integer"},
+                            "exclude": {"type": "array", "items": {"type": "string"}},
+                            "only_free": {"type": "boolean"},
+                            "drop_reposts": {"type": "boolean"},
+                            "verify_license": {"type": "boolean"},
+                            "sort": {"type": "string", "enum": ["smart", "license", "views", "new"]},
+                            "name": {"type": "string"},
+                            "save_settings": {"type": "boolean",
+                                              "description": "把這次的參數存成預設"},
+                        },
+                    }}}
+                },
+                "responses": {"200": {"description": "回傳 {job: id}"}},
+            },
+        },
+        "/api/pick": {
+            "post": {
+                "tags": ["download"], "summary": "下載整支或切片（非同步）",
+                "requestBody": {
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["project", "indexes"],
+                        "properties": {
+                            "project": {"type": "string"},
+                            "indexes": {"type": "array", "items": {"type": "integer"},
+                                        "description": "0 起算的候選編號"},
+                            "full": {"type": "boolean", "description": "整支下載"},
+                            "per": {"type": "number", "description": "每段秒數"},
+                            "starts": {"type": "array", "items": {"type": "number"}},
+                            "ranges": {"type": "array", "items": {
+                                "type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}},
+                            "height": {"type": "integer"},
+                            "audio": {"type": "boolean"},
+                            "frames": {"type": "boolean"},
+                            "frame_only": {"type": "boolean"},
+                            "save_settings": {"type": "boolean"},
+                        },
+                    }}}
+                },
+                "responses": {"200": {"description": "回傳 {job: id}"}},
+            },
+        },
+        "/api/job/{id}": {
+            "get": {"tags": ["job"], "summary": "查工作狀態與完整訊息",
+                    "parameters": [{"name": "id", "in": "path", "required": True,
+                                    "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/stream/{id}": {
+            "get": {"tags": ["job"], "summary": "SSE 即時進度（log / done / error）",
+                    "parameters": [{"name": "id", "in": "path", "required": True,
+                                    "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "text/event-stream"}}},
+        },
+        "/api/projects": {
+            "get": {"tags": ["project"], "summary": "列出所有專案",
+                    "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/project/{name}": {
+            "get": {"tags": ["project"], "summary": "單一專案完整內容（含候選與已下載片段）",
+                    "parameters": [{"name": "name", "in": "path", "required": True,
+                                    "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/item/{name}/{index}": {
+            "get": {"tags": ["project"], "summary": "單一候選影片",
+                    "parameters": [
+                        {"name": "name", "in": "path", "required": True, "schema": {"type": "string"}},
+                        {"name": "index", "in": "path", "required": True, "schema": {"type": "integer"}},
+                    ],
+                    "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/project/delete": {
+            "post": {"tags": ["project"], "summary": "刪除整個專案（連同已下載檔案）",
+                     "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/delete-clip": {
+            "post": {"tags": ["project"], "summary": "刪除單一片段檔",
+                     "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/refresh": {
+            "post": {"tags": ["project"], "summary": "重新確認授權與影片是否還在（非同步）",
+                     "responses": {"200": {"description": "回傳 {job: id}"}}},
+        },
+        "/api/export": {
+            "get": {"tags": ["project"], "summary": "匯出全部設定與專案索引（備份用）",
+                    "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/login/start": {
+            "post": {"tags": ["auth"], "summary": "產生 B 站登入 QR",
+                     "responses": {"200": {"description": "回傳 {key, image}"}}},
+        },
+        "/api/login/qr": {
+            "get": {"tags": ["auth"], "summary": "QR 圖（PNG）",
+                    "responses": {"200": {"description": "image/png"}}},
+        },
+        "/api/login/poll": {
+            "post": {"tags": ["auth"], "summary": "查掃碼結果",
+                     "responses": {"200": {"description": "status: waiting/scanned/ok/expired"}}},
+        },
+        "/api/login/status": {
+            "get": {"tags": ["auth"], "summary": "目前登入的帳號",
+                    "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/login/logout": {
+            "post": {"tags": ["auth"], "summary": "登出並刪除 cookie",
+                     "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/open": {
+            "post": {"tags": ["project"], "summary": "用瀏覽器打開 HTML 清單",
+                     "responses": {"200": {"description": "OK"}}},
+        },
+    },
+}
+
+
 # ---------------------------------------------------------------- 頁面
 
 
@@ -273,6 +491,41 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, png.read_bytes(), "image/png")
             return
+        if route == "/api/config":
+            from . import config as cfg
+
+            self._json(cfg.describe())
+            return
+        if route == "/api/openapi.json":
+            self._send(200, json.dumps(OPENAPI, ensure_ascii=False, indent=2).encode())
+            return
+        if route == "/api/export":
+            from . import auth as _auth
+
+            self._json({
+                "version": __version__,
+                "config": __import__("vidgrab.config", fromlist=["load"]).load(),
+                "logged_in": _auth.logged_in(),
+                "projects": projects_payload(),
+            })
+            return
+        if route.startswith("/api/item/"):
+            parts = route[len("/api/item/"):].split("/", 1)
+            project = self._project_dir(parts[0])
+            if not project or len(parts) < 2:
+                self._json({"error": "找不到專案或編號"}, 404)
+                return
+            try:
+                idx = int(parts[1])
+            except ValueError:
+                self._json({"error": "編號要是整數"}, 400)
+                return
+            manifest, items = tasks.load_project(project)
+            if not (0 <= idx < len(items)):
+                self._json({"error": f"編號超出範圍（0–{len(items) - 1}）"}, 404)
+                return
+            self._json(item_payload(items[idx], idx, project))
+            return
         if route == "/api/version":
             from .version import build, full_version
 
@@ -295,27 +548,74 @@ class Handler(BaseHTTPRequestHandler):
         route = urllib.parse.urlparse(self.path).path
         body = self._body()
 
+        if route == "/api/config":
+            from . import config as cfg
+
+            try:
+                if body.get("reset") is not None:
+                    keys = body.get("reset") or None
+                    values = cfg.reset(keys if isinstance(keys, list) else None)
+                else:
+                    patch = body.get("set") or body
+                    values = cfg.save_patch({k: v for k, v in patch.items() if k in cfg.DEFAULTS})
+            except cfg.ConfigError as exc:
+                self._json({"error": str(exc)}, 400)
+                return
+            self._json({"ok": True, "values": values, "path": str(cfg.config_path())})
+            return
+
+        if route == "/api/login/logout":
+            from . import auth
+
+            auth.logout()
+            self._json({"ok": True})
+            return
+
+        if route == "/api/project/delete":
+            name = body.get("project", "")
+            project = self._project_dir(name)
+            if not project:
+                self._json({"error": "找不到專案"}, 404)
+                return
+            import shutil
+
+            shutil.rmtree(project)
+            self._json({"ok": True, "deleted": name})
+            return
+
         if route == "/api/search":
             queries = [q for q in (body.get("keywords") or []) if str(q).strip()]
             if not queries:
                 self._json({"error": "請至少輸入一個關鍵字"}, 400)
                 return
+            from . import config as cfg
+
+            saved = cfg.load()
+            def pick(key, cast=None):
+                if body.get(key) is not None:
+                    return body[key]
+                value = saved.get(key, cfg.DEFAULTS.get(key))
+                return cast(value) if cast and value is not None else value
+
             opts = {
-                "platform": body.get("platform", "both"),
-                "per_keyword": int(body.get("per_keyword") or 12),
-                "order": body.get("order", "smart"),
-                "duration": body.get("duration", "any"),
-                "exclude": body.get("exclude") or [],
-                "fresh_days": int(body.get("fresh_days") or 0),
-                "min_duration": float(body.get("min_duration") or 0),
-                "max_duration": float(body.get("max_duration") or 0),
-                "min_views": int(body.get("min_views") or 0),
-                "only_free": bool(body.get("only_free")),
-                "drop_reposts": bool(body.get("drop_reposts")),
-                "verify_license": bool(body.get("verify_license")),
-                "sort": body.get("sort", "smart"),
+                "platform": pick("platform"),
+                "per_keyword": int(pick("per_keyword")),
+                "order": pick("order"),
+                "duration": pick("duration"),
+                "exclude": body.get("exclude") or saved.get("exclude") or [],
+                "fresh_days": int(pick("fresh_days")),
+                "min_duration": float(pick("min_duration")),
+                "max_duration": float(pick("max_duration")),
+                "min_views": int(pick("min_views")),
+                "only_free": bool(pick("only_free")),
+                "drop_reposts": bool(pick("drop_reposts")),
+                "verify_license": bool(pick("verify_license")),
+                "sort": pick("sort"),
                 "name": body.get("name") or None,
             }
+            if body.get("save_settings"):
+                patch = {k: opts[k] for k in opts if k in cfg.DEFAULTS}
+                cfg.save_patch(patch)
 
             def work(emit):
                 res = tasks.run_search(queries, emit=emit, **opts)
@@ -333,22 +633,18 @@ class Handler(BaseHTTPRequestHandler):
             indexes = [int(i) for i in (body.get("indexes") or [])]
             if not indexes:
                 self._json({"error": "請先勾選影片"}, 400)
-            per = float(body.get("per") or 15)
-            starts = [float(s) for s in (body.get("starts") or [])]
-            ranges = [tuple(float(x) for x in pair) for pair in (body.get("ranges") or [])]
-            full = bool(body.get("full"))
-            opts = {
-                "per": per,
-                "starts": starts,
-                "ranges": ranges,
-                "full": full,
-                "frames": bool(body.get("frames")),
-                "frame_count": int(body.get("frame_count") or 3),
-                "height": int(body.get("height") or 1080),
-                "audio": bool(body.get("audio")),
-                "frame_only": bool(body.get("frame_only")),
-                "cookies_from_browser": body.get("cookies_from_browser") or None,
-            }
+            from . import config as cfg
+
+            opts = resolve_pick_options(body, cfg.load())
+            if body.get("save_settings"):
+                cfg.save_patch({
+                    "per": opts["per"],
+                    "height": opts["height"],
+                    "audio": opts["audio"],
+                    "frames": opts["frames"],
+                    "frame_count": opts["frame_count"],
+                    "audio_format": opts["audio_format"],
+                })
 
             def work(emit):
                 res = tasks.run_pick(project, indexes, emit=emit, **opts)
@@ -978,6 +1274,10 @@ function render() {
       <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;color:var(--muted)">
         <input type="checkbox" id="audio"> 只要聲音
       </label>
+      <label style="display:flex;gap:5px;align-items:center;font-size:12.5px;color:var(--muted)"
+             title="勾起來：這次用的下載參數會存成預設值">
+        <input type="checkbox" id="savesettings"> 記住這些設定
+      </label>
       <button class="primary" id="grab" style="width:auto;padding:8px 18px">切片段</button>
       <button class="ghost tiny" id="refresh">重新確認授權</button>
       <button class="ghost tiny" id="openlist">開 HTML 清單</button>
@@ -1107,6 +1407,7 @@ async function grabClips() {
     height: Number($('#height').value) || 1080,
     frames: $('#frames').checked,
     audio: $('#audio').checked,
+    save_settings: $('#savesettings') && $('#savesettings').checked,
   };
   busy(true, '下載中');
   consoleLine(mode === 'full'
