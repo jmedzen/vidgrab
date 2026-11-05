@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d12'/%3E%3Cpath d='M9 8h4l3 9 3-9h4l-5.5 16h-3z' fill='%236cc0ff'/%3E%3C/svg%3E">
+<title>vidgrab · 素材獵人</title>
+<script>
+// 在第一次繪製之前就決定主題與側欄寬度，否則淺色主題會先閃一下深色
+(function () {
+  try {
+    var t = localStorage.getItem('vidgrab.theme');
+    if (!t && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) t = 'paper';
+    document.documentElement.dataset.theme = t || 'midnight';
+    var w = Number(localStorage.getItem('vidgrab.sidebar'));
+    if (w >= 240 && w <= 620 && window.innerWidth > 820) {
+      document.documentElement.style.setProperty('--sidebar', w + 'px');
+    }
+  } catch (e) {}
+})();
+</script>
+<link rel="stylesheet" href="/static/app.css">
+
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brandrow">
+      <div>
+        <h1>vid<span>grab</span></h1>
+        <div class="tagline">打關鍵字 → 挑片 → 只切你要的那幾秒</div>
+      </div>
+      <div class="theme-picker">
+        <button class="theme-btn" id="themebtn" title="切換主題" aria-haspopup="true" aria-expanded="false">
+          <span id="themeicon">◐</span>
+        </button>
+        <div class="theme-menu" id="thememenu" role="menu"></div>
+      </div>
+    </div>
+    <div class="buildtag" id="buildtag"></div>
+
+    <label class="field">
+      <span>關鍵字（一行一個，或用逗號分隔）</span>
+      <textarea id="keywords" placeholder="台北 街景&#10;北歐 空景&#10;寺廟 特寫"></textarea>
+    </label>
+
+    <div class="row">
+      <label class="field">
+        <span>平台</span>
+        <select id="platform">
+          <option value="both">B 站 + YouTube</option>
+          <option value="bilibili">只要 B 站</option>
+          <option value="youtube">只要 YouTube</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>排序</span>
+        <select id="sort">
+          <option value="smart">智慧（授權＋熱度）</option>
+          <option value="views">觀看最多</option>
+          <option value="new">最新</option>
+          <option value="license">授權優先</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="row">
+      <label class="field">
+        <span>每字幾支</span>
+        <input type="number" id="per_keyword" value="12" min="1" max="50">
+      </label>
+      <label class="field">
+        <span>最短（分鐘）</span>
+        <input type="number" id="min_duration" value="10" min="0" step="1">
+      </label>
+      <label class="field">
+        <span>最長（0=不限）</span>
+        <input type="number" id="max_duration" value="0" min="0" step="1">
+      </label>
+    </div>
+
+    <div class="row">
+      <label class="field">
+        <span>最近 N 天（0=不限）</span>
+        <input type="number" id="fresh_days" value="0" min="0">
+      </label>
+      <label class="field">
+        <span>最少觀看</span>
+        <input type="number" id="min_views" value="0" min="0" step="100">
+      </label>
+    </div>
+
+    <label class="field">
+      <span>排除詞（逗號分隔，標題含這些就跳過）</span>
+      <input type="text" id="exclude" placeholder="ex. 合集,直播回放">
+    </label>
+
+    <div class="checks">
+      <label><input type="checkbox" id="only_free"> 只留授權明確的</label>
+      <label><input type="checkbox" id="drop_reposts"> 丟掉轉載／非原始出處</label>
+      <label><input type="checkbox" id="verify_license"> 逐支確認授權（慢，較準）</label>
+    </div>
+
+    <div id="authbox" class="authbox">
+      <span id="authwho">檢查 B 站登入…</span>
+      <button class="tiny ghost" id="loginbtn" style="white-space:nowrap;flex:none">掃碼登入</button>
+    </div>
+
+    <button class="primary" id="go">搜尋素材</button>
+    <div class="hint" style="margin-top:8px">長度預設 10 分鐘以上，適合找可反覆取用的長素材。</div>
+
+    <div class="proj-list">
+      <h3>我的素材專案
+        <button class="mini" id="openlib" title="展開素材庫">⤢ 展開</button>
+      </h3>
+      <div id="projects"></div>
+    </div>
+    <div class="resizer" id="resizer" role="separator" aria-orientation="vertical"
+         tabindex="0" title="拖曳調整寬度（雙擊還原）"></div>
+  </aside>
+
+  <main>
+    <div class="player" id="player" style="display:none">
+      <div class="ptitle"><b id="playername">—</b><span id="playermeta"></span></div>
+      <div class="stage"><video id="videoplayer" controls preload="metadata" playsinline></video></div>
+      <div class="prow">
+        <button class="mini" id="playerclose">關閉</button>
+        <a class="mini" id="playerdownload" href="#" download>下載這個檔案</a>
+        <span id="playerframes" class="frames"></span>
+      </div>
+    </div>
+    <div id="view">
+      <div class="empty">
+        <div class="big">🎬</div>
+        先在左邊打關鍵字，按「搜尋素材」。<br>
+        搜完可以勾選想要的，只下載你要的那幾秒。
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="progressbar"><div id="progressfill"></div></div>
+
+<div id="dlcard">
+  <div class="row1">
+    <span class="badge" id="dlbadge">下載中</span>
+    <span class="name" id="dlname">準備中…</span>
+    <span class="pct" id="dlpct" role="status" aria-live="polite" aria-label="下載進度">0%</span>
+  </div>
+  <div id="dlbar"><div id="dlfill"></div></div>
+  <div id="dltotal"><div id="dltotalfill"></div></div>
+  <div id="dlmeta">
+    <span id="dlspeed"></span>
+    <span id="dleta"></span>
+  </div>
+</div>
+<div id="console" role="log" aria-live="polite" aria-label="執行日誌"></div>
+<div class="toast" id="toast" role="status" aria-live="assertive"></div>
+<div class="modal" id="loginmodal">
+  <div class="sheet">
+    <h3>掃碼登入 B 站</h3>
+    <p>手機 B 站 App →「我的」→ 右上角「掃一掃」<br>掃完在手機上按確認</p>
+    <img id="qrimg" alt="B 站登入 QR">
+    <div class="stat" id="loginstat">等待掃碼…</div>
+  </div>
+</div>
+
+<div class="libmodal" id="libmodal" role="dialog" aria-modal="true" aria-labelledby="libtitle">
+  <div class="libpanel">
+    <div class="libhead">
+      <h2 id="libtitle">我的素材專案</h2>
+      <span class="count" id="libcount"></span>
+      <span class="grow"></span>
+      <select id="libsort" aria-label="排序方式" title="排序方式" style="width:150px">
+        <option value="manual">手動順序</option>
+        <option value="created">建立時間</option>
+        <option value="name">名稱</option>
+        <option value="clips">片段數</option>
+        <option value="count">候選數</option>
+      </select>
+      <button class="ghost tiny" id="libscan" title="掃描 projects/，找出未納入或遺失的專案">⟳ 掃描</button>
+      <button class="ghost tiny" id="libclose">關閉</button>
+    </div>
+    <div class="libbody">
+      <div id="libscanbox"></div>
+      <div class="libgrid" id="libgrid"></div>
+    </div>
+  </div>
+</div>
+
+<div class="lightbox" id="lightbox"></div>
+
+<script src="/static/app.js"></script>
+
+</body>
+</html>

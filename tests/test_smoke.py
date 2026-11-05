@@ -181,10 +181,39 @@ def test_web_projects_empty(web):
 
 
 def test_web_index_renders(web):
+    """首頁外殼與它的靜態資源都要真的送得出來。
+
+    階段 0 之後 CSS／JS 搬到 static/ 了，首頁本身只有外殼
+    （內容全部走 /api/），所以「有 id=mode」要在靜態檔裡驗。
+    """
     with urllib.request.urlopen(web + "/", timeout=5) as resp:
         body = resp.read().decode()
     assert "vidgrab" in body
-    assert 'id="mode"' in body  # 整支／切片選單
+    assert "/static/app.css" in body, "外殼要載入樣式"
+    assert "/static/app.js" in body, "外殼要載入程式"
+
+    for path, want in (("/static/index.html", 'id="keywords"'),
+                       ("/static/app.css", "--console-bg"),
+                       ("/static/app.js", 'id="mode"')):
+        with urllib.request.urlopen(web + path, timeout=5) as resp:
+            assert resp.status == 200, f"{path} 回應 {resp.status}"
+            got = resp.read().decode()
+        assert want in got, f"{path} 少了 {want}"
+
+
+def test_static_route_blocks_traversal(web):
+    """/static/ 不可以被路徑穿越。"""
+    import urllib.error
+
+    for path in ("/static/../web.py", "/static/%2e%2e/web.py",
+                 "/static/../__init__.py"):
+        try:
+            with urllib.request.urlopen(web + path, timeout=5) as resp:
+                resp.read()
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404, f"{path} 回了 {exc.code}"
+        else:
+            raise AssertionError(f"{path} 竟然讀得到，路徑穿越沒擋住")
 
 
 # ---------------------------------------------------------------- 設定
@@ -788,13 +817,15 @@ def test_scrub_metadata_cleans_existing(tmp_path, monkeypatch):
 
 
 def _page_css() -> str:
-    """把 web.py 裡那一大段 PAGE 字串抽出來，方便對 CSS 做靜態檢查。"""
+    """前端樣式（階段 0 之後放在 static/app.css）。"""
+    return _static_file("app.css")
+
+
+def _static_file(name: str) -> str:
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "web.py").read_text(
-        encoding="utf-8"
-    )
-    return src
+    return (Path(__file__).resolve().parents[1]
+            / "src" / "vidgrab" / "static" / name).read_text(encoding="utf-8")
 
 
 def test_theme_menu_has_explicit_width():
@@ -831,9 +862,7 @@ def test_six_themes_defined_with_all_vars():
     import re
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "web.py").read_text(
-        encoding="utf-8"
-    )
+    src = _page_css()
     themes = re.findall(r'\[data-theme="([a-z]+)"\]\s*\{(.*?)\}', src, re.S)
     ids = [t[0] for t in themes]
     for want in ("midnight", "ink", "forest", "paper", "mist", "sakura"):
