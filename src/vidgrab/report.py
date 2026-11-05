@@ -70,28 +70,39 @@ def write_csv(path: Path, items: list[Item], root: Path) -> None:
         writer = csv.writer(fh)
         writer.writerow(
             [
-                "#", "平台", "標題", "作者", "時長", "觀看數", "發布日", "授權", "轉載",
-                "檔案", "連結", "命中關鍵字", "備註",
+                "#", "平台", "標題", "作者", "頻道", "作者頁面", "時長", "解析度",
+                "觀看數", "發布日", "授權", "授權名稱", "轉載",
+                "檔案", "連結", "命中關鍵字", "素材關鍵字", "分類", "標註建議", "備註",
             ]
         )
         for idx, item in enumerate(items, 1):
             files = "; ".join(
                 _rel(Path(c["path"]), root) + f" [{span_label(c)}]" for c in item.clips
             )
+            from .models import contact_block, search_terms
+
+            res = f"{item.width}x{item.height}" if item.width and item.height else ""
             writer.writerow(
                 [
                     idx,
                     PLATFORM_LABEL.get(item.platform, item.platform),
                     item.title,
                     item.author,
+                    item.channel,
+                    item.author_url,
                     fmt_duration(item.duration),
+                    res,
                     item.views or "",
                     item.pubdate,
                     item.license_label or "",
+                    item.license_name,
                     "是" if item.repost else "",
                     files,
-                    item.url,
+                    item.webpage_url or item.url,
                     item.keyword,
+                    " ".join(search_terms(item)),
+                    " / ".join(item.categories),
+                    contact_block(item)["credit_hint"],
                     item.error or item.check_note,
                 ]
             )

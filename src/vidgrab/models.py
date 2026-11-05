@@ -181,6 +181,23 @@ class Item:
     clips: list[dict[str, Any]] = field(default_factory=list)
     thumbs: list[str] = field(default_factory=list)
 
+    # ---- 素材庫需要的資訊（下載時就寫好，不必回頭爬） ----
+    tags: list[str] = field(default_factory=list)          # 標籤／分類
+    categories: list[str] = field(default_factory=list)     # 平台分類
+    author_url: str = ""                                    # 作者頁面（要聯繫／標註用）
+    author_id: str = ""                                     # 作者 uid / channel id
+    channel: str = ""                                       # 頻道名
+    webpage_url: str = ""                                   # 原始頁面
+    thumbnail: str = ""                                     # 封面
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+    filesize: int | None = None
+    language: str = ""
+    license_name: str = ""                                  # yt-dlp 的 license 欄位
+    description_full: str = ""                              # 完整說明（不受截斷）
+    info_json: str = ""                                     # sidecar json 路徑
+
     def blob(self) -> str:
         return " ".join([self.title, self.description, self.license_hint])
 
@@ -235,3 +252,153 @@ def iter_unique(items: Iterable[Item]) -> list[Item]:
         seen.add(key)
         out.append(item)
     return out
+
+
+# ---------------------------------------------------------------- 素材 metadata
+
+
+# yt-dlp 會把一些「技術狀態」也塞進 tags，例如 yt:cc=on（有字幕）、
+# yt:stretch=16:9。這些不是內容關鍵字，進素材庫只會變成雜訊。
+_TECH_TAG = re.compile(r"^(yt:|yt-dlp:|language:|quality:)", re.IGNORECASE)
+
+
+def _is_tech_tag(tag: str) -> bool:
+    return bool(_TECH_TAG.match(tag.strip()))
+
+
+def enrich_from_info(item: "Item", info: dict[str, Any]) -> "Item":
+    """把 yt-dlp 的 info dict 補進 Item。
+
+    設計原則：**下載當下就寫好**，因為影片之後可能下架、改標題、改授權。
+    這裡只做「有就拿」，拿不到就留空，不猜、不編造。
+    """
+    info = info or {}
+
+    def _s(key: str) -> str:
+        v = info.get(key)
+        return str(v).strip() if v not in (None, "") else ""
+
+    def _tags(key: str) -> list[str]:
+        raw = info.get(key) or []
+        if isinstance(raw, str):
+            raw = [x.strip() for x in raw.replace("，", ",").split(",")]
+        out: list[str] = []
+        for t in raw:
+            t = str(t).strip()
+            if not t or _is_tech_tag(t):
+                continue
+            if t not in out:
+                out.append(t)
+        return out[:40]
+
+    if not item.author:
+        item.author = _s("uploader") or _s("channel") or _s("creator")
+    item.channel = item.channel or _s("channel") or _s("uploader")
+    item.author_id = item.author_id or _s("channel_id") or _s("uploader_id")
+    item.author_url = item.author_url or _s("channel_url") or _s("uploader_url")
+    item.webpage_url = item.webpage_url or _s("webpage_url") or item.url
+    item.thumbnail = item.thumbnail or _s("thumbnail")
+    item.language = item.language or _s("language")
+
+    if not item.tags:
+        item.tags = _tags("tags")
+    if not item.categories:
+        item.categories = _tags("categories")
+
+    if not item.description_full:
+        item.description_full = _s("description")
+    if not item.description:
+        item.description = (item.description_full or "")[:2000]
+
+    if not item.pubdate:
+        raw = info.get("upload_date") or ""
+        if raw and len(str(raw)) == 8:
+            item.pubdate = str(raw)
+        elif info.get("timestamp"):
+            try:
+                item.pubdate = time.strftime("%Y%m%d", time.localtime(float(info["timestamp"])))
+            except Exception:  # noqa: BLE001
+                pass
+    if not item.upload_date:
+        item.upload_date = _s("upload_date")
+
+    if item.width is None and info.get("width"):
+        try:
+            item.width = int(info["width"])
+        except Exception:  # noqa: BLE001
+            pass
+    if item.height is None and info.get("height"):
+        try:
+            item.height = int(info["height"])
+        except Exception:  # noqa: BLE001
+            pass
+    if item.fps is None and info.get("fps"):
+        try:
+            item.fps = float(info["fps"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    if item.filesize is None:
+        for key in ("filesize", "filesize_approx"):
+            if info.get(key):
+                try:
+                    item.filesize = int(info[key])
+                    break
+                except Exception:  # noqa: BLE001
+                    pass
+
+    item.license_name = item.license_name or _s("license")
+
+    if not item.views and info.get("view_count"):
+        try:
+            item.views = int(info["view_count"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not item.vid:
+        item.vid = _s("id")
+
+    return item
+
+
+def search_terms(item: "Item") -> list[str]:
+    """可以用來搜尋／比對這支素材的關鍵字。
+
+    由「標籤 + 分類 + 使用者的搜尋詞」組成，去重後保留順序。
+    這是素材庫最實用的一欄：想找「廚房 特寫」時，靠的就是這些詞。
+    """
+    out: list[str] = []
+    for group in (item.tags, item.categories, (item.keyword or "").split()):
+        for t in group:
+            t = str(t).strip()
+            if not t or _is_tech_tag(t):
+                continue
+            if t.lower() not in {x.lower() for x in out}:
+                out.append(t)
+    return out[:60]
+
+
+def contact_block(item: "Item") -> dict[str, str]:
+    """要標註出處／聯繫作者時需要的資訊。
+
+    刻意只放「公開頁面」的連結，不放任何爬到的私人聯絡方式。
+    """
+    return {
+        "author": item.author,
+        "channel": item.channel,
+        "author_url": item.author_url,
+        "webpage_url": item.webpage_url or item.url,
+        "license": item.license_name or item.license_label,
+        "credit_hint": _credit_hint(item),
+    }
+
+
+def _credit_hint(item: "Item") -> str:
+    """給剪輯者看的「這段要怎麼標註」一句話。"""
+    who = item.author or item.channel or "原作者"
+    where = item.webpage_url or item.url
+    if item.license_name:
+        return f"{who}（{item.license_name}）— {where}"
+    if item.license_kind in ("free", "free-attribution"):
+        return f"{who} — {where}"
+    return f"授權未標示，使用前請先聯繫 {who}：{where}"

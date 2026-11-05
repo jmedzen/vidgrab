@@ -169,6 +169,11 @@ def _common_args(opts: GrabOptions) -> list[str]:
         "--newline",
         "--progress-template",
         PROGRESS_TEMPLATE,
+        # 下載當下就把完整 metadata 寫成 sidecar json。
+        # 這是素材庫的資料來源：以後要查標籤、作者、授權都靠它，
+        # 不必再回頭爬一次（影片可能已下架或改版）。
+        "--write-info-json",
+        "--no-clean-info-json",
     ]
     if opts.cookies:
         args += ["--cookies", opts.cookies]
@@ -371,7 +376,31 @@ def grab_range(
     for leftover in outdir.glob(f"{stem}.f*"):
         if leftover != final:
             leftover.unlink(missing_ok=True)
-    return {"path": str(final), "cached": False, **ffprobe(final)}
+
+    # 把 sidecar info json 的內容併進 item：這是素材庫的資料來源
+    _absorb_info_json(item, outdir, stem)
+
+    probe = ffprobe(final)
+    return {"path": str(final), "cached": False, **probe}
+
+
+def _absorb_info_json(item: Item, outdir: Path, stem: str) -> None:
+    """讀回 yt-dlp 寫的 .info.json，補齊 item 的素材庫欄位。
+
+    讀不到不算失敗——下載本身已經成功了，metadata 缺了只是少一點資訊。
+    """
+    from .models import enrich_from_info
+
+    candidates = sorted(outdir.glob(f"{stem}*.info.json"))
+    if not candidates:
+        return
+    path = candidates[0]
+    try:
+        info = json.loads(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return
+    enrich_from_info(item, info)
+    item.info_json = str(path)
 
 
 def ffprobe(path: Path) -> dict[str, Any]:

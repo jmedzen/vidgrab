@@ -477,6 +477,37 @@ def _run() -> int:
                 except Exception:  # noqa: BLE001
                     pass
 
+    print("── 掃描／復原")
+    tab.js("openLibrary()")
+    time.sleep(0.8)
+    has_scan = tab.js("!!document.querySelector('#libscan')")
+    check("有掃描按鈕", has_scan)
+    if has_scan:
+        tab.js("document.querySelector('#libscan').click()")
+        time.sleep(2.0)
+        box = tab.js("(document.querySelector('#libscanbox')||{}).textContent||''")
+        check("掃描有回報結果", "掃描" in (box or ""), (box or "")[:44].strip())
+    tab.js("closeLibrary()")
+    time.sleep(0.3)
+
+    print("── 素材 metadata")
+    asset = tab.js("""(async () => {
+      const list = await api('/api/projects');
+      const p = (list || [])[0];
+      if (!p) return '';
+      const a = await api('/api/asset/' + encodeURIComponent(p.name) + '/0');
+      return JSON.stringify({t: a.title, terms: a.search_terms, c: !!a.contact});
+    })()""", await_promise=True)
+    ok_asset = False
+    if asset:
+        import json as _json
+        try:
+            a = _json.loads(asset)
+            ok_asset = bool(a.get("t")) and isinstance(a.get("terms"), list) and a.get("c")
+        except Exception:  # noqa: BLE001
+            ok_asset = False
+    check("單支素材可讀取完整 metadata", ok_asset, (asset or "")[:56])
+
     print("── 授權膠囊")
     pills = tab.js("JSON.stringify([...document.querySelectorAll('.card .meta .pill')].map(e=>e.textContent.trim()))")
     check("卡片上沒有「未知」膠囊", "未知" not in (pills or ""), str(pills))

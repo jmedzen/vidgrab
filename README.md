@@ -98,6 +98,19 @@ brew install ffmpeg uv
 - **排序**：手動順序／建立時間／名稱／片段數／候選數。手動拖曳卡片就能改順序，拖過之後自動切回「手動」
 - 排序方式存在伺服器（`library.json`），換瀏覽器、重開容器都一樣
 
+### 清單是「權威記錄」，不會因為資料夾不見就消失
+
+`projects/library.json` 是一份**獨立的穩定記錄**。重要規則：
+
+- 專案資料夾不見了（換 `VIDGRAB_HOME`、誤搬、外接碟沒插）→ 記錄**保留**，
+  標記 `missing`，卡片還在，只是變成虛線框
+- 資料夾放回來 → **自動復原**，不需要任何操作
+- 只有你明確按「移除記錄」才會刪
+
+面板右上角有 **⟳ 掃描**：比對磁碟與記錄，列出兩種不一致並各自給一個按鈕 ——
+「磁碟有、記錄沒有」可以**全部納入**；「記錄有、磁碟沒有」可以移除空記錄
+（只刪記錄，不動任何檔案）。
+
 ### 主題與側欄
 
 右上角的 ◐ 按鈕切換主題，六組分別是：
@@ -265,6 +278,8 @@ curl -s -X POST http://127.0.0.1:8310/api/config \
 | GET | `/api/project/{name}` | 單一專案（含候選與已下載片段） |
 | GET | `/api/item/{name}/{i}` | 單一候選影片 |
 | GET | `/api/library` | 素材庫（改名／釘選／排序後的清單） |
+| GET | `/api/library/scan` | 掃描 projects/，找出未納入與遺失的專案 |
+| GET | `/api/asset/{專案}/{索引}` | 單支素材的完整 metadata |
 | POST | `/api/library` | 改名、釘選、排序、拖曳（見下） |
 | POST | `/api/project/delete` | 刪除整個專案 |
 | POST | `/api/delete-clip` | 刪除單一片段檔 |
@@ -339,6 +354,34 @@ docker exec vidgrab vidgrab build                 # 確認跑的是哪次建置
 公開使用的素材，要嘛找明確授權的（Pexels、Pixabay、YouTube CC BY），
 要嘛只用短片段、以評論或教學形式引用，並在影片說明標明出處、作者、原片連結。
 `index.html` 底部也寫了同樣的提醒。
+
+### 素材 metadata
+
+**下載的當下**就把完整資訊寫進 `results.json`（以及 yt-dlp 的 `.info.json` sidecar），
+不必事後回頭爬——影片可能下架、改標題、改授權，那時就補不回來了。
+
+每支素材都有：
+
+| 欄位 | 內容 |
+|---|---|
+| `tags` / `categories` | 平台標籤與分類（已過濾 `yt:cc=on` 這種技術標記） |
+| `search_terms` | **找素材用的關鍵字**＝標籤＋分類＋你的搜尋詞 |
+| `author` / `channel` / `author_url` | 作者與其頁面（要標註或聯繫時用） |
+| `webpage_url` / `thumbnail` | 原始頁面與封面 |
+| `pubdate` / `language` | 發布日與語言 |
+| `width` / `height` / `fps` | 解析度 |
+| `license` | 授權類別、原始授權名稱 |
+| `contact.credit_hint` | 一句話的標註建議 |
+
+`CSV` 也補上了這些欄位（作者頁面／素材關鍵字／分類／標註建議／解析度），
+可以直接匯進素材管理工具。
+
+既有專案（metadata 功能上線前建立的）跑一次回填：
+
+```bash
+./vidgrab refresh demo-taipei     # 重新抓一次詳情，補齊所有欄位
+./vidgrab scrub                   # 只清技術標記，不重新抓取
+```
 
 介面上不再對每支影片掛「未知」膠囊（幾乎每支都是，掛了等於雜訊）。
 只有真的查出授權的才會顯示標籤；其餘在清單上方用一句「N 支未標示授權」帶過。

@@ -196,8 +196,6 @@ def projects_payload() -> list[dict[str, Any]]:
 
     lib = library.load()
     lib, changed = library.sync(lib, folders)
-    if changed:
-        library.save(lib)
 
     stats: dict[str, dict[str, Any]] = {}
     for p in [root / f for f in folders]:
@@ -211,18 +209,45 @@ def projects_payload() -> list[dict[str, Any]]:
                 int(c.get("size_bytes") or 0) for i in items for c in (i.clips or [])
             ),
         }
+        # 順手記下「最後一次看到的樣子」，資料夾遺失時卡片才有內容可顯示
+        rec = lib["items"].setdefault(p.name, {})
+        if rec.get("count") != stats[p.name]["count"] or not rec.get("last_seen"):
+            rec["count"] = stats[p.name]["count"]
+            rec["clips"] = stats[p.name]["clips"]
+            rec["queries"] = stats[p.name]["queries"]
+            rec["last_seen"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            changed = True
+
+    if changed:
+        library.save(lib)
 
     out = []
     for folder in lib.get("order", []):
-        if folder not in stats:
-            continue
         meta = library.entry(lib, folder)
+        if folder not in stats:
+            # 資料夾不見了：保留卡片，用記錄裡上次看到的樣子顯示
+            if not meta["missing"]:
+                continue
+            out.append({
+                "name": folder,
+                "title": meta["title"],
+                "pinned": meta["pinned"],
+                "note": meta["note"],
+                "missing": True,
+                "queries": meta.get("queries") or [],
+                "count": meta.get("count") or 0,
+                "clips": meta.get("clips") or 0,
+                "created": "",
+                "size": "",
+            })
+            continue
         st = stats[folder]
         out.append({
             "name": folder,
             "title": meta["title"],
             "pinned": meta["pinned"],
             "note": meta["note"],
+            "missing": meta["missing"],
             "queries": st["queries"],
             "count": st["count"],
             "clips": st["clips"],
@@ -406,6 +431,21 @@ OPENAPI: dict[str, Any] = {
                     ],
                     "responses": {"200": {"description": "OK"}}},
         },
+        "/api/library/scan": {
+            "get": {"tags": ["project"], "summary": "掃描 projects/，找出未納入與遺失的專案",
+                    "responses": {"200": {"description": "OK"}}},
+        },
+        "/api/asset/{project}/{index}": {
+            "get": {
+                "tags": ["project"],
+                "summary": "單支素材的完整 metadata（標籤、可聯繫資訊、標註建議、片段）",
+                "parameters": [
+                    {"name": "project", "in": "path", "required": True, "schema": {"type": "string"}},
+                    {"name": "index", "in": "path", "required": True, "schema": {"type": "integer"}},
+                ],
+                "responses": {"200": {"description": "OK"}, "404": {"description": "找不到"}},
+            },
+        },
         "/api/library": {
             "get": {"tags": ["project"], "summary": "素材庫（含改名、釘選、目前排序）",
                     "responses": {"200": {"description": "OK"}}},
@@ -418,11 +458,14 @@ OPENAPI: dict[str, Any] = {
                         "required": ["action"],
                         "properties": {
                             "action": {"type": "string",
-                                       "enum": ["rename", "pin", "order", "move", "sort"]},
+                                       "enum": ["rename", "pin", "order", "move", "sort",
+                                                "adopt", "forget"]},
                             "project": {"type": "string", "description": "資料夾名"},
                             "title": {"type": "string", "description": "rename 用"},
                             "pinned": {"type": "boolean", "description": "pin 用"},
                             "order": {"type": "array", "items": {"type": "string"}},
+                            "folders": {"type": "array", "items": {"type": "string"},
+                                        "description": "adopt／forget 用"},
                             "delta": {"type": "integer", "description": "move 用，-1 上移、1 下移"},
                             "mode": {"type": "string",
                                      "enum": ["manual", "created", "name", "clips", "count"]},
@@ -561,6 +604,75 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, png.read_bytes(), "image/png")
             return
+        if route.startswith("/api/asset/"):
+            # 單支素材的完整資訊，給外部工具（剪輯軟體、素材管理）讀取
+            from .models import contact_block, search_terms
+
+            parts = route.split("/api/asset/", 1)[1].split("/")
+            project = self._project_dir(urllib.parse.unquote(parts[0]))
+            if not project:
+                self._json({"error": "找不到專案"}, 404)
+                return
+            try:
+                idx = int(parts[1]) if len(parts) > 1 else -1
+            except ValueError:
+                self._json({"error": "索引必須是整數"}, 400)
+                return
+            _, items = tasks.load_project(project)
+            if not (0 <= idx < len(items)):
+                self._json({"error": f"索引超出範圍（0–{len(items) - 1}）"}, 404)
+                return
+            it = items[idx]
+            self._json({
+                "index": idx,
+                "platform": it.platform,
+                "vid": it.vid,
+                "title": it.title,
+                "author": it.author,
+                "channel": it.channel,
+                "author_url": it.author_url,
+                "webpage_url": it.webpage_url or it.url,
+                "thumbnail": it.thumbnail,
+                "duration": it.duration,
+                "width": it.width,
+                "height": it.height,
+                "fps": it.fps,
+                "views": it.views,
+                "pubdate": it.pubdate,
+                "language": it.language,
+                "tags": it.tags,
+                "categories": it.categories,
+                "search_terms": search_terms(it),
+                "description": it.description_full or it.description,
+                "license": {
+                    "kind": it.license_kind,
+                    "label": it.license_label,
+                    "name": it.license_name,
+                },
+                "repost": it.repost,
+                "contact": contact_block(it),
+                "clips": [
+                    {
+                        "path": c.get("path"),
+                        "start": c.get("start"),
+                        "end": c.get("end"),
+                        "duration": c.get("duration"),
+                        "width": c.get("width"),
+                        "height": c.get("height"),
+                        "size_bytes": c.get("size_bytes"),
+                        "url": "/file/" + urllib.parse.quote(
+                            str(Path(c.get("path", "")).relative_to(tasks.projects_root()))
+                        ) if c.get("path") else "",
+                    }
+                    for c in it.clips
+                ],
+            })
+            return
+        if route == "/api/library/scan":
+            from . import library
+
+            self._json(library.scan())
+            return
         if route == "/api/library":
             from . import library
 
@@ -656,6 +768,12 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "sort":
                     stats = {p["name"]: p for p in projects_payload()}
                     library.sort_by(lib, body.get("mode", "manual"), stats)
+                elif action == "adopt":
+                    folders = body.get("folders") or []
+                    library.adopt(lib, [f for f in folders if self._project_dir(f)])
+                elif action == "forget":
+                    # 只移除「記錄」，不動磁碟上的資料夾
+                    library.forget(lib, body.get("folders") or [])
                 else:
                     self._json({"error": f"不認得的動作：{action}"}, 400)
                     return
@@ -1299,6 +1417,19 @@ PAGE = r"""<!doctype html>
   .libcard input.renaming {
     font-size:14px; font-weight:600; padding:5px 8px; width:100%;
   }
+  .libscan {
+    margin:0 20px 14px; padding:12px 14px; border-radius:10px;
+    border:1px solid var(--line); background:var(--panel2); font-size:12.5px;
+  }
+  .libscan h4 { margin:0 0 8px; font-size:12.5px; letter-spacing:.04em; }
+  .libscan .row2 { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:6px; }
+  .libscan .f { font-family:ui-monospace, monospace; background:var(--code-bg);
+                padding:1px 6px; border-radius:4px; }
+  .libscan .grow { flex:1; }
+  .libcard.ismissing { opacity:.55; border-style:dashed; }
+  .libcard.ismissing .lctitle::after {
+    content:'（記錄存在，資料夾不見）'; font-size:10.5px; color:var(--warn); font-weight:400;
+  }
   .libempty { text-align:center; color:var(--muted); padding:56px 20px; }
   .libempty .big { font-size:34px; margin-bottom:10px; opacity:.5; }
 
@@ -1496,9 +1627,13 @@ PAGE = r"""<!doctype html>
         <option value="clips">片段數</option>
         <option value="count">候選數</option>
       </select>
+      <button class="ghost tiny" id="libscan" title="掃描 projects/，找出未納入或遺失的專案">⟳ 掃描</button>
       <button class="ghost tiny" id="libclose">關閉</button>
     </div>
-    <div class="libbody"><div class="libgrid" id="libgrid"></div></div>
+    <div class="libbody">
+      <div id="libscanbox"></div>
+      <div class="libgrid" id="libgrid"></div>
+    </div>
   </div>
 </div>
 
@@ -1718,8 +1853,8 @@ async function renderLibrary() {
   grid.innerHTML = LIB.map((p, i) => {
     const cur = CURRENT && CURRENT.name === p.name;
     return `
-    <div class="libcard ${cur ? 'current' : ''}" data-name="${esc(p.name)}" data-i="${i}"
-         draggable="true" tabindex="0">
+    <div class="libcard ${cur ? 'current' : ''} ${p.missing ? 'ismissing' : ''}"
+         data-name="${esc(p.name)}" data-i="${i}" draggable="true" tabindex="0">
       <div class="lctitle">
         ${p.pinned ? '<span class="pinmark" title="已釘選">📌</span>' : ''}
         <span class="lctext">${esc(p.title || p.name)}</span>
@@ -1851,9 +1986,63 @@ function startRename(card, name) {
   };
 }
 
+
+// ------------------------------------------------------------ 掃描／復原
+async function runScan() {
+  const box = $('#libscanbox');
+  box.innerHTML = '<div class="libscan">掃描中…</div>';
+  let r;
+  try { r = await api('/api/library/scan'); }
+  catch (e) { box.innerHTML = `<div class="libscan">掃描失敗：${esc(e.message)}</div>`; return; }
+
+  if (r.ok) {
+    box.innerHTML = `<div class="libscan" style="color:var(--muted)">
+      ✓ 掃描完成，記錄與 ${esc(r.root)} 一致（${r.on_disk.length} 個專案）</div>`;
+    return;
+  }
+
+  const un = r.untracked || [];
+  const mi = r.missing || [];
+  box.innerHTML = `<div class="libscan">
+    <h4>掃描結果</h4>
+    ${un.length ? `<div>· 磁碟上有、記錄裡沒有：<b>${un.length}</b> 個</div>
+      <div class="row2">
+        ${un.map(x => `<span class="f">${esc(x.folder)}</span>`).join('')}
+        <span class="grow"></span>
+        <button class="mini" id="libadopt">全部納入</button>
+      </div>` : ''}
+    ${mi.length ? `<div style="margin-top:8px">· 記錄有、磁碟上找不到：<b>${mi.length}</b> 個
+      <span style="color:var(--muted)">（可能是換了目錄或被移走）</span></div>
+      <div class="row2">
+        ${mi.map(x => `<span class="f">${esc(x.folder)}</span>`).join('')}
+        <span class="grow"></span>
+        <button class="mini ghost" id="libforget">移除這些空記錄</button>
+      </div>` : ''}
+  </div>`;
+
+  const adopt = $('#libadopt');
+  if (adopt) adopt.onclick = async () => {
+    await api('/api/library', {method:'POST', body: JSON.stringify({
+      action:'adopt', folders: un.map(x => x.folder)})});
+    toast(`已納入 ${un.length} 個專案`);
+    await renderLibrary();
+    await runScan();
+  };
+  const forget = $('#libforget');
+  if (forget) forget.onclick = async () => {
+    if (!confirm(`確定要移除 ${mi.length} 筆記錄？\n（只移除記錄，不會動到任何檔案）`)) return;
+    await api('/api/library', {method:'POST', body: JSON.stringify({
+      action:'forget', folders: mi.map(x => x.folder)})});
+    toast('已移除空記錄');
+    await renderLibrary();
+    await runScan();
+  };
+}
+
 function initLibrary() {
   $('#openlib').onclick = openLibrary;
   $('#libclose').onclick = closeLibrary;
+  $('#libscan').onclick = runScan;
   const modal = $('#libmodal');
   modal.onclick = (e) => { if (e.target === modal) closeLibrary(); };
   document.addEventListener('keydown', (e) => {

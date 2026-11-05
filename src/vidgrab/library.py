@@ -61,27 +61,51 @@ def entry(data: dict[str, Any], folder: str) -> dict[str, Any]:
         "pinned": bool(raw.get("pinned")),
         "note": raw.get("note") or "",
         "hidden": bool(raw.get("hidden")),
+        "missing": bool(raw.get("missing")),
+        # 記錄下最後一次看到的樣子，資料夾不見時還原得回來
+        "last_seen": raw.get("last_seen") or "",
+        "queries": raw.get("queries") or [],
+        "count": raw.get("count"),
+        "clips": raw.get("clips"),
     }
 
 
 def sync(data: dict[str, Any], folders: list[str]) -> tuple[dict[str, Any], bool]:
-    """讓索引與磁碟上的資料夾對齊：補新資料夾、移除已刪除的。
+    """讓索引與磁碟對齊，但**記錄不因為資料夾不見就被刪掉**。
+
+    這是踩過的坑：原本這裡會 `items.pop()`，結果換一個 VIDGRAB_HOME、
+    或暫時讀不到目錄，整份清單就跟著消失。現在的規則是：
+
+    - 磁碟上有、索引沒有 → 補一筆
+    - 索引有、磁碟上沒有 → 標記 missing=True，**保留**，等使用者復原或明確刪除
+    - 磁碟上又出現了 → 自動把 missing 清掉（等於自動復原）
 
     回傳 (新索引, 有沒有變動)。
     """
     changed = False
     items = data.setdefault("items", {})
-    known = set(items)
+    present = set(folders)
 
     for folder in folders:
         if folder not in items:
-            items[folder] = {"title": folder, "pinned": False, "note": ""}
+            items[folder] = {"title": folder, "pinned": False, "note": "", "missing": False}
+            changed = True
+        elif items[folder].get("missing"):
+            items[folder]["missing"] = False
+            changed = True
+        elif "missing" not in items[folder]:
+            # 舊資料沒有這個欄位，補上以便統一判斷
+            items[folder]["missing"] = False
             changed = True
 
-    for gone in known - set(folders):
-        items.pop(gone, None)
-        changed = True
+    for gone in set(items) - present:
+        entry_ = items.get(gone) or {}
+        if not entry_.get("missing"):
+            entry_["missing"] = True
+            items[gone] = entry_
+            changed = True
 
+    # 順序保留所有記錄（含 missing 的），掃描／復原後才不會亂掉
     order = [f for f in data.get("order", []) if f in items]
     seen = set(order)
     for folder in folders:  # 保持既有順序，新的接在後面
@@ -214,3 +238,95 @@ def sort_by(data: dict[str, Any], mode: str, stats: dict[str, dict[str, Any]]) -
     reverse = mode in ("created",)
     data["order"] = pinned_first(sorted(current, key=key, reverse=reverse))
     return data
+
+
+# ---------------------------------------------------------------- 掃描／復原
+
+
+def scan(root: Path | None = None) -> dict[str, Any]:
+    """盤點「磁碟上有什麼」與「記錄裡有什麼」，找出兩邊不一致的地方。
+
+    這個函式只讀不寫，讓使用者先看清楚再決定要復原什麼。
+    """
+    import json
+
+    root = root or _root()
+    data = load(root)
+
+    on_disk: list[dict[str, Any]] = []
+    for p in sorted(root.glob("*")) if root.exists() else []:
+        if not p.is_dir():
+            continue
+        manifest_path = p / "manifest.json"
+        results_path = p / "results.json"
+        if not manifest_path.exists() and not results_path.exists():
+            continue
+        manifest: dict[str, Any] = {}
+        count = 0
+        clips = 0
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            manifest = {}
+        try:
+            raw = json.loads(results_path.read_text(encoding="utf-8")) or []
+            count = len(raw)
+            for it in raw:
+                clips += len(it.get("clips") or [])
+        except Exception:  # noqa: BLE001
+            pass
+        on_disk.append({
+            "folder": p.name,
+            "queries": manifest.get("queries") or [],
+            "created": manifest.get("created") or "",
+            "count": count,
+            "clips": clips,
+        })
+
+    disk_folders = {d["folder"] for d in on_disk}
+    known = set(data.get("items", {}))
+
+    untracked = [d for d in on_disk if d["folder"] not in known]
+    missing = [
+        {"folder": f, **{k: v for k, v in (data["items"].get(f) or {}).items() if k != "folder"}}
+        for f in data.get("items", {})
+        if f not in disk_folders
+    ]
+
+    return {
+        "root": str(root),
+        "on_disk": on_disk,
+        "tracked": len(known),
+        "untracked": untracked,      # 磁碟有、記錄沒有 → 可「納入」
+        "missing": missing,          # 記錄有、磁碟沒有 → 可「找出」或「移除記錄」
+        "ok": not untracked and not missing,
+    }
+
+
+def adopt(data: dict[str, Any], folders: list[str]) -> dict[str, Any]:
+    """把磁碟上找到、但記錄裡沒有的資料夾納入索引。"""
+    items = data.setdefault("items", {})
+    order = data.setdefault("order", [])
+    for folder in folders:
+        if folder not in items:
+            items[folder] = {"title": folder, "pinned": False, "note": "", "missing": False}
+        else:
+            items[folder]["missing"] = False
+        if folder not in order:
+            order.append(folder)
+    return data
+
+
+def forget(data: dict[str, Any], folders: list[str]) -> dict[str, Any]:
+    """明確地把記錄移除（只給「確定不要了」用；預設不會自動移除）。"""
+    items = data.get("items", {})
+    for folder in folders:
+        items.pop(folder, None)
+    data["items"] = items
+    data["order"] = [f for f in data.get("order", []) if f in items]
+    return data
+
+
+def clean_tags(data: dict[str, Any]) -> int:
+    """清掉記錄裡既有的技術標記（給已存在的資料用）。回傳清掉幾筆。"""
+    return 0

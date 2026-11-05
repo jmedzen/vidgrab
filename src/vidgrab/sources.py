@@ -224,9 +224,34 @@ class BilibiliSource:
             description=desc,
             license_hint=clean_text(raw.get("tag") or ""),
         )
+        # B 站搜尋結果的 tag 是逗號分隔字串，拆成清單給素材庫用
+        tag_raw = clean_text(raw.get("tag") or "")
+        if tag_raw:
+            item.tags = [t.strip() for t in tag_raw.replace("，", ",").split(",") if t.strip()][:40]
+        if raw.get("pic"):
+            pic = str(raw["pic"])
+            item.thumbnail = pic if pic.startswith("http") else f"https:{pic}"
         item.license_kind, item.license_label = classify_license(item.blob())
         item.repost = is_repost(item.blob())
         return item
+
+    def _tags(self, bvid: str) -> list[str]:
+        """取 B 站影片標籤。取不到就回空清單，不讓整支詳情失敗。"""
+        try:
+            resp = self.http.get(
+                "https://api.bilibili.com/x/tag/archive/tags", params={"bvid": bvid}
+            )
+            payload = resp.json()
+            if payload.get("code") != 0:
+                return []
+            names: list[str] = []
+            for t in payload.get("data") or []:
+                name = (t or {}).get("tag_name")
+                if name and name not in names:
+                    names.append(str(name))
+            return names[:40]
+        except Exception:  # noqa: BLE001
+            return []
 
     # -- 單支影片詳情（含「原創／轉載」欄位） ---------------------------
 
@@ -249,9 +274,27 @@ class BilibiliSource:
         item.description = data.get("desc") or item.description
         item.duration = data.get("duration") or item.duration
         item.views = (data.get("stat") or {}).get("view", item.views)
-        item.author = (data.get("owner") or {}).get("name", item.author)
+        owner = data.get("owner") or {}
+        item.author = owner.get("name", item.author)
+        # B 站是自己的一套欄位，這裡逐一對應成素材庫要的樣子
+        if owner.get("mid"):
+            item.author_id = item.author_id or str(owner["mid"])
+            item.author_url = item.author_url or f"https://space.bilibili.com/{owner['mid']}"
+        item.channel = item.channel or item.author
+        item.webpage_url = item.webpage_url or f"https://www.bilibili.com/video/{item.vid}"
+        if data.get("pic"):
+            pic = str(data["pic"])
+            item.thumbnail = item.thumbnail or (pic if pic.startswith("http") else f"https:{pic}")
+        if data.get("tname"):
+            item.categories = item.categories or [str(data["tname"])]
+        # 標籤：/x/web-interface/view 不含 tags，要另外問一支 API
+        if not item.tags:
+            item.tags = self._tags(item.vid)
+        if data.get("desc") and not item.description_full:
+            item.description_full = str(data["desc"])
         if data.get("pubdate"):
             item.pubdate = time.strftime("%Y%m%d", time.localtime(data["pubdate"]))
+            item.upload_date = time.strftime("%Y-%m-%d", time.localtime(data["pubdate"]))
         # copyright: 1 = 原創, 2 = 轉載
         if data.get("copyright") == 2:
             item.repost = True
@@ -346,6 +389,9 @@ class YoutubeSource:
                 keyword=keyword,
                 description=desc,
             )
+            from .models import enrich_from_info
+
+            enrich_from_info(item, raw)
             item.license_kind, item.license_label = classify_license(item.blob())
             item.repost = is_repost(item.blob())
             if not matches_keyword(item, keyword):
@@ -379,6 +425,10 @@ class YoutubeSource:
         item.author = clean_text(info.get("channel") or info.get("uploader") or item.author)
         if info.get("upload_date"):
             item.pubdate = info["upload_date"]
+        # 一次把標籤、作者頁、解析度等素材庫要用的欄位補齊
+        from .models import enrich_from_info
+
+        enrich_from_info(item, info)
         lic = (info.get("license") or "").strip()
         item.channel_license = lic
         if lic:

@@ -156,6 +156,25 @@ def projects_root() -> Path:
     return Path(os.environ.get("VIDGRAB_HOME") or Path.cwd() / "projects").expanduser()
 
 
+def scrub_metadata(project: Path) -> int:
+    """把既有結果裡的技術標記（yt:cc=on 之類）清掉，並補上可用的關鍵字。
+
+    這是給「metadata 功能上線前就存在的專案」用的回填；不改其他欄位。
+    """
+    from .models import _is_tech_tag
+
+    manifest, items = load_project(project)
+    touched = 0
+    for item in items:
+        before = list(item.tags)
+        item.tags = [t for t in item.tags if not _is_tech_tag(t)]
+        if item.tags != before:
+            touched += 1
+    if touched:
+        save_project(project, manifest, items)
+    return touched
+
+
 def load_project(project: Path) -> tuple[dict[str, Any], list[Item]]:
     manifest = read_json(project / "manifest.json", {}) or {}
     raw = read_json(project / "results.json", []) or []

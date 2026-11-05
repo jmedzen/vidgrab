@@ -321,17 +321,26 @@ def _lib(order, pinned=()):
     return {"order": list(order), "items": {f: {"pinned": f in pinned} for f in order}}
 
 
-def test_library_sync_adds_and_drops(tmp_path, monkeypatch):
+def test_library_sync_never_drops_records(tmp_path, monkeypatch):
+    """資料夾不見時，記錄要保留並標記 missing——不可以直接刪。
+
+    這是實戰換來的：以前這裡會 pop 掉，換個 VIDGRAB_HOME 整份清單就消失。
+    """
     monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
     from vidgrab import library
 
     data, changed = library.sync({"order": [], "items": {}}, ["a", "b"])
     assert changed and data["order"] == ["a", "b"]
 
-    data, changed = library.sync(data, ["b", "c"])  # a 被刪了、c 是新的
+    data, changed = library.sync(data, ["b", "c"])  # a 不在磁碟了、c 是新的
     assert changed
-    assert set(data["order"]) == {"b", "c"}
-    assert "a" not in data["items"]
+    assert set(data["items"]) == {"a", "b", "c"}, "記錄不可以被刪掉"
+    assert data["items"]["a"]["missing"] is True, "a 應該被標記 missing"
+    assert data["items"]["b"]["missing"] is False
+
+    # 資料夾又出現了 → 自動復原
+    data, changed = library.sync(data, ["a", "b", "c"])
+    assert data["items"]["a"]["missing"] is False
 
 
 def test_library_rename_and_pin(tmp_path, monkeypatch):
@@ -555,3 +564,218 @@ def test_dev_extra_has_websocket_client():
         encoding="utf-8"
     )
     assert "websocket-client" in pyproject
+
+
+# ---------------------------------------------------------------- 掃描／復原
+
+
+def test_scan_finds_untracked_and_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import library
+
+    root = tmp_path / "projects"
+    for name in ("known", "orphan"):
+        d = root / name
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text('{"queries": ["x"]}', encoding="utf-8")
+        (d / "results.json").write_text("[]", encoding="utf-8")
+
+    library.save({"order": ["known", "gone"], "items": {
+        "known": {"title": "K"}, "gone": {"title": "G"},
+    }})
+
+    report = library.scan()
+    assert [x["folder"] for x in report["untracked"]] == ["orphan"]
+    assert [x["folder"] for x in report["missing"]] == ["gone"]
+    assert report["ok"] is False
+
+
+def test_scan_clean_when_everything_matches(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import library
+
+    root = tmp_path / "projects"
+    (root / "a").mkdir(parents=True)
+    (root / "a" / "manifest.json").write_text("{}", encoding="utf-8")
+    (root / "a" / "results.json").write_text("[]", encoding="utf-8")
+    library.save({"order": ["a"], "items": {"a": {"title": "A", "missing": False}}})
+
+    report = library.scan()
+    assert report["ok"] is True
+    assert report["untracked"] == [] and report["missing"] == []
+
+
+def test_adopt_and_forget(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import library
+
+    data = {"order": [], "items": {}}
+    library.adopt(data, ["x", "y"])
+    assert set(data["items"]) == {"x", "y"} and data["order"] == ["x", "y"]
+
+    library.forget(data, ["x"])
+    assert set(data["items"]) == {"y"} and data["order"] == ["y"]
+
+
+def test_scan_ignores_non_project_dirs(tmp_path, monkeypatch):
+    """掃描只看真的有 manifest/results 的資料夾，不要把小垃圾當專案。"""
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import library
+
+    root = tmp_path / "projects"
+    (root / "junk" / "sub").mkdir(parents=True)  # 沒有 manifest
+    (root / "real").mkdir()
+    (root / "real" / "manifest.json").write_text("{}", encoding="utf-8")
+
+    report = library.scan()
+    assert [x["folder"] for x in report["on_disk"]] == ["real"]
+
+
+# ---------------------------------------------------------------- 素材 metadata
+
+
+def test_enrich_from_info_fills_library_fields():
+    from vidgrab.models import Item, enrich_from_info, search_terms
+
+    it = Item(platform="youtube", vid="x", url="u", title="T", keyword="vegan dish")
+    enrich_from_info(it, {
+        "uploader": "Andrew", "channel_url": "https://yt/@a",
+        "webpage_url": "https://yt/watch?v=x",
+        "tags": ["vegan", "cooking"], "categories": ["Howto"],
+        "upload_date": "20250102", "width": 1920, "height": 1080, "fps": 30,
+        "license": "Creative Commons", "description": "d" * 50,
+    })
+    assert it.pubdate == "20250102"
+    assert it.tags == ["vegan", "cooking"]
+    assert it.width == 1920 and it.height == 1080
+    assert it.license_name == "Creative Commons"
+    assert it.author_url == "https://yt/@a"
+
+    terms = search_terms(it)
+    assert "vegan" in terms and "cooking" in terms and "dish" in terms
+
+
+def test_enrich_does_not_overwrite_existing():
+    """已經有值就不要蓋掉——搜尋結果可能比第二次抓的更準。"""
+    from vidgrab.models import Item, enrich_from_info
+
+    it = Item(platform="bilibili", vid="x", url="u", title="原標題",
+              keyword="k", author="原作者", views=999)
+    enrich_from_info(it, {"title": "新標題", "uploader": "新作者", "view_count": 1})
+    assert it.title == "原標題"
+    assert it.author == "原作者"
+    assert it.views == 999
+
+
+def test_contact_block_gives_credit_hint():
+    from vidgrab.models import Item, contact_block
+
+    it = Item(platform="bilibili", vid="x", url="https://b/v", title="T",
+              author="作者", license_name="CC BY")
+    block = contact_block(it)
+    assert block["author_url"] == ""
+    assert "作者" in block["credit_hint"]
+    assert "https://b/v" in block["credit_hint"]
+
+
+def test_contact_block_warns_when_license_unknown():
+    from vidgrab.models import Item, contact_block
+
+    it = Item(platform="bilibili", vid="x", url="https://b/v", title="T", author="某人")
+    hint = contact_block(it)["credit_hint"]
+    assert "聯繫" in hint, "授權不明時應該提示要先聯繫"
+
+
+def test_csv_has_library_columns(tmp_path):
+    """CSV 是素材庫的匯出格式，關鍵欄位不能少。"""
+    import csv as _csv
+
+    from vidgrab.models import Item
+    from vidgrab.report import write_csv
+
+    item = Item(
+        platform="youtube", vid="v1", url="https://y/v1", title="T", author="A",
+        keyword="廚房", tags=["特寫", "料理"], author_url="https://y/@a",
+        width=1920, height=1080, pubdate="20250101",
+    )
+    out = tmp_path / "clips.csv"
+    write_csv(out, [item], tmp_path)
+    rows = list(_csv.reader(out.read_text(encoding="utf-8-sig").splitlines()))
+    header = rows[0]
+    for col in ("作者頁面", "素材關鍵字", "分類", "標註建議", "解析度"):
+        assert col in header, f"CSV 缺欄位：{col}"
+
+    row = dict(zip(header, rows[1]))
+    assert "特寫" in row["素材關鍵字"]
+    assert "廚房" in row["素材關鍵字"]
+    assert row["解析度"] == "1920x1080"
+
+
+def test_api_library_scan_endpoint(web):
+    data = get(web + "/api/library/scan")
+    assert "on_disk" in data and "untracked" in data and "missing" in data
+    assert isinstance(data["ok"], bool)
+
+
+def _make_project(tmp_path, name="p1", items=None):
+    """在測試用 VIDGRAB_HOME 裡造一個最小專案。"""
+    d = tmp_path / "projects" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "manifest.json").write_text(
+        json.dumps({"queries": ["廚房"], "created": "2026-01-01"}), encoding="utf-8"
+    )
+    (d / "results.json").write_text(
+        json.dumps(items or [{
+            "platform": "youtube", "vid": "v1", "url": "https://y/v1",
+            "title": "測試影片", "author": "作者A", "keyword": "廚房",
+            "tags": ["特寫"], "webpage_url": "https://y/v1",
+            "author_url": "https://y/@a",
+        }], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return d
+
+
+def test_api_asset_metadata(tmp_path, web):
+    """每支素材都要能讀到素材庫需要的資訊（外部工具靠這支）。"""
+    _make_project(tmp_path)
+    data = get(web + "/api/asset/p1/0")
+    for key in ("title", "author", "webpage_url", "tags", "search_terms",
+                "contact", "license", "clips"):
+        assert key in data, f"asset API 缺欄位：{key}"
+    assert isinstance(data["search_terms"], list)
+    assert "credit_hint" in data["contact"]
+
+
+def test_api_asset_out_of_range(tmp_path, web):
+    import urllib.error
+
+    _make_project(tmp_path)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        get(web + "/api/asset/p1/9999")
+    assert exc.value.code == 404
+
+
+def test_tech_tags_are_filtered():
+    """yt:cc=on 這類技術標記不是內容關鍵字，不該進素材庫。"""
+    from vidgrab.models import Item, enrich_from_info, search_terms
+
+    it = Item(platform="youtube", vid="x", url="u", title="T", keyword="vegan")
+    enrich_from_info(it, {"tags": ["vegan", "yt:cc=on", "yt:stretch=16:9", "language:en", "cooking"]})
+    assert it.tags == ["vegan", "cooking"]
+    assert "yt:cc=on" not in search_terms(it)
+
+
+def test_scrub_metadata_cleans_existing(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import tasks
+
+    _make_project(tmp_path, "p1", items=[{
+        "platform": "youtube", "vid": "v1", "url": "u", "title": "T",
+        "tags": ["vegan", "yt:cc=on"],
+    }])
+    n = tasks.scrub_metadata(tmp_path / "projects" / "p1")
+    assert n == 1
+
+    _, items = tasks.load_project(tmp_path / "projects" / "p1")
+    assert items[0].tags == ["vegan"]

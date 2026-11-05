@@ -266,6 +266,22 @@ def cmd_pick(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scrub(args: argparse.Namespace) -> int:
+    """清掉既有資料裡的技術標記；不重新抓取，純本機整理。"""
+    root = tasks.projects_root()
+    targets = (
+        [resolve_project(args.project)] if args.project
+        else [p for p in sorted(root.glob("*")) if (p / "manifest.json").exists()]
+    )
+    total = 0
+    for project in targets:
+        n = tasks.scrub_metadata(project)
+        total += n
+        print(f"· {project.name}: 清掉 {n} 支的技術標記")
+    print(f"\n共 {len(targets)} 個專案，{total} 支有變動")
+    return 0
+
+
 def cmd_refresh(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     manifest, items = tasks.load_project(project)
@@ -547,6 +563,10 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("refresh", help="回頭確認授權與影片還在不在")
     r.add_argument("project", nargs="?")
     r.set_defaults(func=cmd_refresh)
+
+    sc = sub.add_parser("scrub", help="清掉既有資料裡的技術標記（不重新抓取）")
+    sc.add_argument("project", nargs="?", help="專案名稱或路徑（省略 = 全部）")
+    sc.set_defaults(func=cmd_scrub)
 
     sh = sub.add_parser("show", help="看專案清單")
     sh.add_argument("project", nargs="?")
