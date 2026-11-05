@@ -307,7 +307,28 @@ def _run() -> int:
     tab.send("Log.enable")
     tab.send("Page.enable")
     tab.send("Page.navigate", url="http://127.0.0.1:8310/")
-    time.sleep(4)
+
+    # 等「應用真的掛起來」再開始測，不要用固定秒數。
+    # 固定 4 秒在資源第一次載入（或剛重啟伺服器）時不夠，
+    # 會出現 ERR_CONNECTION_RESET 之後所有主題斷言全紅的假失敗。
+    deadline = time.time() + 30
+    ready = False
+    while time.time() < deadline:
+        time.sleep(0.4)
+        ok_now = tab.js(
+            "typeof THEMES !== 'undefined' && !!document.querySelector('#console')"
+            " && document.querySelectorAll('.projrow, .hint').length > 0"
+        )
+        if ok_now:
+            ready = True
+            break
+    if not ready:
+        print("✗ 介面 30 秒內沒載入完成（THEMES 或 #console 不存在）")
+        print("  通常是前端產物沒建置，或伺服器還沒起來：")
+        print("    cd web && npm run build")
+        return 2
+    # 再給一點時間讓第一輪資料（專案清單）落地
+    time.sleep(1.2)
 
     ok = True
 
@@ -1012,6 +1033,33 @@ def _run() -> int:
         check("進度條有可讀標籤", bool((info.get("label") or "").strip()), str(info.get("label"))[:30])
     else:
         check("沒有下載時不顯示進度條", True, "目前沒在跑")
+
+    print("── 左下角專案清單")
+    rows = tab.js("document.querySelectorAll('.projrow').length")
+    listed = tab.js("""(async () => {
+      const all = await api('/api/projects');
+      return JSON.stringify({api: all.length});
+    })()""", await_promise=True)
+    try:
+        api_n = json.loads(listed or "{}").get("api", -1)
+    except Exception:  # noqa: BLE001
+        api_n = -1
+    check("側欄列出全部專案（不是只前幾個）",
+          api_n >= 0 and (rows or 0) == api_n, f"側欄 {rows} / API {api_n}")
+    check("專案列有候選數",
+          bool(tab.js("!!document.querySelector('.projrow .n')")))
+    # 有切過片的專案要標出來，不然看不出哪個已經有素材
+    check("有片段的專案顯示片段數",
+          tab.js("""(async () => {
+            const list = await api('/api/projects');
+            const has = list.some(p => p.clips > 0);
+            const shown = !!document.querySelector('.projrow .nc');
+            return has ? shown : true;
+          })()""", await_promise=True))
+    check("專案列不會撐爆側欄",
+          tab.js("(() => { const b=document.querySelector('#projects');"
+                 " if(!b) return true; return b.scrollHeight <= b.clientHeight + 2"
+                 " || getComputedStyle(b).overflowY === 'auto'; })()"))
 
     print("── 沒有 JS 錯誤")
     real_errors = [e for e in tab.errors if e and "favicon" not in e.lower()]

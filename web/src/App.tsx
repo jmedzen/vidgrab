@@ -713,12 +713,20 @@ export default function App() {
           onOpenAdmin={() => { void doOpenAdmin() }}
           projectsNode={(
             <>
-              {library.slice(0, 8).map((p) => (
+              {/* 全部列出，不再只給前 8 個 —— 新建的專案會被切掉，
+                  使用者看到的是「我明明建了，左邊卻沒有」。 */}
+              {library.map((p) => (
                 <div key={p.name}
                      className={`projrow${project?.name === p.name ? ' active' : ''}`}
+                     title={p.title && p.title !== p.name ? `${p.title}（${p.name}）` : p.name}
                      onClick={() => { void openProject(p.name); setLibOpen(false) }}>
-                  {p.pinned ? '📌 ' : ''}{p.title || p.name}
-                  <span className="n">{p.count}</span>
+                  <span className="projname">
+                    {p.pinned ? '📌 ' : ''}{p.title || p.name}
+                  </span>
+                  <span className="n" title={`${p.count} 支候選`}>{p.count}</span>
+                  {p.clips > 0
+                    ? <span className="nc" title={`${p.clips} 段已切片`}>✂{p.clips}</span>
+                    : null}
                 </div>
               ))}
               {library.length === 0
