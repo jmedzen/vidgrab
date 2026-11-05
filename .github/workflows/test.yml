@@ -1,0 +1,65 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 安裝
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          python tools/stamp_build.py
+
+      - name: 版本
+        run: vidgrab build --json
+
+      - name: 測試（含 Dockerfile 靜態檢查）
+        run: vidgrab test
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 建置映像
+        run: |
+          BUILD="$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+          docker build --build-arg VIDGRAB_BUILD="$BUILD" -t vidgrab:ci .
+
+      - name: 跑起來確認健康
+        run: |
+          docker run -d --name vidgrab-ci -p 8310:8310 vidgrab:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8310/api/version; then
+              echo
+              echo "healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "健康檢查逾時"
+          docker logs vidgrab-ci
+          exit 1
+
+      - name: 確認 build number 進了映像
+        run: |
+          BUILD="$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+          docker exec vidgrab-ci vidgrab build --json | tee /tmp/b.json
+          grep -q "$BUILD" /tmp/b.json
+
+      - name: 收尾
+        if: always()
+        run: docker rm -f vidgrab-ci || true

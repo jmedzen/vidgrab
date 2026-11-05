@@ -1,3 +1,4 @@
+# 建置時不要把這些送進 context
 .git
 .gitignore
 .venv
@@ -11,10 +12,12 @@ __pycache__
 build
 dist
 .DS_Store
-README.md
-docs
-tests
-*.md
-!README.md
 .pytest_cache
 .ruff_cache
+docs
+
+# 只保留 README 這份文件（pyproject 的 readme 指向它）
+*.md
+!README.md
+
+# 注意：tests/ 不要排除，Dockerfile 的測試階段會 COPY 它

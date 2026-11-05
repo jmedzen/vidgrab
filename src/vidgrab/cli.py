@@ -10,9 +10,26 @@ import traceback
 import webbrowser
 from pathlib import Path
 
-from . import media, report, tasks
-from .version import __version__, build, full_version
-from .models import (
+# 必須在 requests/urllib3 被 import 之前過濾，否則它會先印出警告
+def _quiet_ssl_noise() -> None:
+    """某些 Python（如 Xcode 內建的 3.9、Homebrew 的 LibreSSL）連不到 OpenSSL，
+    urllib3 會在 import 時就碎念一次。
+
+    這跟工具本身無關，但會把 CLI 輸出弄得很吵。
+    這裡刻意「不 import urllib3」來取類別——那樣做本身就會先觸發警告，
+    所以改用訊息比對，在它被印出來之前就攔掉。
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore", message=r".*only supports OpenSSL.*")
+    warnings.filterwarnings("ignore", message=r".*NotOpenSSLWarning.*")
+
+
+_quiet_ssl_noise()
+
+from . import media, report, tasks  # noqa: E402  （要排在警告過濾之後）
+from .version import __version__, build, full_version  # noqa: E402
+from .models import (  # noqa: E402
     Item,
     fmt_duration,
     human_size,
@@ -280,7 +297,17 @@ def cmd_test(args: argparse.Namespace) -> int:
     if not target.exists():
         print("找不到 tests/ 目錄（容器映像裡不含測試）", file=sys.stderr)
         return 2
-    return subprocess.call([sys.executable, "-m", "pytest", str(target), "-q"])
+
+    code = subprocess.call([sys.executable, "-m", "pytest", str(target), "-q"])
+
+    # 順手檢查 Dockerfile：需要的檔案沒被 .dockerignore 排掉
+    checker = root / "tools" / "check_docker.py"
+    if checker.exists():
+        print()
+        rc = subprocess.call([sys.executable, str(checker)])
+        if rc != 0 and code == 0:
+            code = rc
+    return code
 
 
 def cmd_build(args: argparse.Namespace) -> int:
