@@ -519,6 +519,42 @@ def _run() -> int:
         vis = tab.js("getComputedStyle(document.querySelector('#player')).display")
         check("關閉播放器", vis == "none", vis)
 
+        # ── 點外面／Esc 要關得掉（用真的事件測，不是直接呼叫 closePlayer）
+        #
+        # 注意：playClip 有 toggle 行為——再點同一個片段會「收起」。
+        # 所以每次都要先確定是關著的再點開，並且**確認真的開了**，
+        # 否則會變成在測「本來就關著」的假測試（踩過）。
+        def _is_open():
+            return tab.js(
+                "getComputedStyle(document.querySelector('#player')).display"
+            ) != "none"
+
+        def _open_player():
+            if _is_open():
+                tab.js("closePlayer()")
+                time.sleep(0.3)
+            tab.js("document.querySelector('[data-play]').click()")
+            time.sleep(1.2)
+            return _is_open()
+
+        assert _open_player(), "播放器沒開起來，後面的斷言就沒意義了"
+        tab.js("document.querySelector('#view').click()")
+        time.sleep(0.6)
+        check("點播放器外面會關閉", not _is_open())
+
+        assert _open_player(), "播放器沒開起來"
+        tab.js("document.querySelector('#player .ptitle').click()")
+        time.sleep(0.6)
+        check("點播放器內部不會關閉", _is_open())
+
+        assert _open_player(), "播放器沒開起來，Esc 那條會變成假測試"
+        tab.send("Input.dispatchKeyEvent", type="keyDown", key="Escape",
+                 code="Escape", windowsVirtualKeyCode=27)
+        tab.send("Input.dispatchKeyEvent", type="keyUp", key="Escape",
+                 code="Escape", windowsVirtualKeyCode=27)
+        time.sleep(0.6)
+        check("按 Esc 會關閉播放器", not _is_open())
+
     print("── 素材庫面板")
     # 先從 API 取狀態（面板還沒開，DOM 是空的），測完再還原
     snap = get("http://127.0.0.1:8310/api/projects")

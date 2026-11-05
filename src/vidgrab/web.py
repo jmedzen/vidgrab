@@ -2411,9 +2411,20 @@ function initPlayer() {
   // 事件委派：影片清單是動態重繪的，不能在元素上綁
   document.addEventListener('click', (e) => {
     const el = e.target.closest('[data-play]');
-    if (!el) return;
-    e.preventDefault();
-    playClip(el.dataset.play, el.dataset.name);
+    if (el) {
+      e.preventDefault();
+      playClip(el.dataset.play, el.dataset.name);
+      return;
+    }
+    // 點播放器以外的任何地方就收起來。
+    // 播放器是內嵌面板（不是遮罩），所以「外面」= 不在 #player 裡。
+    if (!PLAYING) return;
+    if (e.target.closest('#player')) return;   // 面板自己的按鈕、進度條
+    if (e.target.closest('#lightbox')) return; // 大圖模式另外處理
+    // 拖曳選字不算是「點外面」
+    const sel = window.getSelection();
+    if (sel && String(sel).length > 0) return;
+    closePlayer();
   });
 }
 
@@ -2707,7 +2718,14 @@ $('#keywords').addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) search();
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { const b = $('#lightbox'); b.classList.remove('show'); b.innerHTML = ''; }
+  if (e.key !== 'Escape') return;
+  // 由外而內收：先關大圖，再關播放器
+  const lb = $('#lightbox');
+  if (lb.classList.contains('show')) {
+    lb.classList.remove('show'); lb.innerHTML = '';
+    return;
+  }
+  if (PLAYING) closePlayer();
 });
 async function showBuild() {
   try {
