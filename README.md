@@ -534,8 +534,19 @@ docker exec vidgrab vidgrab build                 # 確認跑的是哪次建置
 ./vidgrab build --json   # {"version":"0.2.0","build":"2.8436bba","full":"..."}
 ```
 
-來源依序：`VIDGRAB_BUILD` 環境變數 → 打包時寫入的 `_build_info.py` → git commit 數＋短 hash → `dev`。
+來源依序：`VIDGRAB_BUILD` 環境變數 → **git commit 數＋短 hash** → 打包時寫入的 `_build_info.py` → `dev`。
 Docker 建置會自動帶入，容器內 `vidgrab build` 就知道跑的是哪一次建置。網頁左上角也會顯示。
+
+> **為什麼 git 排在 stamp 檔前面**
+>
+> `_build_info.py` 是 stamp 當下寫的快照。它一旦存在、又排在 git 前面，
+> 就會**永遠蓋掉 git**：明明已經有 11 個 commit，`./vidgrab build` 還一直顯示 `3.d79b3e3`。
+> 正確的順序是「有 git 就信 git（最新），沒有 git（Docker／pip 安裝）才看 stamp 檔」。
+> 三種來源各有一條測試：`test_build_env_wins`、`test_build_prefers_git_over_stale_stamp`、
+> `test_build_falls_back_to_stamp_without_git`。
+>
+> 改了 `version.py` 之後若行為沒變，先清 `__pycache__`——
+> 用 `cp` 還原檔案會保留舊 mtime，Python 會繼續用過期的 `.pyc`（我就被這個騙過一次）。
 
 ---
 

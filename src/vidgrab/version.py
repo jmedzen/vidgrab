@@ -2,9 +2,14 @@
 
 build number 的來源優先序：
 1. 環境變數 VIDGRAB_BUILD（Docker 建置時帶入，最可靠）
-2. 打包時產生的 _build_info.py（tools/stamp_build.py 寫入）
-3. git 的 commit 數與短 hash（本機開發）
+2. git 的 commit 數與短 hash（本機開發：永遠是最新的）
+3. 打包時產生的 _build_info.py（沒有 .git 的環境才靠這個）
 4. 都沒有就退回版本號本身
+
+**為什麼 git 要排在 _build_info.py 前面**：
+那個檔案是 stamp 時寫下的快照，一旦存在就會永遠蓋掉 git，
+於是明明已經有 11 個 commit，`./vidgrab build` 還一直顯示 3。
+Docker 裡沒有 .git，所以第 1、3 條仍然能正確報版。
 
 刻意不 import subprocess 之外的東西，讓它永遠不會因為環境怪而爆掉。
 """
@@ -52,7 +57,12 @@ def _from_git() -> str:
 
 @lru_cache(maxsize=1)
 def build() -> str:
-    return _from_env() or _from_file() or _from_git() or "dev"
+    """目前這份程式碼是哪一版。
+
+    順序刻意是 env → git → 檔案：
+    有 git 時就用 git（最新），沒有 git（Docker／pip 安裝）才看 stamp 檔。
+    """
+    return _from_env() or _from_git() or _from_file() or "dev"
 
 
 @lru_cache(maxsize=1)

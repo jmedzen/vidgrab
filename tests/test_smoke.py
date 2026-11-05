@@ -1057,3 +1057,51 @@ def test_normalize_does_not_clobber(tmp_path):
     out = _normalize_name(dup, "abc")
     assert out == dup, "不該動它"
     assert keep.read_bytes() == b"original"
+
+
+def test_build_prefers_git_over_stale_stamp(tmp_path, monkeypatch):
+    """git 可用時要看 git，不能被舊的 _build_info.py 蓋掉。
+
+    真實踩到的 bug：stamp 檔停在 `3.d79b3e3`，但 git 已經有 11 個 commit，
+    `./vidgrab build` 一直顯示 3。
+    """
+    import importlib
+
+    from vidgrab import version
+
+    monkeypatch.delenv("VIDGRAB_BUILD", raising=False)
+    monkeypatch.setattr(version, "_from_git", lambda: "11.abc1234")
+    monkeypatch.setattr(version, "_from_file", lambda: "3.stale00")
+    version.build.cache_clear()
+    try:
+        assert version.build() == "11.abc1234", "有 git 時應該相信 git"
+    finally:
+        version.build.cache_clear()
+
+
+def test_build_falls_back_to_stamp_without_git(monkeypatch):
+    """沒有 git（Docker／pip 安裝）時才靠 stamp 檔。"""
+    from vidgrab import version
+
+    monkeypatch.delenv("VIDGRAB_BUILD", raising=False)
+    monkeypatch.setattr(version, "_from_git", lambda: "")
+    monkeypatch.setattr(version, "_from_file", lambda: "7.deadbee")
+    version.build.cache_clear()
+    try:
+        assert version.build() == "7.deadbee"
+    finally:
+        version.build.cache_clear()
+
+
+def test_build_env_wins(monkeypatch):
+    """VIDGRAB_BUILD 永遠最優先（Docker 建置時帶入）。"""
+    from vidgrab import version
+
+    monkeypatch.setenv("VIDGRAB_BUILD", "42.cafe000")
+    monkeypatch.setattr(version, "_from_git", lambda: "11.abc1234")
+    monkeypatch.setattr(version, "_from_file", lambda: "3.stale00")
+    version.build.cache_clear()
+    try:
+        assert version.build() == "42.cafe000"
+    finally:
+        version.build.cache_clear()
