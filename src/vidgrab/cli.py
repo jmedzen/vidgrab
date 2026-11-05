@@ -937,7 +937,9 @@ def main(argv: list[str] | None = None) -> int:
 
     from .models import MissingFFmpeg, VidgrabError
 
-    if not media.ffmpeg_ok() and args.cmd not in ("list", "vault", "find"):
+    from .models import NEEDS_NO_FFMPEG
+
+    if not media.ffmpeg_ok() and args.cmd not in NEEDS_NO_FFMPEG:
         err = MissingFFmpeg("需要 ffmpeg 與 ffprobe")
         if machine:
             emit_json({"ok": False, "error": err.to_dict()})

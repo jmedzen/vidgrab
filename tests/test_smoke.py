@@ -1277,3 +1277,60 @@ def test_prune_dry_run_keeps_files(tmp_path, monkeypatch):
     assert data["dry_run"] is True
     assert data["orphans"] == 1
     assert f.exists(), "dry-run 不可以刪檔"
+
+
+def test_build_works_without_ffmpeg(tmp_path):
+    """CI 沒有 ffmpeg。讀資料的指令不該被它擋住。
+
+    真的掛過：`vidgrab build --json` 在 GitHub Actions 回 exit 2，
+    連續五次 push 的 CI 都紅的。
+    """
+    import os
+    import subprocess
+    import sys
+
+    from vidgrab.models import NEEDS_NO_FFMPEG
+
+    # 只放最基本的東西，確保 PATH 裡找不到 ffmpeg
+    bare = tmp_path / "bin"
+    bare.mkdir()
+    for tool in ("git", "sh", "env"):
+        src = __import__("shutil").which(tool)
+        if src:
+            (bare / tool).symlink_to(src)
+
+    env = {
+        **os.environ,
+        "PATH": f"{bare}:/usr/bin:/bin",
+        "PYTHONPATH": str(_ROOT / "src"),
+        "VIDGRAB_HOME": str(tmp_path / "projects"),
+    }
+    r = subprocess.run(
+        [sys.executable, "-m", "vidgrab.cli", "build", "--json"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert r.returncode == 0, f"沒有 ffmpeg 時 build 應該照樣能跑：{r.stderr}"
+    data = json.loads(r.stdout)
+    assert data["version"]
+
+    # 這份清單是 CLI 與啟動腳本共用的，改動時要想清楚
+    assert "build" in NEEDS_NO_FFMPEG
+    assert "vault" in NEEDS_NO_FFMPEG
+    assert "test" in NEEDS_NO_FFMPEG
+    assert "pick" not in NEEDS_NO_FFMPEG, "pick 真的要 ffmpeg，不能豁免"
+
+
+def test_launcher_and_cli_share_ffmpeg_list():
+    """啟動腳本與 CLI 的豁免清單不可以不同步。
+
+    之前分成兩份，導致 CI 掛掉。
+    """
+    src = (_ROOT / "vidgrab").read_text(encoding="utf-8")
+    from vidgrab.models import NEEDS_NO_FFMPEG
+
+    assert "needs_ffmpeg" in src, "啟動腳本要有這個判斷"
+    # 腳本裡的 case 清單要涵蓋 Python 清單裡的每個指令
+    for cmd in NEEDS_NO_FFMPEG:
+        assert f" {cmd} " in src or f" {cmd}\"" in src, (
+            f"啟動腳本的清單少了 {cmd}，兩邊不同步"
+        )

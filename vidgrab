@@ -12,8 +12,27 @@ export UV_TOOL_DIR="${UV_TOOL_DIR:-$HERE/.cache/uv-tools}"
 
 VENV="$HERE/.venv"
 
-if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
-  echo "✗ 找不到 ffmpeg／ffprobe。請先安裝：brew install ffmpeg" >&2
+# ffmpeg 只有真的要處理影片時才需要。
+# build／list／vault 這類純讀取的指令不該被它擋住（CI 就是這樣掛的）。
+# 清單只有一份（models.NEEDS_NO_FFMPEG），這裡不重複維護，
+# 免得兩邊不同步——之前就是這樣讓 CI 掛掉。
+needs_ffmpeg=1
+_first_cmd=""
+for _a in "$@"; do
+  case "$_a" in
+    -*) continue ;;
+    *) _first_cmd="$_a"; break ;;
+  esac
+done
+if [ -n "$_first_cmd" ]; then
+  case " build list vault find config show login logout purge prune scrub test web " in
+    *" $_first_cmd "*) needs_ffmpeg=0 ;;
+  esac
+fi
+if [ "$needs_ffmpeg" = "1" ] && { ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; }; then
+  echo "✗ 找不到 ffmpeg／ffprobe，這個指令需要它來處理影片。" >&2
+  echo "  macOS：brew install ffmpeg" >&2
+  echo "  Ubuntu：sudo apt-get install -y ffmpeg" >&2
   exit 1
 fi
 

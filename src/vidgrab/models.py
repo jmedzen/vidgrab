@@ -527,3 +527,13 @@ def looks_like_tutorial(item: "Item") -> bool:
     if (item.duration or 0) > _TUTORIAL_DURATION_HINT and re.search(r"[講讲課课]", title):
         return True
     return False
+
+
+# 不需要 ffmpeg 就能跑的指令（純讀資料或印版本）。
+# CLI 與啟動腳本都共用這份清單——分成兩份就會不同步，
+# 之前就是這樣讓 CI 的 `vidgrab build --json` 掛掉。
+NEEDS_NO_FFMPEG = frozenset({
+    "build", "list", "vault", "find", "config", "show",
+    "purge", "prune", "scrub", "login", "logout", "test",
+    "web",  # web 本身不處理影片，是背景工作才需要
+})
