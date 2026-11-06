@@ -379,8 +379,317 @@ def resolve_pick_options(body: dict, saved: dict) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- OpenAPI
 
+
+# 回應體的結構。沒有這些，外部工具只知道「會回 200」，
+# 不知道拿回來的是什麼 —— Postman／程式碼產生器到這裡就沒戲了。
+COMPONENTS = {
+    "schemas": {
+        "Error": {
+            "type": "object",
+            "description": "出錯時的回應（HTTP 4xx／5xx）",
+            "properties": {"error": {"type": "string"}},
+            "required": ["error"],
+        },
+        "Version": {
+            "type": "object",
+            "properties": {
+                "version": {"type": "string", "example": "0.2.0"},
+                "build": {"type": "string", "example": "33.df8dd79"},
+                "full": {"type": "string", "example": "0.2.0+33.df8dd79"},
+            },
+        },
+        "ProjectSummary": {
+            "type": "object",
+            "description": "素材庫清單裡的一個專案（輕量）",
+            "properties": {
+                "name": {"type": "string"},
+                "title": {"type": "string"},
+                "pinned": {"type": "boolean"},
+                "note": {"type": "string"},
+                "missing": {"type": "boolean", "description": "資料夾不見了"},
+                "queries": {"type": "array", "items": {"type": "string"}},
+                "count": {"type": "integer", "description": "候選數"},
+                "clips": {"type": "integer", "description": "已切片數"},
+                "created": {"type": "string"},
+                "size": {"type": "string", "example": "60.9MB"},
+            },
+        },
+        "Clip": {
+            "type": "object",
+            "description": "一段切好的影片",
+            "properties": {
+                "name": {"type": "string"},
+                "rel": {"type": "string", "description": "/file/... 網址"},
+                "url": {"type": "string"},
+                "start": {"type": "number"},
+                "end": {"type": "number"},
+                "full": {"type": "boolean", "description": "整支而非切片"},
+                "span": {"type": "string", "example": "21:37→21:45"},
+                "size": {"type": "string", "example": "7.1MB"},
+                "dims": {"type": "string", "example": "1920×1080"},
+                "orientation": {"type": "string", "enum": ["landscape", "portrait", ""]},
+                "thumb": {"type": "string", "description": "縮圖網址，沒有就是空字串"},
+            },
+        },
+        "Item": {
+            "type": "object",
+            "description": "一支候選影片",
+            "properties": {
+                "index": {"type": "integer", "description": "0 起算"},
+                "vid": {"type": "string"},
+                "platform": {"type": "string", "enum": ["bilibili", "youtube"]},
+                "platform_label": {"type": "string"},
+                "title": {"type": "string"},
+                "author": {"type": "string"},
+                "url": {"type": "string"},
+                "keyword": {"type": "string"},
+                "duration": {"type": "string",
+                             "description": "給人看的長度，例如 3:00:11"},
+                "duration_sec": {"type": "number", "description": "實際秒數"},
+                "views": {"type": ["integer", "null"]},
+                "views_label": {"type": "string"},
+                "pubdate": {"type": "string"},
+                "license_kind": {"type": "string"},
+                "license_label": {"type": "string"},
+                "license_short": {"type": "string"},
+                "repost": {"type": "boolean"},
+                "error": {"type": "string"},
+                "note": {"type": "string"},
+                "thumbs": {"type": "array", "items": {"type": "string"}},
+                "clips": {"type": "array", "items": {"$ref": "#/components/schemas/Clip"}},
+            },
+        },
+        "Project": {
+            "type": "object",
+            "description": "單一專案的完整內容",
+            "properties": {
+                "name": {"type": "string"},
+                "path": {"type": "string"},
+                "created": {"type": "string"},
+                "updated": {"type": "string"},
+                "queries": {"type": "array", "items": {"type": "string"}},
+                "sources": {"type": "array", "items": {"type": "string"}},
+                "clips_bytes": {"type": "string",
+                                "description": "給人看的總大小，例如 60.9MB"},
+                "stats": {
+                    "type": "object",
+                    "properties": {
+                        "total": {"type": "integer"},
+                        "by_platform": {"type": "object", "additionalProperties": {"type": "integer"}},
+                        "by_license": {"type": "object", "additionalProperties": {"type": "integer"}},
+                        "reposts": {"type": "integer"},
+                        "with_clips": {"type": "integer"},
+                        "clip_bytes": {"type": "integer"},
+                    },
+                },
+                "items": {"type": "array", "items": {"$ref": "#/components/schemas/Item"}},
+            },
+        },
+        "JobRef": {
+            "type": "object",
+            "description": "非同步工作；用 id 去輪詢或訂閱",
+            "properties": {"job": {"type": "string"}},
+            "required": ["job"],
+        },
+        "Job": {
+            "type": "object",
+            "description": "工作狀態；還沒跑完時 result 不存在",
+            "properties": {
+                "id": {"type": "string"},
+                "done": {"type": "boolean"},
+                "error": {"type": "string"},
+                "messages": {"type": "array", "items": {"type": "string"}},
+                "result": {"type": "object"},
+            },
+        },
+        "Config": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "config.json 的位置"},
+                "values": {"type": "object", "additionalProperties": True},
+                "fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string"},
+                            "group": {"type": "string"},
+                            "label": {"type": "string"},
+                            "type": {"type": "string"},
+                            "value": {},
+                            "default": {},
+                            "help": {"type": "string"},
+                            "changed": {"type": "boolean"},
+                            "min": {"type": "number"},
+                            "max": {"type": "number"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                },
+            },
+        },
+        "Library": {
+            "type": "object",
+            "properties": {
+                "projects": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/ProjectSummary"},
+                },
+                "order": {"type": "array", "items": {"type": "string"}},
+                "sort": {"type": "string"},
+            },
+        },
+        "LoginStatus": {
+            "type": "object",
+            "properties": {
+                "ok": {"type": "boolean"},
+                "name": {"type": "string"},
+                "mid": {"type": "integer"},
+            },
+        },
+    }
+}
+
+def _docs_html() -> str:
+    """把 OpenAPI 規格變成一頁可讀的文件。
+
+    刻意不載 swagger-ui：那要多帶幾百 KB 的 CDN 資源，
+    而這個工具本身就是「不要依賴外部服務」的取向。
+    """
+    import html as _html
+
+    rows: list[str] = []
+    for path, ops in OPENAPI["paths"].items():
+        for method, op in ops.items():
+            if method not in ("get", "post", "put", "delete"):
+                continue
+            tags = ", ".join(op.get("tags") or [])
+            # 請求參數：路徑參數 + requestBody 的 properties
+            params: list[str] = []
+            for prm in op.get("parameters") or []:
+                need = "" if prm.get("required") else "?"
+                params.append(f'{prm.get("name", "?")}{need}'
+                              f' <span class="ty">{_html.escape(str(prm.get("in", "")))}</span>')
+            body = (op.get("requestBody") or {}).get("content", {}).get(
+                "application/json", {}).get("schema", {})
+            required = set(body.get("required") or [])
+            for key, spec in (body.get("properties") or {}).items():
+                star = "" if key in required else "?"
+                desc = _html.escape(str(spec.get("description", "")))
+                params.append(f'{_html.escape(key)}{star}'
+                              f' <span class="ty">{_html.escape(str(spec.get("type", "")))}</span>'
+                              + (f' <span class="d">{desc}</span>' if desc else ""))
+
+            resp = op.get("responses", {}).get("200", {})
+            rcontent = resp.get("content", {})
+            if "application/json" in rcontent:
+                sch = rcontent["application/json"].get("schema", {})
+                ref = sch.get("$ref", "")
+                if ref:
+                    rtype = ref.rsplit("/", 1)[-1]
+                elif sch.get("type") == "array":
+                    rtype = f'{sch.get("items", {}).get("$ref", "").rsplit("/", 1)[-1]}[]'
+                else:
+                    rtype = sch.get("type", "object")
+                resp_txt = _html.escape(rtype or "object")
+            elif rcontent:
+                resp_txt = _html.escape(next(iter(rcontent)))
+            else:
+                resp_txt = "—"
+
+            rows.append(f"""<details class="ep">
+  <summary><span class="m {method}">{method.upper()}</span>
+    <span class="path">{_html.escape(path)}</span>
+    <span class="sum">{_html.escape(op.get("summary", ""))}</span></summary>
+  <div class="body">
+    <div class="line"><b>標籤</b> {_html.escape(tags)}</div>
+    <div class="line"><b>回傳</b> <code>{resp_txt}</code></div>
+    {('<div class="line"><b>參數</b></div><ul class="prm">' + "".join(
+        f"<li>{x}</li>" for x in params) + "</ul>") if params else ""}
+  </div>
+</details>""")
+
+    schemas = "".join(
+        f'<div class="schema"><b>{_html.escape(name)}</b>'
+        f'<span class="d">{_html.escape(str(spec.get("description", "")))}</span>'
+        + ("<ul>" + "".join(
+            f'<li>{_html.escape(k)}'
+            f' <span class="ty">{_html.escape(str(v.get("type", v.get("$ref", "")).__class__.__name__ if isinstance(v.get("type"), dict) else v.get("type", "ref")))}</span>'
+            f'</li>' for k, v in (spec.get("properties") or {}).items()) + "</ul>"
+           if spec.get("properties") else "")
+        + "</div>"
+        for name, spec in COMPONENTS["schemas"].items()
+    )
+
+    return f"""<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vidgrab API</title>
+<style>
+  :root {{ color-scheme: dark light; }}
+  body {{ margin:0; padding:28px 32px 80px; font:14px/1.6 -apple-system,"PingFang TC",
+         "Noto Sans TC",system-ui,sans-serif; background:#0e1014; color:#e8ecf2;
+         max-width:1000px; }}
+  h1 {{ font-size:20px; margin:0 0 4px; }}
+  .meta {{ color:#8b94a3; font-size:12.5px; margin-bottom:20px; }}
+  .meta code {{ background:#1a1e26; padding:2px 6px; border-radius:5px; }}
+  h2 {{ font-size:15px; margin:26px 0 10px; color:#c9d2e0; }}
+  .ep {{ background:#161a21; border:1px solid #232833; border-radius:9px;
+         margin-bottom:7px; overflow:hidden; }}
+  .ep summary {{ padding:9px 13px; cursor:pointer; display:flex; gap:10px;
+                 align-items:center; flex-wrap:wrap; }}
+  .ep summary::marker {{ color:#5f6b7d; }}
+  .m {{ font:600 10.5px/1 ui-monospace,monospace; padding:4px 7px; border-radius:4px;
+        letter-spacing:.05em; flex:none; }}
+  .m.get {{ background:#1d3a5c; color:#8ec5ff; }}
+  .m.post {{ background:#1e4030; color:#84e0b0; }}
+  .m.put, .m.delete {{ background:#4a2530; color:#f2a0b0; }}
+  .path {{ font:12.5px/1 ui-monospace,monospace; color:#e8ecf2; }}
+  .sum {{ color:#8b94a3; font-size:12.5px; }}
+  .body {{ padding:4px 13px 12px 13px; border-top:1px solid #232833; }}
+  .line {{ margin:7px 0; font-size:12.5px; }}
+  .line b {{ color:#8b94a3; font-weight:500; margin-right:7px; }}
+  .ty {{ font:11px/1 ui-monospace,monospace; color:#7f8b9d; background:#1e232c;
+         padding:2px 5px; border-radius:4px; }}
+  .d {{ color:#6f7a8b; font-size:12px; }}
+  ul {{ margin:5px 0 0; padding-left:20px; }}
+  li {{ font:12px/1.8 ui-monospace,monospace; color:#c2cbd8; }}
+  .schemas {{ display:grid; gap:8px; }}
+  .schema {{ background:#161a21; border:1px solid #232833; border-radius:9px;
+             padding:10px 13px; }}
+  .schema b {{ font:600 12.5px/1 ui-monospace,monospace; color:#8ec5ff; }}
+  .schema .d {{ display:block; margin-top:3px; }}
+  a {{ color:#8ec5ff; }}
+  @media (prefers-color-scheme: light) {{
+    body {{ background:#f7f9fc; color:#1a2029; }}
+    .meta, .sum, .line b, .d {{ color:#5c6675; }}
+    .ep, .schema {{ background:#fff; border-color:#dde3ec; }}
+    .path {{ color:#1a2029; }}
+    .ty {{ background:#eef2f7; color:#5c6675; }}
+    li {{ color:#2c3542; }}
+    .m.get {{ background:#dbeafe; color:#1d4ed8; }}
+    .m.post {{ background:#d7f5e3; color:#157347; }}
+    .m.put, .m.delete {{ background:#fde2e6; color:#a3182f; }}
+    .ep summary::marker {{ color:#9aa5b5; }}
+  }}
+</style></head><body>
+<h1>vidgrab API</h1>
+<div class="meta">
+  OpenAPI {OPENAPI["openapi"]} · {sum(1 for ops in OPENAPI["paths"].values() for m in ops if m in ("get","post","put","delete"))} 個端點、{len(OPENAPI["paths"])} 條路徑 ·
+  機器可讀版本：<code><a href="/api/openapi.json">/api/openapi.json</a></code><br>
+  長時間的工作是非同步的：先 POST 拿 job id，再輪詢
+  <code>/api/job/{{id}}</code> 或訂閱 <code>/api/stream/{{id}}</code>。
+</div>
+<h2>端點</h2>
+{"".join(rows)}
+<h2>資料結構</h2>
+<div class="schemas">{schemas}</div>
+</body></html>"""
+
+
 OPENAPI: dict[str, Any] = {
     "openapi": "3.0.3",
+    "components": COMPONENTS,
     "info": {
         "title": "vidgrab API",
         "version": __version__,
@@ -402,11 +711,11 @@ OPENAPI: dict[str, Any] = {
     "paths": {
         "/api/version": {
             "get": {"tags": ["meta"], "summary": "版本與 build number",
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "版本資訊", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Version"}}}}}},
         },
         "/api/openapi.json": {
             "get": {"tags": ["meta"], "summary": "這份 OpenAPI 規格",
-                    "responses": {"200": {"description": "OpenAPI 3.0"}}},
+                    "responses": {"200": {"description": "OpenAPI 3.0 文件", "content": {"application/json": {"schema": {"type": "object"}}}}}},
         },
         "/file/{project}/{path}": {
             "get": {
@@ -417,13 +726,13 @@ OPENAPI: dict[str, Any] = {
                     {"name": "path", "in": "path", "required": True,
                      "schema": {"type": "string"}, "description": "例如 clips/xxx.mp4"},
                 ],
-                "responses": {"200": {"description": "檔案內容"},
-                              "404": {"description": "找不到"}},
+                "responses": {"200": {"description": "原始檔案（影片／縮圖）", "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}},
+                              "404": {"description": "找不到", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}},
             },
         },
         "/api/config": {
             "get": {"tags": ["meta"], "summary": "讀設定（含預設值）",
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "目前的設定", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Config"}}}}}},
             "post": {
                 "tags": ["meta"], "summary": "改設定，存過就成為預設",
                 "requestBody": {
@@ -432,7 +741,7 @@ OPENAPI: dict[str, Any] = {
                         "example": {"set": {"per": 30, "height": 720, "platform": "bilibili"}},
                     }}}
                 },
-                "responses": {"200": {"description": "已更新"}, "400": {"description": "值不合法"}},
+                "responses": {"200": {"description": "更新後的設定", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Config"}}}}, "400": {"description": "值不合法", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}},
             },
         },
         "/api/search": {
@@ -463,7 +772,7 @@ OPENAPI: dict[str, Any] = {
                         },
                     }}}
                 },
-                "responses": {"200": {"description": "回傳 {job: id}"}},
+                "responses": {"200": {"description": "已排入搜尋工作", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobRef"}}}}},
             },
         },
         "/api/pick": {
@@ -490,30 +799,30 @@ OPENAPI: dict[str, Any] = {
                         },
                     }}}
                 },
-                "responses": {"200": {"description": "回傳 {job: id}"}},
+                "responses": {"200": {"description": "已排入", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobRef"}}}}},
             },
         },
         "/api/job/{id}": {
             "get": {"tags": ["job"], "summary": "查工作狀態與完整訊息",
                     "parameters": [{"name": "id", "in": "path", "required": True,
                                     "schema": {"type": "string"}}],
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "工作狀態", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Job"}}}}}},
         },
         "/api/stream/{id}": {
             "get": {"tags": ["job"], "summary": "SSE 即時進度（log / done / error）",
                     "parameters": [{"name": "id", "in": "path", "required": True,
                                     "schema": {"type": "string"}}],
-                    "responses": {"200": {"description": "text/event-stream"}}},
+                    "responses": {"200": {"description": "SSE 串流：log / progress / done / error 四種事件", "content": {"text/event-stream": {"schema": {"type": "string"}}}}}},
         },
         "/api/projects": {
             "get": {"tags": ["project"], "summary": "列出所有專案",
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "專案清單", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/ProjectSummary"}}}}}}},
         },
         "/api/project/{name}": {
             "get": {"tags": ["project"], "summary": "單一專案完整內容（含候選與已下載片段）",
                     "parameters": [{"name": "name", "in": "path", "required": True,
                                     "schema": {"type": "string"}}],
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "專案內容", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Project"}}}}}},
         },
         "/api/item/{name}/{index}": {
             "get": {"tags": ["project"], "summary": "單一候選影片",
@@ -521,11 +830,11 @@ OPENAPI: dict[str, Any] = {
                         {"name": "name", "in": "path", "required": True, "schema": {"type": "string"}},
                         {"name": "index", "in": "path", "required": True, "schema": {"type": "integer"}},
                     ],
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "單一候選", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Item"}}}}}},
         },
         "/api/library/scan": {
             "get": {"tags": ["project"], "summary": "掃描 projects/，找出未納入與遺失的專案",
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "掃描結果", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectSummary"}}}}}},
         },
         "/api/asset/{project}/{index}": {
             "get": {
@@ -540,7 +849,7 @@ OPENAPI: dict[str, Any] = {
         },
         "/api/library": {
             "get": {"tags": ["project"], "summary": "素材庫（含改名、釘選、目前排序）",
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "素材庫", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Library"}}}}}},
             "post": {
                 "tags": ["project"],
                 "summary": "改名／釘選／排序／拖曳",
@@ -564,49 +873,49 @@ OPENAPI: dict[str, Any] = {
                         },
                     }}}
                 },
-                "responses": {"200": {"description": "回傳更新後的清單"},
-                              "400": {"description": "參數不合法"}},
+                "responses": {"200": {"description": "更新後的素材庫", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Library"}}}},
+                              "400": {"description": "參數不合法", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}},
             },
         },
         "/api/project/delete": {
             "post": {"tags": ["project"], "summary": "刪除整個專案（連同已下載檔案）",
-                     "responses": {"200": {"description": "OK"}}},
+                     "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectSummary"}}}}}},
         },
         "/api/delete-clip": {
             "post": {"tags": ["project"], "summary": "刪除單一片段檔",
-                     "responses": {"200": {"description": "OK"}}},
+                     "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Item"}}}}}},
         },
         "/api/refresh": {
             "post": {"tags": ["project"], "summary": "重新確認授權與影片是否還在（非同步）",
-                     "responses": {"200": {"description": "回傳 {job: id}"}}},
+                     "responses": {"200": {"description": "回傳 {job: id}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobRef"}}}}}},
         },
         "/api/export": {
             "get": {"tags": ["project"], "summary": "匯出全部設定與專案索引（備份用）",
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "已排入", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobRef"}}}}}},
         },
         "/api/login/start": {
             "post": {"tags": ["auth"], "summary": "產生 B 站登入 QR",
-                     "responses": {"200": {"description": "回傳 {key, image}"}}},
+                     "responses": {"200": {"description": "回傳 {key, image}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobRef"}}}}}},
         },
         "/api/login/qr": {
             "get": {"tags": ["auth"], "summary": "QR 圖（PNG）",
-                    "responses": {"200": {"description": "image/png"}}},
+                    "responses": {"200": {"description": "QR 圖（PNG）", "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}}}}},
         },
         "/api/login/poll": {
             "post": {"tags": ["auth"], "summary": "查掃碼結果",
-                     "responses": {"200": {"description": "status: waiting/scanned/ok/expired"}}},
+                     "responses": {"200": {"description": "status: waiting/scanned/ok/expired", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LoginStatus"}}}}}},
         },
         "/api/login/status": {
             "get": {"tags": ["auth"], "summary": "目前登入的帳號",
-                    "responses": {"200": {"description": "OK"}}},
+                    "responses": {"200": {"description": "登入結果", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LoginStatus"}}}}}},
         },
         "/api/login/logout": {
             "post": {"tags": ["auth"], "summary": "登出並刪除 cookie",
-                     "responses": {"200": {"description": "OK"}}},
+                     "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LoginStatus"}}}}}},
         },
         "/api/open": {
             "post": {"tags": ["project"], "summary": "用瀏覽器打開 HTML 清單",
-                     "responses": {"200": {"description": "OK"}}},
+                     "responses": {"200": {"description": "OK", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectSummary"}}}}}},
         },
     },
 }
@@ -778,6 +1087,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/openapi.json":
             self._send(200, json.dumps(OPENAPI, ensure_ascii=False, indent=2).encode())
+            return
+        if route in ("/docs", "/docs/"):
+            # 可瀏覽的 API 文件：不需要另開伺服器，也不需要外掛。
+            # 不引入 swagger-ui（要多帶一整包 CDN 資源），自己畫一份：
+            # 端點、參數、回應結構、可展開的範例。
+            self._send(200, _docs_html().encode("utf-8"),
+                       "text/html; charset=utf-8")
             return
         if route == "/api/export":
             from . import auth as _auth

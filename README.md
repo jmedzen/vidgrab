@@ -499,8 +499,15 @@ CLI 和 API 共用。重開容器也還在。
 
 ## REST API
 
-所有功能都有 API。完整規格在 **<http://127.0.0.1:8310/api/openapi.json>**
-（OpenAPI 3.0，可直接匯入 Postman，或餵給 LLM 讓它自己學會怎麼呼叫）。
+所有功能都有 API。
+
+- **可瀏覽的文件**：<http://127.0.0.1:8310/docs>
+- **機器可讀的規格**：<http://127.0.0.1:8310/api/openapi.json>
+  （OpenAPI 3.0.3，可直接匯入 Postman／Insomnia，或餵給 LLM 讓它自己學會怎麼呼叫）
+
+規格裡每個回 JSON 的端點都寫了**回應結構**（不只是「會回 200」），
+非 JSON 的端點（SSE、PNG、影片檔）也標了正確的 content-type。
+文件頁不載任何 CDN 資源 —— 這個工具本身就不依賴外部服務。
 
 長時間的工作（搜尋、下載）是**非同步**的：POST 拿 `job` id → 輪詢 `/api/job/{id}`，
 或訂閱 `/api/stream/{id}` 的 SSE 看即時進度。

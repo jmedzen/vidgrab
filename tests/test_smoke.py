@@ -2625,3 +2625,176 @@ def test_action_pill_only_shows_after_scroll():
     assert "mainscroll" in src, "沒監聽 .mainscroll（真正在捲的那層）"
     assert "dataset.visible" in src or "data-visible" in src
     assert "#actionpill" not in src or True
+
+
+# ---------------------------------------------------------------- OpenAPI
+
+
+def test_openapi_every_json_endpoint_has_response_schema(web):
+    """每個回 JSON 的端點都要寫出回應結構。
+
+    實際狀況：原本 26 個端點的 200 全都只寫 {"description": "OK"}，
+    外部工具（Postman、程式碼產生器）知道怎麼呼叫，
+    卻不知道會拿回什麼，等於只能看不能用的文件。
+    """
+    spec = get(web + "/api/openapi.json")
+
+    # 這幾個本來就不是 JSON，不該要求 application/json schema
+    non_json = {"/api/openapi.json", "/file/{project}/{path}",
+                "/api/stream/{id}", "/api/asset/{project}/{index}",
+                "/api/login/qr"}
+
+    missing = []
+    for path, ops in spec["paths"].items():
+        if path in non_json:
+            continue
+        for method, op in ops.items():
+            if method not in ("get", "post", "put", "delete"):
+                continue
+            if "content" not in op.get("responses", {}).get("200", {}):
+                missing.append(f"{method.upper()} {path}")
+    assert not missing, f"這些端點沒寫回應結構：{missing}"
+
+
+def test_openapi_binary_endpoints_declare_content_type(web):
+    """非 JSON 的端點也要標對 content-type，否則工具會當成 JSON 解析。"""
+    spec = get(web + "/api/openapi.json")
+    expect = {
+        "/api/stream/{id}": "text/event-stream",
+        "/api/login/qr": "image/png",
+        "/file/{project}/{path}": "application/octet-stream",
+    }
+    for path, ctype in expect.items():
+        ops = spec["paths"].get(path, {})
+        op = ops.get("get") or next(iter(ops.values()))
+        content = op.get("responses", {}).get("200", {}).get("content", {})
+        assert ctype in content, f"{path} 的 content-type 應為 {ctype}，實際 {list(content)}"
+
+
+def test_openapi_schemas_are_referenced_not_orphaned(web):
+    """定義的 schema 要真的被用到，不要留一堆沒人引用的孤兒。"""
+    import json as _json
+
+    spec = get(web + "/api/openapi.json")
+    blob = _json.dumps(spec)
+    for name in spec["components"]["schemas"]:
+        assert f"#/components/schemas/{name}" in blob, f"{name} 定義了卻沒被引用"
+
+
+def test_docs_page_renders(web):
+    """要有可瀏覽的文件頁，而且列出所有端點。"""
+    import urllib.request as _u
+
+    with _u.urlopen(web + "/docs", timeout=15) as r:
+        assert r.status == 200
+        body = r.read().decode("utf-8")
+    spec = get(web + "/api/openapi.json")
+    for path in spec["paths"]:
+        assert path in body, f"/docs 沒列出 {path}"
+    assert "OpenAPI 3.0.3" in body
+
+
+def test_docs_page_has_no_external_dependency(web):
+    """/docs 不能依賴 CDN —— 這個工具的取向就是不要外部服務。"""
+    import urllib.request as _u
+
+    with _u.urlopen(web + "/docs", timeout=15) as r:
+        body = r.read().decode("utf-8")
+    for bad in ("cdn.", "unpkg.com", "jsdelivr", "googleapis.com"):
+        assert bad not in body, f"/docs 載了外部資源：{bad}"
+
+
+def _walk_errors(data, schema, spec, path="$"):
+    """拿真實資料去對 schema，回傳不符合的地方。
+
+    只做這個專案用得到的部分：type、properties、required、items、$ref。
+    不引入 jsonschema 相依 —— 少一個套件，測試跑得快也少一個壞掉的來源。
+    """
+    errs: list[str] = []
+    if not isinstance(schema, dict):
+        return errs
+
+    ref = schema.get("$ref")
+    if ref:
+        target = spec
+        for part in ref.lstrip("#/").split("/"):
+            target = target[part]
+        return _walk_errors(data, target, spec, path)
+
+    t = schema.get("type")
+    if isinstance(t, list):
+        ok = any(_type_ok(data, x) for x in t)
+        if not ok:
+            errs.append(f"{path}: 型別應為 {'/'.join(t)}，實際 {type(data).__name__}")
+    elif t and not _type_ok(data, t):
+        errs.append(f"{path}: 型別應為 {t}，實際 {type(data).__name__}")
+        return errs
+
+    if isinstance(data, dict):
+        for key in schema.get("required") or []:
+            if key not in data:
+                errs.append(f"{path}: 缺少必填欄位 {key}")
+        for key, sub in (schema.get("properties") or {}).items():
+            if key in data:
+                errs.extend(_walk_errors(data[key], sub, spec, f"{path}.{key}"))
+    if isinstance(data, list) and schema.get("items"):
+        for i, one in enumerate(data[:3]):
+            errs.extend(_walk_errors(one, schema["items"], spec, f"{path}[{i}]"))
+    return errs
+
+
+def _type_ok(value, t: str) -> bool:
+    if t == "object":
+        return isinstance(value, dict)
+    if t == "array":
+        return isinstance(value, list)
+    if t == "string":
+        return isinstance(value, str)
+    if t == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if t == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if t == "boolean":
+        return isinstance(value, bool)
+    if t == "null":
+        return value is None
+    return True
+
+
+def test_real_responses_match_openapi_schema(web, tmp_path):
+    """拿真實回應去驗 schema —— 文件不能跟程式碼走鐘。
+
+    這條是關鍵：schema 寫得再漂亮，只要跟實際回傳不一致，
+    外部工具照著寫就會壞。所以直接打真的 API，把拿回來的 JSON
+    丟進 schema 裡走一遍。
+    """
+    import json as _json
+    import urllib.request as _u
+
+    _make_project(tmp_path, name="oa-proj")
+    spec = get(web + "/api/openapi.json")
+
+    def fetch(path):
+        with _u.urlopen(web + path, timeout=30) as r:
+            return _json.loads(r.read())
+
+    cases = [
+        ("/api/version", "Version"),
+        ("/api/config", "Config"),
+        ("/api/projects", "ProjectSummary"),
+        ("/api/library", "Library"),
+        ("/api/project/oa-proj", "Project"),
+        ("/api/item/oa-proj/0", "Item"),
+    ]
+    schemas = spec["components"]["schemas"]
+    problems: list[str] = []
+    for path, name in cases:
+        data = fetch(path)
+        # 清單端點回的是陣列，用 array 包一層再驗
+        schema = {"type": "array", "items": {"$ref": f"#/components/schemas/{name}"}} \
+            if isinstance(data, list) else {"$ref": f"#/components/schemas/{name}"}
+        errs = _walk_errors(data, schema, spec, path)
+        if errs:
+            problems.extend(errs)
+
+    assert not problems, "實際回應與 OpenAPI 不符：\n" + "\n".join(problems[:12])
