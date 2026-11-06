@@ -312,6 +312,11 @@ def run_pick(
     order = list(indexes)  # 預先算好位置，進度回呼會很頻繁
     for n in order:
         pos = order.index(n) + 1
+        if not 0 <= n < len(items):
+            # 呼叫端已經擋過，這裡是最後一道：寧可回一句人話，
+            # 也不要讓 IndexError 冒到工作層變成「完成了但什麼都沒有」。
+            emit(f"✗ 編號 {n} 超出範圍（0–{len(items) - 1}），略過")
+            continue
         item = items[n]
         emit(f"[{n + 1:02d}] {item.title} · {fmt_duration(item.duration)} · {item.license_label or '授權未標示'}")
         if item.license_kind in ("unknown", "none"):

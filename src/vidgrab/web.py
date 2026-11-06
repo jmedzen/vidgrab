@@ -1347,9 +1347,23 @@ class Handler(BaseHTTPRequestHandler):
             if not project:
                 self._json({"error": "找不到專案"}, 404)
                 return
-            indexes = [int(i) for i in (body.get("indexes") or [])]
+            try:
+                indexes = [int(i) for i in (body.get("indexes") or [])]
+            except (TypeError, ValueError):
+                self._json({"error": "indexes 必須是整數陣列"}, 400)
+                return
             if not indexes:
+                # 少了這個 return 就會「送完 400 再起一個 job」，
+                # 連線已被標記回應完成，第二次寫入直接讓請求爛掉。
                 self._json({"error": "請先勾選影片"}, 400)
+                return
+            # 索引要先對得上候選，否則工作會在背景丟 IndexError，
+            # 使用者只看到「已完成」卻什麼都沒下載（實際踩過）。
+            _, items = tasks.load_project(project)
+            bad = [i for i in indexes if i < 0 or i >= len(items)]
+            if bad:
+                self._json({"error": f"編號超出範圍（0–{len(items) - 1}）：{bad}"}, 400)
+                return
             from . import config as cfg
 
             opts = resolve_pick_options(body, cfg.load())

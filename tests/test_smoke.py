@@ -2883,3 +2883,62 @@ def test_clip_points_back_to_its_item(web):
     spec = get(web + "/api/openapi.json")
     props = spec["components"]["schemas"]["Clip"]["properties"]
     assert "item_index" in props, "Clip 少了 item_index"
+
+
+# ---------------------------------------------------------------- pick 的輸入驗證
+
+
+def test_pick_rejects_bad_indexes_before_starting_job(web, tmp_path):
+    """索引不合法要在「開始工作之前」就擋下來。
+
+    實際踩到：indexes:[999] 回 200 + job id，工作跑完顯示完成，
+    但背後是 IndexError，什麼都沒下載。
+    """
+    import json as _json
+    import urllib.error as _ue
+    import urllib.request as _u
+
+    _make_project(tmp_path, name="pk-proj")
+
+    def post(payload):
+        req = _u.Request(web + "/api/pick", method="POST",
+                         data=_json.dumps(payload).encode(),
+                         headers={"Content-Type": "application/json"})
+        try:
+            with _u.urlopen(req, timeout=20) as r:
+                return r.status, _json.loads(r.read())
+        except _ue.HTTPError as e:
+            return e.code, _json.loads(e.read())
+
+    code, body = post({"project": "pk-proj", "indexes": [999]})
+    assert code == 400, f"越界索引應回 400，實際 {code}"
+    assert "超出範圍" in body["error"], body
+
+    code, body = post({"project": "pk-proj", "indexes": []})
+    assert code == 400 and "勾選" in body["error"], body
+
+    code, body = post({"project": "pk-proj", "indexes": ["x"]})
+    assert code == 400, f"非整數索引應回 400，實際 {code}"
+
+
+def test_error_branches_always_return():
+    """回完錯誤一定要 return。
+
+    少一個 return 就會「送完 400 又繼續往下起 job」，
+    連線已經標記回應完成，第二次寫入直接把請求弄爛。
+    """
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "web.py").read_text()
+    lines = src.split("\n")
+    bad = []
+    for i, line in enumerate(lines):
+        if not re.search(r"self\._json\(.*,\s*[45]\d\d\)", line):
+            continue
+        tail = "\n".join(lines[i + 1:i + 3])
+        # if/else 形式是合法的（else 裡會回，之後還有 return）
+        if "return" in tail or "else:" in tail:
+            continue
+        bad.append(f"L{i + 1}: {line.strip()[:60]}")
+    assert not bad, "這些錯誤分支回完沒有 return：\n" + "\n".join(bad)
