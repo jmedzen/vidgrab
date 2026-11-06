@@ -9,7 +9,9 @@
 - **介面內直接播放**：下載完不必離開網頁就能預覽、跳到你想確認的那一格
 - **6 組主題**（3 深 3 淺）＋ 可拖曳側欄寬度，選擇會記住
 - **網頁介面 + 完整 REST API**：外部工具可以直接調用所有功能
-- **設定存一次就變預設**：CLI 與 API 共用同一份 `config.json`
+- **設定存一次就變預設**：CLI 與 API 共用同一份 `config.json`（35 項）
+- **失敗會自己重試**：下載／搜尋／抓畫面各自有次數與退避上限
+- **缺檔會標出來**：切片被刪或搬走時仍然列出，但不給點下去 404 的連結
 - **可包成 Docker**：`docker compose up -d` 就跑起來
 
 ---
@@ -172,12 +174,34 @@ brew install ffmpeg uv
 ./vidgrab purge demo-taipei        # 篩掉教學／課程
 ./vidgrab prune demo-taipei        # 清孤兒檔案
 ./vidgrab forget demo-taipei       # 從清單移除記錄
+./vidgrab refresh demo-taipei      # 回頭確認授權與影片還在不在
 ./vidgrab thumbs                   # 補片段縮圖
+./vidgrab open demo-taipei         # 用瀏覽器打開該專案的 HTML 清單
 ./vidgrab list          # 列出所有專案
 ./vidgrab login         # 掃碼登入 B 站
+./vidgrab logout        # 登出並刪掉 cookie
+./vidgrab config        # 看／改預設設定
 ./vidgrab build         # 版本與 build number
-./vidgrab test          # 跑測試 + Dockerfile 檢查
+./vidgrab test          # 跑測試 + 前端一致性 + Dockerfile 檢查
 ```
+
+`login` / `logout` 成對存在：`login` 寫入 `auth/` 下的 cookie，`logout` 把它刪掉。
+換帳號、或懷疑 cookie 壞掉時就 `logout` 再 `login`。
+
+### 這件事沒有登入機制，所以不預設對外開放
+
+`vidgrab web` 預設綁 `127.0.0.1`。**這個介面本身沒有任何認證**，
+綁到 `0.0.0.0` 等於把整個素材庫、下載能力、B 站登入狀態開放給同網段的任何人。
+所以綁非本機位址會被**拒絕**，除非你明講：
+
+```bash
+./vidgrab web --host 0.0.0.0 --allow-lan   # 我了解風險，還是要開
+```
+
+不帶 `--allow-lan` 會直接 `exit 2` 並說明原因，不會默默幫你開。
+（Docker 映像的 `CMD` 已經帶了 `--allow-lan`——容器裡必須綁 `0.0.0.0` 才連得到，
+對外曝露的範圍由 `docker run -p` 決定。所以 **`-p 8310:8310` 等於對整個區網開放**，
+只想本機用就寫 `-p 127.0.0.1:8310:8310`。）
 
 ---
 
@@ -291,6 +315,10 @@ agent 可以把它存進自己的記憶，之後永遠找得回來。
 | `timeout` | 批次逾時 | **是** |
 | `missing_ffmpeg` | 缺 ffmpeg | 否 |
 | `internal` | 未預期錯誤 | **是** |
+| `interrupted` | 使用者按 Ctrl-C 中斷（結束碼 `130`） | **是** |
+
+`interrupted` 只出現在 `KeyboardInterrupt`，而且已經抓好的片段都會保留，
+所以 agent 重跑不會白費前面的工作。
 
 ### 在已下載的素材裡搜尋
 
@@ -343,8 +371,28 @@ B 站是簡體站，用繁體字搜尋常常一支都搜不到：
 ```
 
 - **兩條進度**：細的是當前影片，粗的是整個作業（3 支裡的第幾支）
+- **每支影片自己的進度條**：卡片上直接顯示，看得出是哪一支在跑、哪一支失敗
 - **下載途中就會出現新片段與截圖**，不必等整個作業跑完
 - 頂部細條保留，滾動時也看得到有事在跑
+
+#### 日誌視窗
+
+畫面下緣的 dock 會即時顯示「現在在做什麼」，預設**展開**，可以收起來。
+收合的選擇會記住（`localStorage`），重整後不會又跳出來擋畫面。
+顯示的是人話（`第 2/3 支 · 47%`），不是原始 JSON —— 後端把人話與進度分成
+兩種 SSE 事件，前端只把該給人看的放進日誌視窗。
+
+#### 浮動操作列
+
+列表往下滾之後，最上面那排「切片段／確認授權」就看不到了。
+右下角有一顆 pill 會浮出來，只在**滾離頂端之後**才出現（頂端本來就有同樣的按鈕，
+常駐只會擋住右側的播放／下載）：
+
+```
+已選 3 支   [切片段]  [確認授權]  [↑ 頂端]
+```
+
+沒勾選時「切片段」是 disabled，不會讓你點了沒反應。手機寬度時自動變成底部橫條。
 
 #### 一個實話：切片下載沒有真實百分比
 
@@ -414,6 +462,40 @@ yt-dlp 只在**結束時**吐一行進度，中間完全是空的。
 
 `vault` 的 JSON 裡每個片段也帶 `orientation: portrait | landscape`，
 agent 選素材時不必自己比大小。
+
+### 切片檔不見了會標出來，不假裝還在
+
+手動刪掉一支 mp4、被同步工具搬走、或外接碟沒插，清單裡**仍然會列出那一列**
+（讓你知道「這裡本來有東西」），但標記 `missing`：
+
+- 前端把檔名畫上**刪除線**、整列變淡，播放／下載按鈕換成「檔案不見了」——
+  不會給你一個點下去 404 的連結
+- API 的 `Clip` 多一個 `missing` 布林欄位，`OpenAPI` 也寫了說明
+- 檔案放回來，`missing` 自動變回 `false`，連結也回來
+
+> **為什麼不直接藏起來**
+>
+> 直接把那一列藏掉的話，看起來就像「我當初根本沒下載這一段」——
+> 但實際上你下載過、只是檔案不在了。這兩件事要分得出來。
+>
+> 也不能若無其事地照樣給連結：實際踩過的是整排「播放／下載」點下去全是 404，
+> 而且沒有任何提示說明為什麼。
+
+### 下載失敗會自己重試
+
+抓取失敗不是直接放棄，而是退避重試（間隔 1、2、4… 秒，有上限）：
+
+| 項目 | 預設 | 為什麼是這個數字 |
+|---|---|---|
+| `download_retries` | `10` | 大檔、長連線最容易抽動 |
+| `search_retries` | `3` | 只是打一次 API，給太多次只是讓人乾等 |
+| `frame_retries` | `2` | 抽一格畫面，重試邊際效益低 |
+| `retry_max_wait` | `20` 秒 | 退避的天花板，不會等到天荒地老 |
+
+下載卡的狀態會變成 `重試 3/10`，看得出來是在重試而不是卡住。
+只有**可重試**的失敗才會重試（比對錯誤訊息裡的關鍵字：`HTTP 5xx`、`429`、
+`timeout`、`connection`、「暫時不可用」這類），
+像「參數寫錯」這種重試一百次也不會好的就不會浪費時間。
 
 ### 清理孤兒檔案
 
@@ -492,8 +574,31 @@ CLI 和 API 共用。重開容器也還在。
 | `frame_count` | `3` | 抓幾格 |
 | `host` / `port` | `127.0.0.1` / `8310` | 服務位址 |
 
+以下幾組平常不用動，但慢網路、超大檔、或機器很閒／很忙時會想調：
+
+| 項目 | 預設 | 說明 |
+|---|---|---|
+| `download_retries` | `10` | 下載失敗重試次數（1–50） |
+| `search_retries` | `3` | 搜尋失敗重試次數（1–20） |
+| `frame_retries` | `2` | 抓畫面重試次數（1–10） |
+| `retry_max_wait` | `20` | 重試退避上限（秒） |
+| `probe_timeout` | `180` | 問「這支多長、幾解析度」的逾時（秒） |
+| `clip_timeout` | `7200` | 切一段的逾時（秒） |
+| `full_timeout` | `14400` | 整支下載的逾時（秒） |
+| `max_finished_jobs` | `40` | 記憶體留幾筆已完成的作業 |
+| `job_ttl_minutes` | `30` | 完成的作業留多久（分） |
+| `max_job_messages` | `2000` | 單一作業的日誌行數上限 |
+| `auto_refresh_ms` | `3000` | 側欄專案清單多久看一次（毫秒） |
+| `project_refresh_ms` | `2500` | 目前專案的片段多久看一次（毫秒） |
+| `log_max_lines` | `2000` | log 視窗保留幾行 |
+| `sidebar_default_width` | `330` | 側欄預設寬度（px，200–800） |
+
 環境變數的優先序比設定檔高：`VIDGRAB_HOST`、`VIDGRAB_PORT`、`VIDGRAB_BUILD`、
-`VIDGRAB_HOME`、`VIDGRAB_AUTH_DIR`、`VIDGRAB_CONFIG`。
+`VIDGRAB_HOME`、`VIDGRAB_AUTH_DIR`、`VIDGRAB_CONFIG`、`VIDGRAB_YTDLP`
+（最後一個是指定 yt-dlp 執行檔路徑，路徑不存在就退回內建的）。
+
+讀設定時是「出廠預設 + 檔案覆蓋」：檔案裡沒有的項目自動用預設值，
+所以升級後新增的設定不會被舊的 `config.json` 卡住或缺欄位。
 
 ---
 
@@ -626,6 +731,24 @@ docker exec vidgrab vidgrab build                 # 確認跑的是哪次建置
 資料都掛在 `/data`：`projects/`（素材）、`auth/`（cookie）、`config.json`（設定）。
 容器以非 root（uid 1000）執行。
 
+### 容器版的曝露範圍由 `-p` 決定
+
+容器內的 `CMD` 是 `vidgrab web --no-open --allow-lan` —— 容器裡一定要綁
+`0.0.0.0`，不然外面的 port 映射打不進來。所以**真正決定誰連得到的是 `-p`**：
+
+| 寫法 | 誰連得到 |
+|---|---|
+| `-p 127.0.0.1:8310:8310` | 只有這台機器（建議） |
+| `-p 8310:8310` | **整個區網** —— 這個介面沒有密碼 |
+
+`docker-compose.yml` 目前寫的是後者。若只是自己在本機用，改成前者即可：
+
+```yaml
+    ports:
+      - "127.0.0.1:8310:8310"
+```
+
+
 ---
 
 ## 授權這件事（重要）
@@ -755,11 +878,53 @@ Docker 建置會自動帶入，容器內 `vidgrab build` 就知道跑的是哪�
 ## 開發
 
 ```bash
-./vidgrab test                     # pytest + Dockerfile 靜態檢查
+./vidgrab test                     # pytest + 前端一致性 + Dockerfile 靜態檢查
 ./vidgrab test --ui                # 另外驗證介面（自動起臨時 Chromium）
 python tools/stamp_build.py        # 手動寫入 build number
 python tools/check_docker.py       # 只跑 Dockerfile 檢查
+tools/check_frontend.sh            # 只比對「前端產物 vs 原始碼」
+python tools/make_fixture.py /tmp/x   # 造一份假素材庫（給 UI 檢查用，不碰真資料）
 ```
+
+目前 `tests/` 有 **155** 個測試，全部離線（不打 B 站、不抓 YouTube）。
+
+### 前端
+
+介面是 React 19 + TypeScript + Vite，原始碼在 `web/src/`，
+**打包產物直接輸出到 `src/vidgrab/static/`**（`vite.config.ts` 的 `outDir`），
+所以 `pip install` 之後就帶著走，不需要 node。
+
+```bash
+cd web && npm install      # 只有第一次
+npm run build              # tsc --noEmit && vite build && 寫入 .build-stamp
+npm run typecheck          # 只做型別檢查
+```
+
+`web/stamp.mjs` 會把 `web/src` 的內容雜湊寫進 `static/.build-stamp`，
+`tools/check_frontend.sh` 再拿它跟現在的原始碼比對 —— 這就是
+「改了 `.tsx` 卻忘記 `npm run build`」會被 `./vidgrab test` 抓出來的原因。
+`vidgrab test` 會自動跑這項檢查，所以不必記得手動跑。
+
+專案結構：
+
+```
+src/vidgrab/
+├── cli.py       命令列
+├── web.py       Web UI + REST API（含 OpenAPI）
+├── tasks.py     搜尋／下載流程（CLI 與 Web 共用）
+├── sources.py   B 站 wbi 簽名搜尋、YouTube yt-dlp 搜尋
+├── media.py     下載、切片、抓畫面、重試退避
+├── config.py    持久化設定（35 項，含範圍與型別檢查）
+├── library.py   素材庫（改名／排序／釘選）
+├── agent.py     agent 介面（vault／batch／find，一律 JSON）
+├── auth.py      B 站掃碼登入
+├── report.py    HTML／CSV 清單
+├── zh.py        繁體→簡體對照表（只為搜尋命中）
+└── models.py    資料結構與工具
+```
+
+前端（`web/src/`）自成一份 TS 專案：`App.tsx` ＋ `components/`（`ItemCard`、
+`ProjectView`、`Console`、`DownloadCard`、`Sidebar`…）＋ `lib/`（狀態、主題、側欄拖曳）。
 
 ### 關於瀏覽器
 
@@ -776,22 +941,6 @@ vidgrab 開介面、開報告、開 QR 圖，一律用 `webbrowser.open()`，
 python tools/check_ui.py                 # 連現有的 CDP（9222）
 python tools/check_ui.py --launch        # 自己起一個臨時的（建議）
 python tools/check_ui.py --launch --headful   # 想看到畫面就加這個
-```
-
-專案結構：
-
-```
-src/vidgrab/
-├── cli.py       命令列
-├── web.py       Web UI + REST API（含 OpenAPI）
-├── tasks.py     搜尋／下載流程（CLI 與 Web 共用）
-├── sources.py   B 站 wbi 簽名搜尋、YouTube yt-dlp 搜尋
-├── media.py     下載、切片、抓畫面
-├── config.py    持久化設定
-├── library.py   素材庫（改名／排序／釘選）
-├── auth.py      B 站掃碼登入
-├── report.py    HTML／CSV 清單
-└── models.py    資料結構與工具
 ```
 
 CI（`.github/workflows/test.yml`）在 Python 3.9／3.12 上跑測試，
@@ -811,3 +960,9 @@ CI（`.github/workflows/test.yml`）在 Python 3.9／3.12 上跑測試，
 | 容器裡抓不到 1080p | 容器內也要登入：網頁按「掃碼登入」 |
 | 設定沒生效 | `./vidgrab config` 看實際值；環境變數優先序比設定檔高 |
 | 想換 port | `./vidgrab web --port 8080` 或 `./vidgrab config --set port=8080` |
+| 綁 `0.0.0.0` 被拒絕 | 這是刻意的：介面沒有登入機制。真要在區網開，加 `--allow-lan` |
+| 片段列變成淡色、寫「檔案不見了」 | 那個 mp4 被刪或搬走了。`missing` 旗標，把檔案放回原路徑就自動恢復（API 的 `missing` 會變回 `false`） |
+| 下載卡一直顯示「重試 N/10」 | 在退避重試（1、2、4…最多 20 秒），不是卡住。連續失敗到上限才會放棄；次數可用 `--set download_retries` 調 |
+| `vidgrab test` 說前端產物沒跟上 | 改了 `web/src` 沒 build。`cd web && npm run build` |
+| `vidgrab build` 顯示的版本比 git 舊 | 清 `src/vidgrab/__pycache__`（用 `cp` 還原檔案會保留舊 mtime，Python 會用過期的 `.pyc`） |
+| 改了 `web/src` 但網頁沒變 | 同上，要 `npm run build`；瀏覽器再 hard reload 一次（檔名帶 hash，通常重整即可） |
