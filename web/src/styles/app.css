@@ -120,7 +120,12 @@
   }
   .app {
     display:grid; grid-template-columns:var(--sidebar, 330px) 1fr;
-    height:100vh; min-height:0;
+    /* grid-template-rows 一定要寫死 1fr：只給 height 的話，
+       列高會被內容撐開（.app 量到 1566px），
+       main 的 overflow:hidden 就等於失效，整頁跟著捲、
+       貼底的日誌 dock 會被推到視窗外（實際踩過）。 */
+    grid-template-rows:1fr;
+    height:100vh; max-height:100vh; min-height:0; overflow:hidden;
   }
   aside {
     position:relative; border-right:1px solid var(--line); background:var(--aside-bg);
@@ -146,7 +151,13 @@
   /* min-height:0 不能省：grid 子項預設 min-height:auto，
      內容一高就會把 main 撐破，overflow-y:auto 等於沒作用，
      視窗矮的時候下面的按鈕會被切掉、點不到（實際踩過）。 */
-  main { overflow-y:auto; min-height:0; padding:22px 26px 80px; }
+  /* main 是直的 flex：上面內容自己捲，下面的日誌 dock 固定貼底。
+     純 overflow-y:auto + sticky 在這裡不成立（父層是 100vh grid），
+     dock 會量到 0 高度 —— 實際踩過。 */
+  main {
+    display:flex; flex-direction:column; overflow:hidden; min-height:0;
+    padding:0;
+  }
   h1 { font-size:19px; margin:0 0 2px; letter-spacing:.04em; }
   h1 span { color:var(--accent); }
   .tagline { color:var(--muted); font-size:12px; margin-bottom:4px; }
@@ -291,13 +302,42 @@
     height:100%; width:0%; background:var(--muted); border-radius:999px; transition:width .25s ease;
   }
   #dlmeta { display:flex; justify-content:space-between; margin-top:8px; font-size:11.5px; color:var(--muted); }
-  /* 進度卡出現時把控制台往上抬，否則會被蓋住、只露出半截字 */
-  body.dl-on #console { bottom:104px; }
+  /* 日誌 dock 現在在文件流裡（不是 fixed），不再需要「往上抬」；
+     下載進度卡會自己疊在上面。 */
+  /* 日誌視窗：之前寫死 display:none，而且沒有任何程式把它打開，
+     等於「跑得再熱鬧你也看不到」—— 進度、錯誤、抓取結果全被吞掉。
+
+     改用文件流裡的 dock（不是 position:fixed）：
+     固定定位會浮在內容上、蓋住按鈕，而且貼著視窗底部時
+     跟標題列之間會留一段空白。 */
+  #logdock {
+    flex:0 0 auto; z-index:50;
+    border-top:1px solid var(--line);
+    /* 底交給 #console 自己上色（主題色要在那裡，
+       不然每個主題看起來都一樣）；dock 只負責陰影與邊界。 */
+    box-shadow:0 -8px 20px rgba(0,0,0,.14);
+  }
+  #consolebar {
+    height:30px; display:flex; align-items:center; gap:10px; padding:0 12px 0 16px;
+    background:var(--console-bg);
+    font:11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+    color:var(--console-fg, var(--muted)); cursor:pointer; user-select:none;
+  }
+  #consolebar .cb-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #consolebar .cb-toggle {
+    flex:none; background:none; border:none; color:inherit; cursor:pointer;
+    font:inherit; padding:0 10px; border-radius:5px;
+    /* 可點高度至少 28px：11px 字 + 上下留白才不會小到不好按 */
+    min-height:28px; min-width:64px;
+  }
+  #consolebar .cb-toggle:hover { background:var(--panel2); }
+  #logdock.closed #console { display:none; }
   #console {
-    position:fixed; left:var(--sidebar); right:0; bottom:0; max-height:190px; display:none;
-    background:var(--console-bg); border-top:1px solid var(--line); overflow-y:auto;
-    /* 跟著主題走：原本寫死深色，淺色主題下會變成深灰字印在黑底上（對比只有 3.5:1） */
-    font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; padding:10px 16px; z-index:50;
+    min-height:44px; max-height:190px; overflow-y:auto;
+    /* 主題色要在這裡上，不然每個主題的日誌底色都一樣 */
+    background:var(--console-bg);
+    /* 跟著主題走：原本寫死深色，淺色主題下會變成深灰字印在黑底上 */
+    font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; padding:8px 16px;
   }
   #console .ln { color:var(--console-fg, var(--muted)); white-space:pre-wrap; }
   #console .ln.err { color:var(--bad); }
@@ -492,3 +532,49 @@
     font-variant-numeric:tabular-nums;
   }
   .projrow.active .n, .projrow.active .nc { color:var(--text); }
+
+  /* ---------------------------------------------------- 浮動操作列
+     長列表的痛點：要動手就得先滾回最上面。
+     這顆 pill 常駐右下角，勾選數量即時顯示。 */
+  #actionpill {
+    position:fixed; right:26px; bottom:34px; z-index:60;
+    /* 沒滾動時不出現：頂端本來就有一排一樣的按鈕，
+       常駐只會擋住列表右側的「播放／下載」。 */
+    opacity:0; transform:translateY(12px); pointer-events:none;
+    transition:opacity .18s ease, transform .18s ease;
+    display:flex; align-items:center; gap:8px;
+    padding:8px 10px 8px 14px; border-radius:999px;
+    background:var(--panel); border:1px solid var(--line);
+    box-shadow:0 6px 24px rgba(0,0,0,.28);
+    max-width:calc(100vw - 60px);
+  }
+  #actionpill[data-visible="1"] {
+    opacity:1; transform:none; pointer-events:auto;
+  }
+  #actionpill .ap-count {
+    font-size:12px; color:var(--muted); white-space:nowrap;
+    font-variant-numeric:tabular-nums;
+  }
+  #actionpill .primary {
+    width:auto; padding:7px 16px; border-radius:999px; margin:0;
+  }
+  #actionpill .ghost { margin:0; }
+  /* 日誌視窗展開時要讓開，不然 pill 會被壓在下面 */
+  @media (max-width:760px) {
+    #actionpill { right:12px; left:12px; bottom:16px; justify-content:center; }
+  }
+
+  /* main 的內容層：自己捲，dock 留在下面不跟著跑 */
+  .mainscroll {
+    flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden;
+    padding:22px 26px 40px;
+  }
+  #console .ln.empty { opacity:.55; font-style:italic; }
+
+  /* main 是 grid 子項，預設會被內容決定高度。
+     加上 align-self:stretch + height:100% 才會吃滿那一列，
+     否則 flex column + overflow 的日誌 dock 量到的可用高度只有幾十 px
+     （實際踩過：log 視窗只分到 62px）。 */
+  .app > main {
+    align-self:stretch; height:100%; min-height:0; box-sizing:border-box;
+  }

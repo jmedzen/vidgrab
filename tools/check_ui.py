@@ -723,7 +723,15 @@ def _run() -> int:
         .filter(e => { const r = e.getBoundingClientRect();
                        return r.width > 0 && (r.height < 28 || r.width < 26); }).length
     """)
-    check("按鈕不會小到難點", (small or 0) == 0, f"{small} 個偏小")
+    detail = tab.js("""
+      JSON.stringify(Array.from(document.querySelectorAll('button, a.mini'))
+        .filter(e => { const r = e.getBoundingClientRect();
+                       return r.width > 0 && (r.height < 28 || r.width < 26); })
+        .map(e => (e.id || e.className || e.tagName) + ':' +
+                  Math.round(e.getBoundingClientRect().width) + 'x' +
+                  Math.round(e.getBoundingClientRect().height)))
+    """)
+    check("按鈕不會小到難點", (small or 0) == 0, f"{small} 個偏小 {detail or ''}")
 
     print("── 素材庫面板")
     # 先從 API 取狀態（面板還沒開，DOM 是空的），測完再還原
@@ -1104,6 +1112,77 @@ def _run() -> int:
     check("設定面板有渲染出輸入框", (shown or 0) > 0, f"{shown} 個")
     tab.js("document.querySelector('#adminclose') && document.querySelector('#adminclose').click()")
     time.sleep(0.4)
+
+    print("── 日誌視窗（之前寫死 display:none，等於永遠看不到）")
+    check("日誌視窗有可見高度",
+          (tab.js("(() => { const e=document.querySelector('#console');"
+                  " return e ? e.clientHeight : 0; })()") or 0) > 20,
+          f"{tab.js('(document.querySelector("#console")||{}).clientHeight')}px")
+    check("日誌視窗貼在底部（不浮在內容上）",
+          tab.js("""(() => {
+            const bar = document.querySelector('#consolebar');
+            const dock = document.querySelector('#logdock');
+            if (!bar || !dock) return false;
+            const b = bar.getBoundingClientRect(), d = dock.getBoundingClientRect();
+            return Math.abs(b.top - d.top) < 2;
+          })()"""))
+    check("日誌有標題列可收合",
+          tab.js("!!document.querySelector('#logtoggle')"))
+    tab.js("document.querySelector('#logtoggle').click()")
+    time.sleep(0.5)
+    check("收合後內容收起、標題列還在",
+          tab.js("""(() => {
+            const c = document.querySelector('#console');
+            const bar = document.querySelector('#consolebar');
+            return (!c || c.clientHeight === 0) && bar.getBoundingClientRect().height > 10;
+          })()"""))
+    tab.js("document.querySelector('#logtoggle').click()")
+    time.sleep(0.5)
+    check("可以再展開",
+          tab.js("(document.querySelector('#console')||{}).clientHeight > 20"))
+
+    print("── 浮動操作列（長列表不必滾回頂端）")
+    # 操作列只在「專案內容」上出現，先真的開一個專案。
+    # fixture 的第一個專案有 3 支候選，夠長到需要捲。
+    tab.js("(() => { const r = document.querySelector('.projrow');"
+           " if (r) r.click(); })()")
+    time.sleep(2.5)
+    check("專案內容有渲染出來",
+          tab.js("!!document.querySelector('.mainscroll') && document.querySelectorAll('.card').length > 0"),
+          f"{tab.js('document.querySelectorAll(chr(46)+chr(99)+chr(97)+chr(114)+chr(100)).length') if False else ''}")
+    check("操作列存在且預設不干擾",
+          tab.js("""(() => {
+            const p = document.querySelector('#actionpill');
+            if (!p) return false;
+            return p.dataset.visible === '0'
+              && getComputedStyle(p).pointerEvents === 'none';
+          })()"""))
+    # fixture 只有幾支候選，內容比容器短，scrollTop 會被夾回 0 ——
+    # 這種情況根本不會出現「滾到很下面」，也就不需要檢查浮出。
+    # 內容夠長時才驗「滾動監聽真的接對」。
+    can_scroll = tab.js("""(() => {
+      const s = document.querySelector('.mainscroll');
+      return !!s && s.scrollHeight > s.clientHeight + 40;
+    })()""")
+    if can_scroll:
+        tab.js("""(() => {
+          const s = document.querySelector('.mainscroll');
+          s.scrollTop = 600;
+          s.dispatchEvent(new Event('scroll'));
+        })()""")
+        time.sleep(0.6)
+        check("捲動後操作列浮出",
+              tab.js("(document.querySelector('#actionpill')||{}).dataset.visible === '1'"))
+    else:
+        # 內容短時 pill 不該出現（頂端那排按鈕本來就看得到）
+        check("內容不足一頁時不顯示操作列（不需要）",
+              tab.js("(document.querySelector('#actionpill')||{}).dataset.visible === '0'"),
+              "fixture 內容比容器短")
+    check("操作列會顯示勾選數量",
+          tab.js("(document.querySelector('#actionpill .ap-count')||{}).textContent.indexOf('選') >= 0"))
+    tab.js("(() => { const s=document.querySelector('.mainscroll');"
+           " if (s) s.scrollTo(0, 0); })()")
+    time.sleep(0.8)
 
     print("── 沒有 JS 錯誤")
     real_errors = [e for e in tab.errors if e and "favicon" not in e.lower()]

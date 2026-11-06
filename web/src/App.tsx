@@ -70,6 +70,18 @@ export default function App() {
   const [busy, setBusy] = useState('')
   const [download, setDownload] = useState<Download>(NO_DOWNLOAD)
   const [lines, setLines] = useState<LogLine[]>([])
+  // 日誌視窗預設打開：使用者要看得到「現在在做什麼」。
+  // 收起來的選擇會記住（重整後不會又跳出來擋畫面）。
+  const [logOpen, setLogOpen] = useState(() => {
+    try { return localStorage.getItem('vidgrab.logopen') !== '0' } catch { return true }
+  })
+  const toggleLog = useCallback(() => {
+    setLogOpen((v) => {
+      const next = !v
+      try { localStorage.setItem('vidgrab.logopen', next ? '1' : '0') } catch { /* 忽略 */ }
+      return next
+    })
+  }, [])
   const [itemProgress, setItemProgress] = useState<Record<number, ItemProgress>>({})
   // 介面相關的設定（輪詢間隔、log 行數）：開機抓一次，
   // 這樣這些數字只有一個來源 —— config.json。
@@ -762,6 +774,7 @@ export default function App() {
         />
 
         <main>
+          <div className="mainscroll">
           <Player playing={playing} onClose={() => setPlaying(null)} />
 
           <div id="view">
@@ -793,7 +806,12 @@ export default function App() {
                 </div>
               )}
           </div>
-        </main>
+        </div>
+
+        {/* main 是 flex column：上面這層負責捲動，日誌 dock 固定貼底。
+            放在 .app 外面會因為 100vh grid 被擠出視窗，高度變 0。 */}
+        <Console lines={lines} open={logOpen} onToggle={toggleLog} />
+      </main>
       </div>
 
       <ProgressBar percent={download.on ? download.totalPercent : null} />
@@ -808,7 +826,6 @@ export default function App() {
         retry={download.retry}
         maxRetries={download.maxRetries}
       />
-      <Console lines={lines} />
       <Toast message={toastMsg} />
       <LoginModal open={loginOpen} qr={loginQr} status={loginStat}
                   onClose={() => setLoginOpen(false)} />

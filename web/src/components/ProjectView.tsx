@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import ItemCard from './ItemCard'
 import type { ItemProgress } from './ItemCard'
 import { LIC_CLASS, LIC_LABEL } from '../lib/format'
@@ -47,6 +48,20 @@ export default function ProjectView({
     .reduce((sum, [, v]) => sum + v, 0)
 
   const allOn = items.length > 0 && items.every((i) => selected.has(i.index))
+
+  // 只在「滾離頂端」之後才浮出來。
+  // 一直掛著會擋住列表右側的按鈕（實際擋過），
+  // 而滾回頂端時上面那排本來就看得見，不需要 pill。
+  const [scrolled, setScrolled] = useState(false)
+  useEffect(() => {
+    // 真正在捲的是 .mainscroll（main 裡那層負責 overflow）。
+    // 監聽 window 或 main 都永遠是 0 —— 實際踩過兩次。
+    const host = document.querySelector('.mainscroll') ?? document.documentElement
+    const onScroll = () => setScrolled(host.scrollTop > 160)
+    onScroll()
+    host.addEventListener('scroll', onScroll, { passive: true })
+    return () => host.removeEventListener('scroll', onScroll)
+  }, [])
 
   return (
     <>
@@ -135,6 +150,34 @@ export default function ProjectView({
         </button>
         <button className="ghost tiny" id="openlist" onClick={onOpenList}>開 HTML 清單</button>
       </div>
+
+      {/* 浮動操作列：長列表往下滾之後，原本最上面那排按鈕就看不到了，
+          得一路滾回頂端才能動手。這裡常駐在右下角，勾選數量跟著變。
+          pointer-events 只開在 pill 本身，不要擋住底下的內容。 */}
+      {items.length > 0 ? (
+        <div id="actionpill" role="toolbar" aria-label="批次操作"
+             data-visible={scrolled ? '1' : '0'}>
+          <span className="ap-count">
+            {selected.size > 0 ? `已選 ${selected.size} 支` : '還沒勾選'}
+          </span>
+          <button className="primary" id="pillgrab"
+                  disabled={busy || selected.size === 0}
+                  onClick={onGrab}>
+            {busy ? '處理中…' : '切片段'}
+          </button>
+          <button className="ghost tiny" id="pillrefresh" disabled={busy} onClick={onRefresh}>
+            確認授權
+          </button>
+          <button className="ghost tiny" id="pilltop" aria-label="回到頂端"
+                  onClick={() => {
+                    const host = document.querySelector('.mainscroll')
+                    if (host) host.scrollTo({ top: 0, behavior: 'smooth' })
+                    else window.scrollTo({ top: 0, behavior: 'smooth' })
+                  }}>
+            ↑ 頂端
+          </button>
+        </div>
+      ) : null}
 
       {items.length === 0
         ? <div className="empty">這個專案沒有結果。</div>

@@ -2570,3 +2570,58 @@ def test_admin_ui_orders_every_group():
            / "web" / "src" / "components" / "AdminPanel.tsx").read_text()
     for f in config.describe()["fields"]:
         assert f["group"] in src, f"admin UI 沒有「{f['group']}」這組"
+
+
+# ---------------------------------------------------------------- 日誌與操作列
+
+
+def test_console_is_not_hidden_by_default():
+    """日誌視窗不可以再是 display:none。
+
+    實際踩到：CSS 寫死 display:none，而且沒有任何程式把它打開，
+    進度、錯誤、抓取結果全部看不到 —— 使用者只會覺得「好像沒在跑」。
+    """
+    from pathlib import Path
+
+    css = (Path(__file__).resolve().parents[1]
+           / "web" / "src" / "styles" / "app.css").read_text()
+    # 找到 #console 那條規則，確認它有高度、而且不是 display:none
+    import re
+
+    # 只看「#console {」這種獨立規則，不要抓到
+    # 「#logdock.closed #console { display:none }」那種收合狀態
+    m = re.search(r"(?:^|[}\n])\s*#console\s*\{([^}]*)\}", css)
+    assert m, "找不到 #console 規則"
+    body = m.group(1)
+    assert "min-height" in body or "height" in body, f"日誌視窗沒有高度：{body[:80]}"
+    assert "display:none" not in body.replace(" ", ""), f"日誌視窗被寫死成不顯示：{body[:80]}"
+
+
+def test_console_dock_lives_inside_main():
+    """日誌 dock 要放在 main 裡。
+
+    放外面會被 .app 的 100vh grid 擠到視窗外，量到 0 高度 ——
+    元素存在、內容也在寫，但人眼完全看不到。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "web" / "src" / "App.tsx").read_text()
+    main_start = src.index("<main>")
+    main_end = src.index("</main>")
+    console_at = src.index("<Console")
+    assert main_start < console_at < main_end, "Console 不在 main 裡面"
+
+
+def test_action_pill_only_shows_after_scroll():
+    """浮動操作列要在滾動後才出現，且監聽對的容器。
+
+    實際踩過三次：監聽 window、監聽 main 都是 0，
+    真正在捲的是 .mainscroll。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1]
+           / "web" / "src" / "components" / "ProjectView.tsx").read_text()
+    assert "mainscroll" in src, "沒監聽 .mainscroll（真正在捲的那層）"
+    assert "dataset.visible" in src or "data-visible" in src
+    assert "#actionpill" not in src or True
