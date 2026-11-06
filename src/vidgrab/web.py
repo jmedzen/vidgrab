@@ -235,6 +235,10 @@ def clip_info(clip: dict[str, Any], project: Path, root: Path,
         "orientation": clip.get("orientation") or "",
         # 指回是哪一支候選：沒有這個，拿到切片的人只能靠檔名前綴猜
         "item_index": item_index,
+        # 檔案可能被手動刪掉、被同步工具搬走、或硬碟拔了。
+        # 仍然列出來（讓使用者知道「這裡本來有東西」），
+        # 但標記出來，前端才不會給一個點下去 404 的連結。
+        "missing": not path.exists(),
     }
 
 
@@ -434,6 +438,8 @@ COMPONENTS = {
                 "thumb": {"type": "string", "description": "縮圖網址，沒有就是空字串"},
                 "item_index": {"type": ["integer", "null"],
                                "description": "這一段來自哪一支候選（0 起算）"},
+                "missing": {"type": "boolean",
+                            "description": "檔案不在磁碟上（被刪或搬走），不要給連結"},
             },
         },
         "Item": {

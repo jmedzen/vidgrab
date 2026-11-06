@@ -14,6 +14,10 @@ export interface Clip {
   thumb: string
   /** 'portrait' | 'landscape' | '' */
   orientation: string
+  /** 這一段來自哪一支候選（0 起算） */
+  item_index: number | null
+  /** 檔案不在磁碟上（被刪或搬走）—— 不要給播放／下載連結 */
+  missing: boolean
 }
 
 export interface Item {

@@ -96,7 +96,8 @@ export default function ItemCard({ item, selected, progress, onToggle, onPlay, o
           ? (
             <div className="clipbox">
               {item.clips.map((c) => (
-                <div className="clip-row" key={c.rel}>
+                <div className={'clip-row' + (c.missing ? ' clip-missing' : '')}
+                     key={c.rel}>
                   {c.thumb
                     ? (
                       <img className="clip-thumb" src={c.thumb} loading="lazy"
@@ -105,18 +106,28 @@ export default function ItemCard({ item, selected, progress, onToggle, onPlay, o
                            onClick={() => onLightbox('video', c.rel)} />
                     )
                     : <span className="clip-thumb clip-nothumb" title="沒有縮圖">無圖</span>}
-                  <a href={c.rel} data-play={c.rel} data-name={c.name}
-                     onClick={(e) => { e.preventDefault(); onPlay(c.rel, c.name) }}>
-                    {c.name}
-                  </a>
+                  {c.missing
+                    ? <span className="clip-name clip-gone" title="檔案不在磁碟上">{c.name}</span>
+                    : (
+                      <a href={c.rel} data-play={c.rel} data-name={c.name}
+                         onClick={(e) => { e.preventDefault(); onPlay(c.rel, c.name) }}>
+                        {c.name}
+                      </a>
+                    )}
                   <code>{c.span}</code>
                   <span>{c.dims} · {c.size}</span>
                   <span className="clip-actions">
-                    <button className="mini" data-play={c.rel} data-name={c.name}
-                            onClick={() => onPlay(c.rel, c.name)}>▶ 播放</button>
-                    <button className="mini" title="放大播放"
-                            onClick={() => onLightbox('video', c.rel)}>⤢</button>
-                    <a className="mini" href={c.rel} download>下載</a>
+                    {c.missing
+                      ? <span className="mini clip-gonetag">檔案不見了</span>
+                      : (
+                        <>
+                          <button className="mini" data-play={c.rel} data-name={c.name}
+                                  onClick={() => onPlay(c.rel, c.name)}>▶ 播放</button>
+                          <button className="mini" title="放大播放"
+                                  onClick={() => onLightbox('video', c.rel)}>⤢</button>
+                          <a className="mini" href={c.rel} download>下載</a>
+                        </>
+                      )}
                   </span>
                 </div>
               ))}

@@ -570,6 +570,13 @@
     padding:22px 26px 40px;
   }
   #console .ln.empty { opacity:.55; font-style:italic; }
+  /* 切片檔被刪掉／搬走：仍然列出來（讓你知道這裡本來有東西），
+     但不給播放／下載連結 —— 點了只會 404。 */
+  .clip-row.clip-missing { opacity:.5; }
+  .clip-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .clip-gone { text-decoration:line-through; }
+  .clip-gonetag { color:var(--muted); font-size:11px; border:1px dashed var(--line);
+    border-radius:5px; padding:2px 7px; }
 
   /* main 是 grid 子項，預設會被內容決定高度。
      加上 align-self:stretch + height:100% 才會吃滿那一列，

@@ -2942,3 +2942,49 @@ def test_error_branches_always_return():
             continue
         bad.append(f"L{i + 1}: {line.strip()[:60]}")
     assert not bad, "這些錯誤分支回完沒有 return：\n" + "\n".join(bad)
+
+
+def test_missing_clip_file_is_flagged_not_hidden(web, tmp_path):
+    """切片檔不見了要標記出來，而不是若無其事地列出。
+
+    實際踩到：手動刪掉一支 mp4 之後，API 照樣列出它，
+    前端顯示縮圖和「播放／下載」，點下去全是 404。
+    仍然列出來是對的（讓你知道這裡本來有東西），但要標記。
+    """
+    import os
+    from pathlib import Path
+
+    proj = _make_project(tmp_path, name="miss-proj")
+    # 造一支真實存在的「切片」
+    clips = proj / "clips"
+    clips.mkdir(parents=True, exist_ok=True)
+    mp4 = clips / "youtube_v1_000-015_作者A.mp4"
+    mp4.write_bytes(b"fake mp4 for test")
+
+    results = json.loads((proj / "results.json").read_text(encoding="utf-8"))
+    results[0]["clips"] = [{
+        "path": str(mp4), "start": 0.0, "end": 15.0,
+        "width": 1920, "height": 1080, "size_bytes": 1234,
+    }]
+    (proj / "results.json").write_text(json.dumps(results, ensure_ascii=False),
+                                       encoding="utf-8")
+
+    data = get(web + "/api/project/miss-proj")
+    clip = data["items"][0]["clips"][0]
+    assert clip["missing"] is False, "正常檔案不該標成不見"
+
+    # 把檔案刪掉，再問一次
+    rel = Path(clip["url"])
+    assert rel.exists()
+    os.remove(rel)
+
+    data = get(web + "/api/project/miss-proj")
+    clip = data["items"][0]["clips"][0]
+    assert clip["missing"] is True, "檔案已刪除，missing 應為 True"
+    assert clip["name"], "仍然要列出檔名，讓人知道原本有這個檔案"
+
+
+def test_clip_schema_documents_missing_flag(web):
+    spec = get(web + "/api/openapi.json")
+    props = spec["components"]["schemas"]["Clip"]["properties"]
+    assert "missing" in props, "Clip 少了 missing"
