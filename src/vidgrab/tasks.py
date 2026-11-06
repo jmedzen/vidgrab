@@ -14,6 +14,25 @@ from .version import full_version
 SEARCH_RETRIES = 3
 FRAME_RETRIES = 2
 
+
+def _retries(key: str, fallback: int) -> int:
+    """重試次數以 config 為準；讀不到才用這裡的預設。"""
+    from . import config
+
+    try:
+        return max(1, int(config.get(key, fallback)))
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def _timeout(key: str, fallback: float) -> float:
+    from . import config
+
+    try:
+        return max(5.0, float(config.get(key, fallback)))
+    except Exception:  # noqa: BLE001
+        return fallback
+
 from .models import (
     Item,
     fmt_duration,
@@ -115,10 +134,12 @@ def run_search(
                     # 搜尋失敗多半是網路抽動或對方暫時限流 —— 這種重試有用。
                     # 一次失敗就跳過整個關鍵字，使用者會拿到一份莫名其妙少一半的清單。
                     last = exc
-                    for attempt in range(1, SEARCH_RETRIES + 1):
-                        wait = min(20.0, 2.0 ** (attempt - 1))
+                    tries = _retries("search_retries", SEARCH_RETRIES)
+                    for attempt in range(1, tries + 1):
+                        wait = min(_timeout("retry_max_wait", 20.0),
+                                   2.0 ** (attempt - 1))
                         emit(f"    ↻ {src.name} 搜「{form}」失敗，{wait:.0f} 秒後重試"
-                             f"（{attempt}/{SEARCH_RETRIES}）：{last}")
+                             f"（{attempt}/{tries}）：{last}")
                         time.sleep(wait)
                         try:
                             found = src.search(
@@ -135,7 +156,7 @@ def run_search(
                         except SourceError as exc2:
                             last = exc2
                     if last is not None:
-                        emit(f"! {src.name} 搜「{form}」重試 {SEARCH_RETRIES} 次仍失敗：{last}")
+                        emit(f"! {src.name} 搜「{form}」重試 {tries} 次仍失敗：{last}")
                         continue
                     emit(f"· {src.name} 「{form}」→ {len(found)} 支（重試後成功）")
                 emit(f"· {src.name} 「{form}」→ {len(found)} 支")
@@ -301,15 +322,16 @@ def run_pick(
             # 真的發生過：YouTube 長片抽幀逾時 → 整批 batch 回 internal，
             # 明明片段已經下載成功，使用者卻收到失敗。
             got: list = []
-            for attempt in range(1, FRAME_RETRIES + 1):
+            frame_tries = _retries("frame_retries", FRAME_RETRIES)
+            for attempt in range(1, frame_tries + 1):
                 try:
                     got = media.probe_frames(item, frames_dir, n=frame_count, opts=opts)
                     break
                 except Exception as exc:  # noqa: BLE001
                     got = []
-                    if attempt < FRAME_RETRIES:
+                    if attempt < frame_tries:
                         emit(f"     ↻ 抓畫面失敗（{type(exc).__name__}），重試"
-                             f"（{attempt}/{FRAME_RETRIES}）")
+                             f"（{attempt}/{frame_tries}）")
                         time.sleep(1.0 * attempt)
                     else:
                         emit(f"     ▣ 抓畫面失敗（{type(exc).__name__}）："
@@ -329,7 +351,8 @@ def run_pick(
 
         if not item.duration:
             try:
-                info = media.probe_video(item.url, opts, timeout=180)
+                info = media.probe_video(item.url, opts,
+                                               timeout=_timeout("probe_timeout", 180.0))
                 item.duration = info.get("duration") or item.duration
             except Exception as exc:  # noqa: BLE001
                 item.error = f"取不到影片資訊：{exc}"

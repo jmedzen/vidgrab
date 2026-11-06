@@ -393,7 +393,18 @@ def grab_full(
 
 # 下載失敗最多重試幾次。10 次是使用者要求的；搭配下面的退避，
 # 大約會撐 3 分鐘左右，足夠撐過網路的短暫抽動。
+# 預設值留在這裡當文件；實際以 config 為準（見 _retries()）。
 MAX_DOWNLOAD_RETRIES = 10
+
+
+def _retries() -> int:
+    """下載重試次數：以 config 為準，讀不到才用模組預設。"""
+    from . import config
+
+    try:
+        return max(1, int(config.get("download_retries", MAX_DOWNLOAD_RETRIES)))
+    except Exception:  # noqa: BLE001
+        return MAX_DOWNLOAD_RETRIES
 
 # 這些錯誤重試有用（網路抽動、伺服器忙、暫時被限流）。
 # 其他錯誤（404、私人影片、地區限制）重試幾次都一樣，直接放棄。
@@ -421,8 +432,14 @@ def _is_retryable(message: str) -> bool:
 
 
 def _backoff(attempt: int) -> float:
-    """1s, 2s, 4s … 上限 20s。"""
-    return min(20.0, float(2 ** max(0, attempt - 1)))
+    """1s, 2s, 4s … 上限由 config 決定（預設 20s）。"""
+    from . import config
+
+    try:
+        cap = float(config.get("retry_max_wait", 20.0))
+    except Exception:  # noqa: BLE001
+        cap = 20.0
+    return min(max(1.0, cap), float(2 ** max(0, attempt - 1)))
 
 
 def grab_range(
@@ -500,7 +517,8 @@ def grab_range(
     produced: list[Path] = []
     tail = ""
     last_error = ""
-    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+    limit = _retries()
+    for attempt in range(1, limit + 1):
         try:
             code, tail = _run_stream(cmd, on_progress=on_progress, timeout=timeout)
         finally:
@@ -518,7 +536,7 @@ def grab_range(
         # 殘檔一定要清：留著下次會從壞掉的地方續傳，永遠修不好
         _clean_partials(outdir, stem)
 
-        if attempt >= MAX_DOWNLOAD_RETRIES or not _is_retryable(last_error):
+        if attempt >= limit or not _is_retryable(last_error):
             raise MediaError(last_error)
 
         wait = _backoff(attempt)

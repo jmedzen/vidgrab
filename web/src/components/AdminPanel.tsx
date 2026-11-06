@@ -27,7 +27,12 @@ interface Props {
   onReset: (keys: string[] | null) => void
 }
 
-const GROUP_ORDER = ['搜尋', '授權', '下載', '服務']
+// 順序照「常用 → 少動」排：一般使用者只會碰前三組，
+// 重試／逾時／服務資源是出了問題才會來調的。
+const GROUP_ORDER = [
+  '搜尋', '授權', '下載',
+  '重試', '逾時', '服務', '服務資源', '介面',
+]
 
 function labelOf(f: ConfigField, v: unknown): string {
   if (f.key === 'platform') {

@@ -2471,5 +2471,102 @@ def test_search_and_frame_failures_are_retried():
     assert tasks.FRAME_RETRIES >= 2
 
     src = (Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "tasks.py").read_text()
-    assert "for attempt in range(1, SEARCH_RETRIES + 1)" in src, "搜尋沒有重試迴圈"
-    assert "for attempt in range(1, FRAME_RETRIES + 1)" in src, "抓畫面沒有重試迴圈"
+    # 不綁死變數名（重試次數現在來自 config），改看「有沒有真的在重試」
+    assert "range(1, tries + 1)" in src, "搜尋沒有重試迴圈"
+    assert "range(1, frame_tries + 1)" in src, "抓畫面沒有重試迴圈"
+    assert "search_retries" in src and "frame_retries" in src, "重試次數沒接 config"
+
+
+# ---------------------------------------------------------------- 設定集中化
+
+
+def test_config_covers_operational_settings():
+    """重試、逾時、資源上限、介面節奏都要能在 config 裡調。
+
+    單人／小團隊用：這些數字每個人的機器都不一樣，
+    寫死在程式碼裡就只能改原始碼。
+    """
+    from vidgrab import config
+
+    keys = {f["key"] for f in config.describe()["fields"]}
+    for key in (
+        "download_retries", "search_retries", "frame_retries", "retry_max_wait",
+        "probe_timeout", "clip_timeout", "full_timeout",
+        "max_finished_jobs", "job_ttl_minutes", "max_job_messages",
+        "auto_refresh_ms", "project_refresh_ms", "log_max_lines",
+        "sidebar_default_width",
+    ):
+        assert key in keys, f"config 少了 {key}"
+    assert len(keys) >= 35
+
+
+def test_every_config_field_has_label_and_group():
+    """每個欄位都要有分組與人話標籤，否則 admin 面板會出現空白項。"""
+    from vidgrab import config
+
+    for f in config.describe()["fields"]:
+        assert f.get("group"), f"{f['key']} 沒有分組"
+        assert f.get("label"), f"{f['key']} 沒有標籤"
+
+
+def test_config_values_actually_drive_behaviour(tmp_path, monkeypatch):
+    """改了 config 要真的改變行為，不能只是「讀得到」。"""
+    import json as _json
+
+    from vidgrab import config, media, tasks
+
+    path = tmp_path / "config.json"
+    path.write_text(_json.dumps({"values": {
+        "download_retries": 3,
+        "search_retries": 7,
+        "retry_max_wait": 5,
+    }}), encoding="utf-8")
+    monkeypatch.setenv("VIDGRAB_CONFIG", str(path))
+
+    assert media._retries() == 3
+    assert tasks._retries("search_retries", 3) == 7
+    assert media._backoff(10) <= 5.0, "退避上限沒跟著 config"
+
+
+def test_job_limits_follow_config(tmp_path, monkeypatch):
+    """作業保留數量／TTL／日誌上限要能被 config 覆寫。"""
+    import json as _json
+
+    from vidgrab import web
+
+    path = tmp_path / "config.json"
+    path.write_text(_json.dumps({"values": {
+        "max_finished_jobs": 5,
+        "job_ttl_minutes": 7,
+        "max_job_messages": 300,
+    }}), encoding="utf-8")
+    monkeypatch.setenv("VIDGRAB_CONFIG", str(path))
+
+    keep, ttl, messages = web._job_limits()
+    assert keep == 5
+    assert ttl == 7 * 60
+    assert messages == 300
+
+
+def test_broken_config_falls_back_to_defaults(tmp_path, monkeypatch):
+    """config 壞掉不能讓工具起不來 —— 回預設值繼續跑。"""
+    from vidgrab import config, media
+
+    path = tmp_path / "config.json"
+    path.write_text("{ 這不是 JSON", encoding="utf-8")
+    monkeypatch.setenv("VIDGRAB_CONFIG", str(path))
+
+    assert config.load()["download_retries"] == config.DEFAULTS["download_retries"]
+    assert media._retries() == media.MAX_DOWNLOAD_RETRIES
+
+
+def test_admin_ui_orders_every_group():
+    """admin 面板要列出所有分組，包含維運用的那幾組。"""
+    from pathlib import Path
+
+    from vidgrab import config
+
+    src = (Path(__file__).resolve().parents[1]
+           / "web" / "src" / "components" / "AdminPanel.tsx").read_text()
+    for f in config.describe()["fields"]:
+        assert f["group"] in src, f"admin UI 沒有「{f['group']}」這組"

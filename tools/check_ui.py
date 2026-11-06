@@ -193,12 +193,28 @@ class Tab:
         self.ws.close()
 
 
+def _port_busy(port: int = 8310) -> bool:
+    """8310 上是不是已經有東西在跑。"""
+    import socket
+
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def _start_fixture_server():
     """用假的素材庫起一個獨立實例（port 8310）。
 
     這樣介面檢查不會依賴、也不會弄壞真人正在用的 projects/。
     """
     import subprocess
+
+    # 已經有實例佔著 8310 就別硬起：fixture 起不來，後面的斷言
+    # 會全部打在「真人那個實例」上，變成一堆看不懂的假失敗。
+    if _port_busy(8310):
+        print("✗ 8310 已經有實例在跑，--fixture 需要一個乾淨的 port")
+        print("  先停掉它：pkill -f 'vidgrab web'")
+        return None
 
     root = Path(__file__).resolve().parents[1]
     data = Path(tempfile.mkdtemp(prefix="vg-ui-"))
@@ -315,9 +331,12 @@ def _run() -> int:
     ready = False
     while time.time() < deadline:
         time.sleep(0.4)
+        # 只要求「應用掛起來」，不要求側欄已經有資料 ——
+        # 空的素材庫本來就沒有 .projrow，那不叫沒載入完成。
         ok_now = tab.js(
             "typeof THEMES !== 'undefined' && !!document.querySelector('#console')"
-            " && document.querySelectorAll('.projrow, .hint').length > 0"
+            " && !!document.querySelector('#projects')"
+            " && !!document.querySelector('.app')"
         )
         if ok_now:
             ready = True
@@ -935,7 +954,9 @@ def _run() -> int:
     thumb = tab.js("!!document.querySelector('.clip-thumb')")
     check("片段有縮圖可點", thumb)
     if thumb:
-        tab.js("document.querySelector('.clip-thumb').click()")
+        # 一定要用真滑鼠事件：關閉鈕聽的是 pointerdown，
+        # 程式呼叫 .click() 不會產生它，會出現「點了卻立刻被關掉」的假失敗。
+        _real_click('.clip-thumb')
         time.sleep(1.8)
         check("放大預覽打開",
               tab.js("document.querySelector('#lightbox').classList.contains('show')"))
@@ -1060,6 +1081,29 @@ def _run() -> int:
           tab.js("(() => { const b=document.querySelector('#projects');"
                  " if(!b) return true; return b.scrollHeight <= b.clientHeight + 2"
                  " || getComputedStyle(b).overflowY === 'auto'; })()"))
+
+    print("── 設定面板涵蓋維運參數")
+    tab.js("document.querySelector('#openadmin') && document.querySelector('#openadmin').click()")
+    time.sleep(1.0)
+    groups = tab.js("""JSON.stringify([...document.querySelectorAll('#adminmodal section h3, #adminmodal section h4, #adminmodal section [class*=group]')].map(e=>e.textContent.trim()))""")
+    raw = tab.js("""(async () => {
+      const c = await api('/api/config');
+      return JSON.stringify({
+        fields: c.fields.length,
+        groups: [...new Set(c.fields.map(f => f.group))],
+        hasRetry: c.fields.some(f => f.key === 'download_retries'),
+        hasUi: c.fields.some(f => f.key === 'auto_refresh_ms'),
+      });
+    })()""", await_promise=True)
+    info = json.loads(raw or "{}")
+    check("設定欄位達 35 項以上", info.get("fields", 0) >= 35, str(info.get("fields")))
+    check("維運參數也在設定裡（重試／介面）",
+          bool(info.get("hasRetry")) and bool(info.get("hasUi")))
+    # 每個分組都要有對應的輸入框，不能有「只有標題、沒有欄位」的空組
+    shown = tab.js("document.querySelectorAll('#adminmodal input, #adminmodal select').length")
+    check("設定面板有渲染出輸入框", (shown or 0) > 0, f"{shown} 個")
+    tab.js("document.querySelector('#adminclose') && document.querySelector('#adminclose').click()")
+    time.sleep(0.4)
 
     print("── 沒有 JS 錯誤")
     real_errors = [e for e in tab.errors if e and "favicon" not in e.lower()]

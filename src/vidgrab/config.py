@@ -38,6 +38,30 @@ DEFAULTS: dict[str, Any] = {
     # 服務
     "host": "127.0.0.1",
     "port": 8310,
+
+    # 重試：抓取失敗會自己再試，這裡是次數。
+    # 下載最容易抽動（大檔、長連線），搜尋只是打一次 API，給太多次只是讓使用者乾等。
+    "download_retries": 10,
+    "search_retries": 3,
+    "frame_retries": 2,
+    # 重試的退避上限（秒）。實際是 1、2、4… 但不會超過這個值。
+    "retry_max_wait": 20.0,
+
+    # 逾時（秒）。單人／小團隊通常不需要動，但慢網路或超大檔會想調。
+    "probe_timeout": 180.0,     # 問「這支多長、幾解析度」
+    "clip_timeout": 7200.0,     # 切一段
+    "full_timeout": 14400.0,    # 整支下載
+
+    # 服務端資源上限
+    "max_finished_jobs": 40,    # 記憶體留幾筆已完成的作業
+    "job_ttl_minutes": 30,      # 完成的作業留多久（分）
+    "max_job_messages": 2000,   # 單一作業的日誌行數上限
+
+    # 介面
+    "auto_refresh_ms": 3000,    # 側欄專案清單多久看一次
+    "project_refresh_ms": 2500, # 目前專案的片段多久看一次
+    "log_max_lines": 2000,      # log 視窗保留幾行
+    "sidebar_default_width": 330,
 }
 
 # 型別檢查用：設定值一定要是這幾種，避免外部 API 塞奇怪的東西進來
@@ -63,6 +87,20 @@ TYPES = {
     "frame_count": int,
     "host": str,
     "port": int,
+    "download_retries": int,
+    "search_retries": int,
+    "frame_retries": int,
+    "retry_max_wait": float,
+    "probe_timeout": float,
+    "clip_timeout": float,
+    "full_timeout": float,
+    "max_finished_jobs": int,
+    "job_ttl_minutes": int,
+    "max_job_messages": int,
+    "auto_refresh_ms": int,
+    "project_refresh_ms": int,
+    "log_max_lines": int,
+    "sidebar_default_width": int,
 }
 
 ENUMS = {
@@ -103,6 +141,18 @@ def load() -> dict[str, Any]:
             if key in DEFAULTS:
                 data[key] = value
     return data
+
+
+def get(key: str, fallback: Any = None) -> Any:
+    """取單一設定值。
+
+    每次呼叫都重讀檔案（幾百 bytes，便宜），這樣在 admin 面板改完
+    不必重啟伺服器；快取會讓「改了卻沒生效」變成常態。
+    """
+    values = load()
+    if key in values:
+        return values[key]
+    return DEFAULTS.get(key, fallback)
 
 
 def save(values: dict[str, Any]) -> dict[str, Any]:
@@ -202,6 +252,32 @@ FIELDS: dict[str, dict[str, Any]] = {
     "host": {"group": "服務", "label": "綁定位址",
              "help": "非本機位址要加 --allow-lan 才給開"},
     "port": {"group": "服務", "label": "埠號", "min": 1, "max": 65535},
+
+    "download_retries": {"group": "重試", "label": "下載重試次數", "min": 1, "max": 50,
+                         "help": "大檔容易抽動，預設 10"},
+    "search_retries": {"group": "重試", "label": "搜尋重試次數", "min": 1, "max": 20,
+                       "help": "搜尋失敗會自己再試"},
+    "frame_retries": {"group": "重試", "label": "抓畫面重試次數", "min": 1, "max": 10},
+    "retry_max_wait": {"group": "重試", "label": "退避上限（秒）", "min": 1,
+                       "help": "重試間隔 1、2、4… 最多等這麼久"},
+
+    "probe_timeout": {"group": "逾時", "label": "探測逾時（秒）", "min": 10,
+                      "help": "問影片長度／解析度"},
+    "clip_timeout": {"group": "逾時", "label": "切片逾時（秒）", "min": 30},
+    "full_timeout": {"group": "逾時", "label": "整支逾時（秒）", "min": 60},
+
+    "max_finished_jobs": {"group": "服務資源", "label": "保留幾筆已完成作業", "min": 1, "max": 500},
+    "job_ttl_minutes": {"group": "服務資源", "label": "作業保留分鐘", "min": 1, "max": 1440,
+                        "help": "完成後多久可以回頭看結果"},
+    "max_job_messages": {"group": "服務資源", "label": "單一作業日誌上限", "min": 100, "max": 100000,
+                         "help": "避免長時間下載把記憶體吃光"},
+
+    "auto_refresh_ms": {"group": "介面", "label": "專案清單更新間隔（毫秒）", "min": 500,
+                        "help": "側欄左下角多久看一次"},
+    "project_refresh_ms": {"group": "介面", "label": "目前專案更新間隔（毫秒）", "min": 500,
+                           "help": "切片視窗多久看一次"},
+    "log_max_lines": {"group": "介面", "label": "log 保留行數", "min": 100, "max": 20000},
+    "sidebar_default_width": {"group": "介面", "label": "側欄預設寬度（px）", "min": 200, "max": 800},
 }
 
 

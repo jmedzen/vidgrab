@@ -51,7 +51,7 @@ class Job:
 
     def emit(self, message: str) -> None:
         # 日誌限長：長時間下載會產生上萬行，全留在記憶體裡沒有意義
-        if len(self.messages) < MAX_JOB_MESSAGES:
+        if len(self.messages) < _job_limits()[2]:
             self.messages.append(message)
         self.queue.put(("log", message))
 
@@ -92,9 +92,27 @@ def _jsonable(data: Any) -> Any:
     return data
 
 
+# 這三個是「預設值」，實際以 config 為準（見 _job_limits()）。
 MAX_FINISHED_JOBS = 40
 JOB_TTL = 30 * 60          # 完成後保留 30 分鐘，足夠你回頭看結果
 MAX_JOB_MESSAGES = 2000    # 單一 job 的日誌上限，避免長時間下載把記憶體吃光
+
+
+def _job_limits() -> tuple[int, float, int]:
+    """(保留筆數, TTL 秒, 單一作業日誌上限)，以 config 為準。"""
+    from . import config
+
+    def pick(key, fallback, cast):
+        try:
+            return cast(config.get(key, fallback))
+        except Exception:  # noqa: BLE001
+            return fallback
+
+    return (
+        max(1, pick("max_finished_jobs", MAX_FINISHED_JOBS, int)),
+        max(60.0, pick("job_ttl_minutes", int(JOB_TTL // 60), int) * 60.0),
+        max(100, pick("max_job_messages", MAX_JOB_MESSAGES, int)),
+    )
 
 
 def _prune_jobs() -> None:
@@ -104,11 +122,12 @@ def _prune_jobs() -> None:
     開著一整天會一直長大。
     """
     now = time.time()
+    keep, ttl, _ = _job_limits()
     with LOCK:
         dead = [
             jid for jid, job in JOBS.items()
             if getattr(job, "done", False)
-            and now - getattr(job, "finished", getattr(job, "started", now)) > JOB_TTL
+            and now - getattr(job, "finished", getattr(job, "started", now)) > ttl
         ]
         for jid in dead:
             JOBS.pop(jid, None)
@@ -119,7 +138,7 @@ def _prune_jobs() -> None:
              for jid, j in JOBS.items() if getattr(j, "done", False)),
             reverse=True,
         )
-        for _, jid in finished[MAX_FINISHED_JOBS:]:
+        for _, jid in finished[keep:]:
             JOBS.pop(jid, None)
 
 
@@ -157,18 +176,37 @@ def _fmt_ts(seconds: float | None) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def _thumb_url(thumb: str | None, project: Path) -> str:
-    """把縮圖路徑變成 /file/... 這種可以給 <img> 用的網址。"""
-    if not thumb:
-        return ""
-    p = Path(thumb)
-    if not p.exists():
+def _to_file_url(path_like: str | None, project: Path) -> str:
+    """把專案裡的檔案變成 /file/... 網址；不在專案內就回空字串。
+
+    兩邊都 resolve()：macOS 的 /var 是 /private/var 的軟連結，
+    素材放在 /tmp、/var 底下時字串前綴會對不上（實際踩過）。
+    """
+    if not path_like:
         return ""
     try:
-        rel = str(p.relative_to(project))
+        p = Path(path_like).resolve()
+        base = project.resolve()
+    except OSError:
+        return ""
+    if not p.is_file():
+        return ""
+    try:
+        rel = p.relative_to(base)
     except ValueError:
         return ""
-    return f"/file/{urllib.parse.quote(project.name)}/{urllib.parse.quote(rel)}"
+    return (f"/file/{urllib.parse.quote(project.name)}/"
+            f"{urllib.parse.quote(str(rel))}")
+
+
+def _thumb_url(thumb: str | None, project: Path) -> str:
+    """把縮圖路徑變成 /file/... 這種可以給 <img> 用的網址。
+
+    兩邊都要 resolve()：macOS 的 /var 是 /private/var 的軟連結，
+    素材放在 /tmp、/var 底下時，路徑字串一個有 /private、一個沒有，
+    relative_to 就會 ValueError，縮圖永遠是空的（實際踩過）。
+    """
+    return _to_file_url(thumb, project)
 
 
 def clip_info(clip: dict[str, Any], project: Path, root: Path) -> dict[str, Any]:
@@ -198,15 +236,7 @@ def clip_info(clip: dict[str, Any], project: Path, root: Path) -> dict[str, Any]
 
 
 def item_payload(item: Item, index: int, project: Path) -> dict[str, Any]:
-    thumbs = []
-    for f in item.thumbs:
-        p = Path(f)
-        if p.exists():
-            try:
-                rel = str(p.relative_to(project))
-            except ValueError:
-                rel = p.name
-            thumbs.append(f"/file/{urllib.parse.quote(project.name)}/{urllib.parse.quote(rel)}")
+    thumbs = [u for u in (_to_file_url(f, project) for f in item.thumbs) if u]
     return {
         "index": index,
         "platform": item.platform,

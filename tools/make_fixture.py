@@ -77,7 +77,9 @@ def main() -> int:
             "views": 1234, "pubdate": "20260101",
             "license_kind": "free", "license_label": "可自由使用",
             "repost": False,
-            "thumbs": ["/file/ui-fixture/thumbs/clip.png"],
+            # 跟真實資料一致：存絕對路徑。web.py 的 _thumb_url 會用
+            # Path(thumb).exists() 驗證，寫成 /file/... 會永遠是空的。
+            "thumbs": [str(thumbs / "clip.png")],
             "clips": [{
                 "name": clip_name,
                 "path": str(clips / clip_name),
@@ -85,7 +87,7 @@ def main() -> int:
                 "start": 0.0, "end": 2.0, "full": False,
                 "span": "00:00→00:02", "size": "2.0 KB",
                 "dims": "320×180", "orientation": "landscape",
-                "thumb": "/file/ui-fixture/thumbs/clip.png",
+                "thumb": str(thumbs / "clip.png"),
             }],
         },
         {

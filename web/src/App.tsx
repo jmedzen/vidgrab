@@ -71,6 +71,13 @@ export default function App() {
   const [download, setDownload] = useState<Download>(NO_DOWNLOAD)
   const [lines, setLines] = useState<LogLine[]>([])
   const [itemProgress, setItemProgress] = useState<Record<number, ItemProgress>>({})
+  // 介面相關的設定（輪詢間隔、log 行數）：開機抓一次，
+  // 這樣這些數字只有一個來源 —— config.json。
+  const [ui, setUi] = useState({
+    autoRefreshMs: 3000,
+    projectRefreshMs: 2500,
+    logMaxLines: 2000,
+  })
 
   // 目前在看的專案。輪詢與 SSE 回呼都要用，所以宣告在所有 effect 之前。
   const projectRef = useRef<string | null>(null)
@@ -100,13 +107,31 @@ export default function App() {
     const entry = { id: lineId.current, text, isError }
     setLines((prev) => {
       const next = [...prev, entry]
-      return next.length > 2000 ? next.slice(-2000) : next
+      const cap = ui.logMaxLines
+      return next.length > cap ? next.slice(-cap) : next
     })
-  }, [])
+  }, [ui.logMaxLines])
 
   useEffect(() => {
     projectRef.current = project?.name ?? null
   }, [project?.name])
+
+  // 介面的節奏只有一個來源：config.json。
+  // 寫死在兩邊（前端 3000、後端也 3000）遲早會對不起來。
+  useEffect(() => {
+    void api.config().then((c) => {
+      const vals = (c as unknown as { values?: Record<string, unknown> }).values ?? {}
+      const num = (k: string, d: number) => {
+        const v = Number(vals[k])
+        return Number.isFinite(v) && v > 0 ? v : d
+      }
+      setUi({
+        autoRefreshMs: num('auto_refresh_ms', 3000),
+        projectRefreshMs: num('project_refresh_ms', 2500),
+        logMaxLines: num('log_max_lines', 2000),
+      })
+    }).catch(() => { /* 讀不到就用預設 */ })
+  }, [])
 
   // ---- 自動更新 ----------------------------------------------------
   //
@@ -149,7 +174,7 @@ export default function App() {
         lastVisible = Date.now()
       }
       void tick()
-    }, 3000)
+    }, ui.autoRefreshMs)
     // 同一個邏輯也套在「目前打開的專案」：切片可能來自另一個視窗、
     // 或使用者自己在終端機跑了 pick。只靠 job 事件的話，
     // 別處抓好的片段要手動重整才看得到。
@@ -174,7 +199,7 @@ export default function App() {
     const pid = window.setInterval(() => {
       if (document.hidden && Date.now() - lastVisible < 9000) return
       void tickProject()
-    }, 2500)
+    }, ui.projectRefreshMs)
     // 切回分頁時立刻補一次，不然要等最多 3 秒
     const onVisible = () => {
       if (document.hidden) return
@@ -189,7 +214,7 @@ export default function App() {
       window.clearInterval(pid)
       document.removeEventListener('visibilitychange', onVisible)
     }
-  }, [libraryKey])
+  }, [libraryKey, ui.autoRefreshMs, ui.projectRefreshMs])
 
   // ---- 主題 ------------------------------------------------------
 
