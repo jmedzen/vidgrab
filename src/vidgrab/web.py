@@ -209,7 +209,8 @@ def _thumb_url(thumb: str | None, project: Path) -> str:
     return _to_file_url(thumb, project)
 
 
-def clip_info(clip: dict[str, Any], project: Path, root: Path) -> dict[str, Any]:
+def clip_info(clip: dict[str, Any], project: Path, root: Path,
+              item_index: int | None = None) -> dict[str, Any]:
     path = Path(clip.get("path", ""))
     try:
         rel = str(path.relative_to(project))
@@ -232,6 +233,8 @@ def clip_info(clip: dict[str, Any], project: Path, root: Path) -> dict[str, Any]
         # 片段自己的縮圖（從這個片段檔抽的，畫面一定對得上）
         "thumb": _thumb_url(clip.get("thumb"), project),
         "orientation": clip.get("orientation") or "",
+        # 指回是哪一支候選：沒有這個，拿到切片的人只能靠檔名前綴猜
+        "item_index": item_index,
     }
 
 
@@ -259,7 +262,7 @@ def item_payload(item: Item, index: int, project: Path) -> dict[str, Any]:
         "note": item.check_note,
         "keyword": item.keyword,
         "thumbs": thumbs,
-        "clips": [clip_info(c, project, project) for c in item.clips],
+        "clips": [clip_info(c, project, project, index) for c in item.clips],
     }
 
 
@@ -429,6 +432,8 @@ COMPONENTS = {
                 "dims": {"type": "string", "example": "1920×1080"},
                 "orientation": {"type": "string", "enum": ["landscape", "portrait", ""]},
                 "thumb": {"type": "string", "description": "縮圖網址，沒有就是空字串"},
+                "item_index": {"type": ["integer", "null"],
+                               "description": "這一段來自哪一支候選（0 起算）"},
             },
         },
         "Item": {
@@ -507,6 +512,8 @@ COMPONENTS = {
             "properties": {
                 "path": {"type": "string", "description": "config.json 的位置"},
                 "values": {"type": "object", "additionalProperties": True},
+                "defaults": {"type": "object", "additionalProperties": True,
+                             "description": "出廠預設值，對照 values 看哪些被改過"},
                 "fields": {
                     "type": "array",
                     "items": {
@@ -528,6 +535,43 @@ COMPONENTS = {
                 },
             },
         },
+        "Export": {
+            "type": "object",
+            "description": "備份快照：拿去別的機器還原用",
+            "properties": {
+                "version": {"type": "string"},
+                "config": {"type": "object", "additionalProperties": True},
+                "logged_in": {"type": "boolean"},
+                "projects": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/ProjectSummary"},
+                },
+            },
+        },
+        "LibraryScan": {
+            "type": "object",
+            "description": "掃描 projects/ 目錄的結果",
+            "properties": {
+                "root": {"type": "string"},
+                "ok": {"type": "boolean"},
+                "tracked": {"type": "integer", "description": "已納入素材庫的數量"},
+                "on_disk": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "folder": {"type": "string"},
+                            "queries": {"type": "array", "items": {"type": "string"}},
+                            "created": {"type": "string"},
+                        },
+                    },
+                },
+                "untracked": {"type": "array", "items": {"type": "string"},
+                              "description": "在磁碟上但沒納入的資料夾"},
+                "missing": {"type": "array", "items": {"type": "string"},
+                            "description": "納入了但資料夾不見了"},
+            },
+        },
         "Library": {
             "type": "object",
             "properties": {
@@ -542,10 +586,12 @@ COMPONENTS = {
         "LoginStatus": {
             "type": "object",
             "properties": {
-                "ok": {"type": "boolean"},
-                "name": {"type": "string"},
-                "mid": {"type": "integer"},
+                "logged_in": {"type": "boolean"},
+                "name": {"type": "string", "description": "沒登入時不存在"},
+                "mid": {"type": "integer", "description": "沒登入時不存在"},
+                "vip": {"type": "boolean"},
             },
+            "required": ["logged_in"],
         },
     }
 }
@@ -799,7 +845,7 @@ OPENAPI: dict[str, Any] = {
                         },
                     }}}
                 },
-                "responses": {"200": {"description": "已排入", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobRef"}}}}},
+                "responses": {"200": {"description": "完整備份（版本、設定、登入狀態、專案索引）", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Export"}}}}},
             },
         },
         "/api/job/{id}": {
@@ -834,7 +880,7 @@ OPENAPI: dict[str, Any] = {
         },
         "/api/library/scan": {
             "get": {"tags": ["project"], "summary": "掃描 projects/，找出未納入與遺失的專案",
-                    "responses": {"200": {"description": "掃描結果", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectSummary"}}}}}},
+                    "responses": {"200": {"description": "掃描結果", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LibraryScan"}}}}}},
         },
         "/api/asset/{project}/{index}": {
             "get": {
@@ -891,7 +937,7 @@ OPENAPI: dict[str, Any] = {
         },
         "/api/export": {
             "get": {"tags": ["project"], "summary": "匯出全部設定與專案索引（備份用）",
-                    "responses": {"200": {"description": "已排入", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobRef"}}}}}},
+                    "responses": {"200": {"description": "完整備份（版本、設定、登入狀態、專案索引）", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Export"}}}}}},
         },
         "/api/login/start": {
             "post": {"tags": ["auth"], "summary": "產生 B 站登入 QR",
@@ -1138,8 +1184,10 @@ class Handler(BaseHTTPRequestHandler):
         if route.startswith("/file/"):
             self._file(route[len("/file/"):])
             return
-        if route == "/api/report/":
-            self._json({"error": "缺少專案"}, 404)
+        if route.startswith("/api/"):
+            # /api/ 開頭一律回 JSON：agent 與程式碼用戶端都只解析 JSON，
+            # 這裡吐純文字會讓它在 json.loads 就炸掉（實際踩過）。
+            self._json({"error": f"沒有這個端點：{route}"}, 404)
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 

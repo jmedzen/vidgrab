@@ -2798,3 +2798,88 @@ def test_real_responses_match_openapi_schema(web, tmp_path):
             problems.extend(errs)
 
     assert not problems, "實際回應與 OpenAPI 不符：\n" + "\n".join(problems[:12])
+
+
+def test_api_404_returns_json_not_plain_text(web):
+    """未知的 /api/ 路徑要回 JSON，不是 "not found" 純文字。
+
+    實際踩到：呼叫 /api/report/xxx 拿到 text/plain，
+    程式碼裡 json.loads 直接炸掉，錯誤訊息完全幫不上忙。
+    """
+    import json as _json
+    import urllib.error as _ue
+    import urllib.request as _u
+
+    for path in ("/api/nonexistent", "/api/report/%E6%9F%90%E5%B0%88%E6%A1%88"):
+        with pytest.raises(_ue.HTTPError) as ei:
+            _u.urlopen(web + path, timeout=15)
+        err = ei.value
+        assert err.code == 404, f"{path} 應回 404，實際 {err.code}"
+        ctype = err.headers.get("Content-Type", "")
+        assert "application/json" in ctype, f"{path} 的 404 不是 JSON（{ctype}）"
+        body = _json.loads(err.read())
+        assert "error" in body, f"{path} 的錯誤回應沒有 error 欄位"
+
+
+def test_non_api_404_stays_plain_text(web):
+    """非 API 的 404 維持純文字 —— 那是給靜態資源／瀏覽器用的。"""
+    import urllib.error as _ue
+    import urllib.request as _u
+
+    with pytest.raises(_ue.HTTPError) as ei:
+        _u.urlopen(web + "/definitely-not-a-page", timeout=15)
+    assert "text/plain" in ei.value.headers.get("Content-Type", "")
+
+
+def test_every_documented_get_matches_its_schema(web):
+    """所有 GET 端點逐一打真的，跟宣告的 schema 對照。
+
+    只驗 6 個端點是不夠的 —— 我原本就只驗了 6 個，
+    結果 /api/export、/api/library/scan 宣告錯的 schema 全都漏掉。
+    """
+    import json as _json
+    import urllib.parse as _up
+    import urllib.request as _u
+
+    spec = get(web + "/api/openapi.json")
+    non_json = {"/api/openapi.json", "/api/stream/{id}", "/api/login/qr"}
+    problems: list[str] = []
+
+    def fetch(path):
+        with _u.urlopen(web + path, timeout=30) as r:
+            return _json.loads(r.read())
+
+    for path, ops in spec["paths"].items():
+        if path in non_json or path.startswith(("/file/", "/api/asset/")):
+            continue
+        op = ops.get("get")
+        if not op:
+            continue
+        url = (path.replace("{id}", "nope")
+                   .replace("{name}", _up.quote("no-such-project"))
+                   .replace("{index}", "0"))
+        if "{project}" in url or "{path}" in url:
+            continue
+        try:
+            data = fetch(url)
+        except Exception:
+            continue  # 需要真實資料的端點（如 /api/job/{id}）跳過
+        schema = op.get("responses", {}).get("200", {}).get(
+            "content", {}).get("application/json", {}).get("schema", {})
+        if not schema:
+            continue
+        if isinstance(data, list) and schema.get("type") != "array":
+            schema = {"type": "array", "items": schema}
+        problems.extend(_walk_errors(data, schema, spec, path))
+
+    assert not problems, "文件與實際回應不符：\n" + "\n".join(problems[:10])
+
+
+def test_clip_points_back_to_its_item(web):
+    """切片要能指回它來自哪一支候選。
+
+    沒有這個欄位，拿到切片的人只能靠檔名前綴猜來源。
+    """
+    spec = get(web + "/api/openapi.json")
+    props = spec["components"]["schemas"]["Clip"]["properties"]
+    assert "item_index" in props, "Clip 少了 item_index"
