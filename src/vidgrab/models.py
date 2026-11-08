@@ -168,14 +168,14 @@ def log(msg: str) -> None:
 
 # 素材站：影片短（10–60 秒）、授權明確、有直連檔案網址。
 # 時長篩選（出廠 10 分鐘起跳）對它們沒有意義，下載也不走 yt-dlp。
-STOCK_PLATFORMS = ("pexels",)
+STOCK_PLATFORMS = ("pexels", "pixabay")
 
 
 @dataclass
 class Item:
     """一支候選影片。"""
 
-    platform: str  # bilibili / youtube / pexels
+    platform: str  # bilibili / youtube / pexels / pixabay
     vid: str  # BV 號或 YouTube video id
     url: str
     title: str

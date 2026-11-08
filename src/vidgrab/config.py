@@ -104,7 +104,7 @@ TYPES = {
 }
 
 ENUMS = {
-    "platform": {"both", "bilibili", "youtube", "pexels"},
+    "platform": {"both", "bilibili", "youtube", "pexels", "pixabay", "stock"},
     "order": {"smart", "relevance", "views", "new"},
     "duration": {"any", "short", "medium", "long", "verylong"},
     "sort": {"smart", "license", "views", "new"},

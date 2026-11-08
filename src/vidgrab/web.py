@@ -343,6 +343,7 @@ def make_search_job(body: dict[str, Any]) -> Job:
             "verify_license": bool(pick("verify_license")),
             "sort": pick("sort"),
             "name": body.get("name") or None,
+            "orientation": str(body.get("orientation") or "any"),
         }
     except (TypeError, ValueError) as exc:
         raise BadInput(f"參數格式不對：{exc}") from None
@@ -1128,8 +1129,10 @@ OPENAPI: dict[str, Any] = {
                         "properties": {
                             "keywords": {"type": "array", "items": {"type": "string"},
                                          "example": ["台北 街景", "北歐 空景"]},
-                            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube", "pexels"]},
+                            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube", "pexels", "pixabay", "stock"]},
                             "per_keyword": {"type": "integer"},
+                            "orientation": {"type": "string", "enum": ["any", "portrait", "landscape", "square"],
+                                            "description": "只對素材站（pexels／pixabay）有效"},
                             "order": {"type": "string", "enum": ["smart", "relevance", "views", "new"]},
                             "min_duration": {"type": "number", "description": "分鐘"},
                             "max_duration": {"type": "number", "description": "分鐘，0=不限"},
