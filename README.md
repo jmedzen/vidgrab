@@ -846,11 +846,12 @@ docker exec vidgrab vidgrab build                 # 確認跑的是哪次建置
 
 ```bash
 cp .env.example .env     # 填 token 與素材站金鑰；.env 不進 git、不進映像
-docker compose up -d
+./tools/compose-up.sh    # = docker compose up -d --build，並帶入 git 的 build number
 ```
 
 `.env.example` 列了 `VIDGRAB_API_TOKEN`、`PIXABAY_API_KEY`、`JAMENDO_CLIENT_ID`、`PEXELS_API_KEY`
 與發佈位址（`VIDGRAB_BIND`、`VIDGRAB_PUBLISH_PORT`）。沒填金鑰的來源會自己略過。
+Docker 建置沒有 `.git`，所以要用 `tools/compose-up.sh`（或 `tools/docker-build.sh`）才帶得進 build number；直接 `docker compose up --build` 會顯示 `dev`，網頁看不出是不是新版。
 健康檢查是映像內建的（打 `/api/version`），`docker compose ps` 看得到 `healthy`。
 與 [vidpipe](https://github.com/jmedzen/vidpipe) 一起跑的完整組合（含網頁介面、字型、連主機上的 audio.cpp）
 見 vidpipe 的 `docker-compose.yml`。
