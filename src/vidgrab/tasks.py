@@ -34,6 +34,7 @@ def _timeout(key: str, fallback: float) -> float:
         return fallback
 
 from .models import (
+    BadInput,
     VidgrabError,
     Item,
     STOCK_PLATFORMS,
@@ -55,17 +56,21 @@ Emit = Callable[[str], None]
 
 def _apply_filters(items: list[Item], *, fresh_days: int, min_duration: float,
                    max_duration: float, min_views: int, only_free: bool,
-                   drop_reposts: bool, drop_tutorials: bool = True) -> list[Item]:
+                   drop_reposts: bool, drop_tutorials: bool = True,
+                   orientation: str = "any") -> list[Item]:
     fresh_after = ""
     if fresh_days:
         fresh_after = time.strftime("%Y%m%d", time.localtime(time.time() - fresh_days * 86400))
     from .models import looks_like_tutorial
+    from .stock import orientation_ok
 
     out = []
     for item in items:
         if drop_tutorials and looks_like_tutorial(item):
             continue
         if fresh_after and item.pubdate and item.pubdate < fresh_after:
+            continue
+        if item.is_stock() and not orientation_ok(item, orientation):
             continue
         # 素材站的片子本來就短、也沒有觀看數；長度與熱度篩選是為長片設計的
         if not item.is_stock():
@@ -83,10 +88,15 @@ def _apply_filters(items: list[Item], *, fresh_days: int, min_duration: float,
     return out
 
 
-def _length_kwargs(src, min_duration: float, max_duration: float) -> dict[str, float]:
-    """長度篩選的單位是「分鐘」，為長片設計；素材站的片子只有幾十秒，不套用。"""
+def _source_kwargs(src, min_duration: float, max_duration: float,
+                   orientation: str = "any") -> dict[str, Any]:
+    """各來源專屬的搜尋參數。
+
+    長度篩選的單位是「分鐘」，為長片設計；素材站的片子只有幾十秒，不套用。
+    orientation 只有素材站看得懂（B 站／YouTube 搜尋結果沒有尺寸）。
+    """
     if getattr(src, "name", "") in STOCK_PLATFORMS:
-        return {}
+        return {"orientation": orientation} if orientation and orientation != "any" else {}
     return {
         "min_seconds": min_duration * 60 if min_duration else 0,
         "max_seconds": max_duration * 60 if max_duration else 0,
@@ -112,8 +122,14 @@ def run_search(
     name: str | None = None,
     out: str | None = None,
     replace: bool = False,
+    orientation: str = "any",
     emit: Emit = log,
 ) -> dict[str, Any]:
+    from .stock import ORIENTATIONS
+
+    if orientation not in ORIENTATIONS:
+        raise BadInput(f"orientation 不認得：{orientation}",
+                       hint="可用 any / portrait / landscape / square")
     queries = [q.strip() for q in queries if q and q.strip()]
     if not queries:
         raise SystemExit("要至少一個關鍵字。")
@@ -141,7 +157,7 @@ def run_search(
                         order=order,
                         duration=duration,
                         exclude=exclude,
-                        **_length_kwargs(src, min_duration, max_duration),
+                        **_source_kwargs(src, min_duration, max_duration, orientation),
                     )
                 except SourceError as exc:
                     # 搜尋失敗多半是網路抽動或對方暫時限流 —— 這種重試有用。
@@ -161,7 +177,7 @@ def run_search(
                                 order=order,
                                 duration=duration,
                                 exclude=exclude,
-                                **_length_kwargs(src, min_duration, max_duration),
+                                **_source_kwargs(src, min_duration, max_duration, orientation),
                             )
                             last = None
                             break
@@ -191,6 +207,7 @@ def run_search(
         min_views=min_views,
         only_free=only_free,
         drop_reposts=drop_reposts,
+        orientation=orientation,
     )
     emit(f"· 篩選後 {len(items)} 支（原始 {len(collected)} 支）")
 

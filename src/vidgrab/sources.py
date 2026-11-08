@@ -475,12 +475,16 @@ def get_source(platform: str, http: _Http | None = None):
         return BilibiliSource(http)
     if platform in ("youtube", "yt", "y"):
         return YoutubeSource()
-    if platform in ("pexels", "stock", "free"):
+    if platform == "pexels":
         from .stock import PexelsSource
 
         return PexelsSource()
-    if platform in ("both", "all"):
-        raise ValueError("both 請用 get_sources()")
+    if platform == "pixabay":
+        from .stock import PixabaySource
+
+        return PixabaySource()
+    if platform in ("both", "all", "stock", "free"):
+        raise ValueError(f"{platform} 請用 get_sources()")
     raise ValueError(f"不認識的平台：{platform}")
 
 
@@ -500,6 +504,18 @@ def get_sources(platform: str, http: _Http | None = None) -> list:
                 out.append(get_source(name, http))
             except SourceError as exc:
                 log(f"! {name} 不可用：{exc}")
+        return out
+    if platform in ("stock", "free"):
+        # 素材站：哪個有 key 就搜哪個；全都沒有才算失敗，並把每個缺什麼講清楚
+        out, reasons = [], []
+        for name in ("pexels", "pixabay"):
+            try:
+                out.append(get_source(name))
+            except SourceError as exc:
+                reasons.append(f"{name}：{exc}")
+                log(f"! {name} 不可用：{exc}")
+        if not out:
+            raise SourceError("素材站都不能用。" + "；".join(reasons))
         return out
     return [get_source(platform, http)]
 

@@ -36,13 +36,15 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "search_footage",
         "description": (
-            "去 B 站／YouTube／Pexels 搜新的影片素材（Pexels 授權明確可商用，需 API key，英文關鍵字效果最好），建立一個專案並回傳候選清單（含時長、授權、縮圖、原始頁面）。"
+            "去 B 站／YouTube／Pexels／Pixabay 搜新的影片素材（Pexels、Pixabay 授權明確可商用，platform 用 stock 兩個都搜，需 API key，英文關鍵字效果最好），建立一個專案並回傳候選清單（含時長、授權、縮圖、原始頁面）。"
             "要找『手上已有的』素材請用 list_assets。搜完用 grab_clip 下載想要的片段。"
         ),
         "inputSchema": _obj({
             "keywords": {"type": "array", "items": {"type": "string"},
                          "description": "關鍵字，每個分開搜再合併（B 站建議也試簡體）"},
-            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube", "pexels"]},
+            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube", "pexels", "pixabay", "stock"]},
+            "orientation": {"type": "string", "enum": ["any", "portrait", "landscape", "square"],
+                            "description": "畫面方向，只對素材站有效；做 Shorts 用 portrait"},
             "per_keyword": {"type": "integer", "description": "每個關鍵字抓幾支"},
             "min_duration": {"type": "number", "description": "最短幾分鐘（出廠 10，找長素材用）"},
             "max_duration": {"type": "number", "description": "最長幾分鐘，0 = 不限"},
