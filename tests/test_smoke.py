@@ -2022,7 +2022,7 @@ def test_download_retries_up_to_ten_times(monkeypatch, tmp_path):
 
     calls = {"n": 0}
 
-    def fake_run(cmd, on_progress=None, timeout=None):
+    def fake_run(cmd, on_progress=None, timeout=None, check=None):
         calls["n"] += 1
         if calls["n"] < 4:
             return 1, "ERROR: HTTP Error 503: Service Unavailable"
@@ -2052,7 +2052,7 @@ def test_download_gives_up_after_ten_and_does_not_retry_404(monkeypatch, tmp_pat
     # 404：只打一次
     seen = {"n": 0}
 
-    def not_found(cmd, on_progress=None, timeout=None):
+    def not_found(cmd, on_progress=None, timeout=None, check=None):
         seen["n"] += 1
         return 1, "ERROR: HTTP Error 404: Not Found"
 
@@ -2064,7 +2064,7 @@ def test_download_gives_up_after_ten_and_does_not_retry_404(monkeypatch, tmp_pat
     # 503：試滿 10 次
     seen["n"] = 0
 
-    def always_busy(cmd, on_progress=None, timeout=None):
+    def always_busy(cmd, on_progress=None, timeout=None, check=None):
         seen["n"] += 1
         return 1, "ERROR: HTTP Error 503: Service Unavailable"
 
@@ -2162,7 +2162,7 @@ def test_retry_progress_event_carries_attempt(monkeypatch, tmp_path):
     events = []
     state = {"n": 0}
 
-    def flaky(cmd, on_progress=None, timeout=None):
+    def flaky(cmd, on_progress=None, timeout=None, check=None):
         state["n"] += 1
         if state["n"] == 1:
             return 1, "ERROR: HTTP Error 503: Service Unavailable"
@@ -2278,7 +2278,7 @@ def test_corrupt_download_is_rejected_not_saved(monkeypatch, tmp_path):
 
     monkeypatch.setattr(media.time, "sleep", lambda _s: None)
 
-    def fake_run(cmd, on_progress=None, timeout=None):
+    def fake_run(cmd, on_progress=None, timeout=None, check=None):
         stem = next((a for a in cmd if a.endswith(".%(ext)s")), "")
         out = Path(stem.replace(".%(ext)s", ".mp4"))
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -2301,7 +2301,7 @@ def test_good_download_is_accepted(monkeypatch, tmp_path):
     """正常的檔案不能被誤擋。"""
     from vidgrab import media
 
-    def fake_run(cmd, on_progress=None, timeout=None):
+    def fake_run(cmd, on_progress=None, timeout=None, check=None):
         stem = next((a for a in cmd if a.endswith(".%(ext)s")), "")
         out = Path(stem.replace(".%(ext)s", ".mp4"))
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -2375,7 +2375,7 @@ def test_retry_recovers_from_transient_failure_for_real_binary(tmp_path, monkeyp
     real = media._run_stream
     seen = {"n": 0, "cmds": []}
 
-    def flaky(cmd, on_progress=None, timeout=None):
+    def flaky(cmd, on_progress=None, timeout=None, check=None):
         seen["n"] += 1
         seen["cmds"].append(list(cmd))
         if seen["n"] <= 2:
@@ -3086,3 +3086,38 @@ def test_file_range_semantics(tmp_path, web):
     assert code == 200 and body == b"" and h["Content-Length"] == "0"
     code, _, _ = _raw(web, "GET", "/file/rg/clips/empty.bin", {"Range": "bytes=0-"})
     assert code == 416
+
+
+def test_run_stream_aborts_fast_when_progress_callback_raises(tmp_path):
+    """on_progress 丟例外（批次期限）時，要立刻殺掉行程並拋出同一個例外（issue #2）。"""
+    import sys
+    import time as _t
+
+    from vidgrab import media
+    from vidgrab.models import VidgrabError
+
+    cmd = [sys.executable, "-c",
+           "import time\nfor i in range(200000):\n"
+           "    print(f'VIDGRAB {i} 1000000 1000 5 1 10', flush=True)\n"
+           "time.sleep(60)"]
+
+    def boom(_info):
+        raise VidgrabError("deadline", code="timeout", retryable=True)
+
+    t0 = _t.time()
+    with pytest.raises(VidgrabError):
+        media._run_stream(cmd, on_progress=boom, timeout=30)
+    assert _t.time() - t0 < 10, "應該很快中止，而不是卡到逾時"
+
+
+def test_run_stream_check_hook_kills_process():
+    import sys
+    import time as _t
+
+    from vidgrab import media
+
+    t0 = _t.time()
+    with pytest.raises(RuntimeError):
+        media._run_stream([sys.executable, "-c", "import time; time.sleep(60)"],
+                          timeout=30, check=lambda: RuntimeError("stop"))
+    assert _t.time() - t0 < 10
