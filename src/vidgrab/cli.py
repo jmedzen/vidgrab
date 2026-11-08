@@ -853,10 +853,20 @@ def cmd_web(args: argparse.Namespace) -> int:
             "  真的要這樣做，加 --allow-lan 表示你知道風險。\n"
         )
         return 2
-    if exposed:
-        sys.stderr.write(
-            f"⚠ 綁定到 {host}：同網段的人都能打開這個介面（沒有密碼）。\n"
-        )
+    from .web import TOKEN_ENV, api_token
+
+    if exposed and not api_token():
+        if not (getattr(args, "no_auth", False) or os.environ.get("VIDGRAB_NO_AUTH") == "1"):
+            sys.stderr.write(
+                f"✗ 拒絕綁定到 {host}：沒有設定 {TOKEN_ENV}。\n"
+                f"  請設定 token 再啟動（例如 export {TOKEN_ENV}=$(openssl rand -hex 24)），\n"
+                "  agent 用 Authorization: Bearer <token>，瀏覽器開 /?token=<token> 登入。\n"
+                "  確定外層已經有保護（例如只對 127.0.0.1 發佈 port）才用 --no-auth 略過。\n"
+            )
+            return 2
+        sys.stderr.write(f"⚠ 綁定到 {host} 且沒有 token（--no-auth）：能連到 port 的人都能操作。\n")
+    elif exposed:
+        sys.stderr.write(f"▸ 綁定到 {host}，API 需要 token。\n")
 
     serve(host=host, port=port, open_browser=not args.no_open)
     return 0
@@ -1033,6 +1043,10 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument(
         "--allow-lan", action="store_true",
         help="允許綁定到非本機位址（這個介面沒有登入機制，開放區網請自行評估）",
+    )
+    w.add_argument(
+        "--no-auth", action="store_true",
+        help="綁非本機位址又不設 VIDGRAB_API_TOKEN 時必須加這個（也可設 VIDGRAB_NO_AUTH=1）",
     )
     w.add_argument("--port", type=int, default=None, help="預設讀 VIDGRAB_PORT，否則 8310")
     w.add_argument("--no-open", action="store_true", help="不要自動開瀏覽器")

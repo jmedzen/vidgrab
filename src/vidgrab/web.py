@@ -119,6 +119,32 @@ class Job:
         }
 
 
+# ---------------------------------------------------------------- 認證
+
+TOKEN_ENV = "VIDGRAB_API_TOKEN"
+TOKEN_COOKIE = "vidgrab_token"
+# 這些路徑不需要 token：頁面外殼、靜態檔、版本（Docker healthcheck 用）、API 文件
+PUBLIC_ROUTES = ("/", "/index.html", "/api/version", "/api/openapi.json", "/docs", "/docs/")
+
+
+def api_token() -> str:
+    """設定的 API token；空字串＝不啟用認證（只適合綁本機時）。只讀環境變數，
+    不放 config.json，因為 /api/config 會把設定回給呼叫端。"""
+    import os
+
+    return (os.environ.get(TOKEN_ENV) or "").strip()
+
+
+def _token_matches(candidate: str, token: str) -> bool:
+    import hmac
+
+    return bool(candidate) and hmac.compare_digest(candidate.encode(), token.encode())
+
+
+def _is_loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
 def _is_within(path: Path, root: Path) -> bool:
     """path 是否在 root 底下（以目錄層級判斷，兩者都先 resolve）。"""
     try:
@@ -1093,11 +1119,64 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return path
 
+    # -- 認證 ---------------------------------------------------------
+
+    def _authorized(self, route: str) -> bool:
+        """沒設 token → 一律放行；有設 → 公開路徑以外都要 Bearer header 或登入後的 cookie。"""
+        token = api_token()
+        if not token or route in PUBLIC_ROUTES or route.startswith("/static/"):
+            return True
+        header = self.headers.get("Authorization") or ""
+        if header.lower().startswith("bearer ") and _token_matches(header[7:].strip(), token):
+            return True
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == TOKEN_COOKIE and _token_matches(urllib.parse.unquote(value), token):
+                return True
+        return False
+
+    def _deny(self) -> None:
+        body = json.dumps({
+            "error": "需要 API token：帶 Authorization: Bearer <token>，或先開 /?token=<token> 登入",
+            "code": "unauthorized",
+        }, ensure_ascii=False).encode()
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Bearer realm="vidgrab"')
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    def _login_redirect(self, query: str) -> bool:
+        """/?token=xxx：token 正確就種 HttpOnly cookie 並導回 /，讓網頁介面（img/video 沒辦法帶 header）可用。"""
+        token = api_token()
+        if not token:
+            return False
+        given = (urllib.parse.parse_qs(query).get("token") or [""])[0]
+        if not _token_matches(given, token):
+            return False
+        self.send_response(302)
+        self.send_header("Set-Cookie",
+                         f"{TOKEN_COOKIE}={urllib.parse.quote(token)}; Path=/; HttpOnly; SameSite=Strict")
+        self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return True
+
     # -- 路由 ---------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
+
+        if route in ("/", "/index.html") and parsed.query and self._login_redirect(parsed.query):
+            return
+        if not self._authorized(route):
+            self._deny()
+            return
 
         if route in ("/", "/index.html"):
             self._send(200, render_page().encode(), "text/html; charset=utf-8")
@@ -1299,6 +1378,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         route = urllib.parse.urlparse(self.path).path
 
+        if not self._authorized(route):
+            self._deny()
+            return
         if not self._origin_ok():
             self._json({"error": "跨站請求已被拒絕"}, 403)
             return
