@@ -168,14 +168,15 @@ def log(msg: str) -> None:
 
 # 素材站：影片短（10–60 秒）、授權明確、有直連檔案網址。
 # 時長篩選（出廠 10 分鐘起跳）對它們沒有意義，下載也不走 yt-dlp。
-STOCK_PLATFORMS = ("pexels", "pixabay")
+MUSIC_PLATFORMS = ("openverse", "jamendo")  # 音樂庫：下載的是音訊檔
+STOCK_PLATFORMS = ("pexels", "pixabay") + MUSIC_PLATFORMS
 
 
 @dataclass
 class Item:
     """一支候選影片。"""
 
-    platform: str  # bilibili / youtube / pexels / pixabay
+    platform: str  # bilibili / youtube / pexels / pixabay / openverse / jamendo
     vid: str  # BV 號或 YouTube video id
     url: str
     title: str
@@ -219,6 +220,9 @@ class Item:
 
     def is_stock(self) -> bool:
         return self.platform in STOCK_PLATFORMS
+
+    def is_music(self) -> bool:
+        return self.platform in MUSIC_PLATFORMS
 
     def asset_id(self) -> str:
         """agent 用來引用這支影片的穩定鍵。"""
