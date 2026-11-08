@@ -291,7 +291,9 @@ class PixabaySource:
                 PIXABAY_API, params={"key": self.key, **params}, timeout=self.timeout
             )
         except requests.RequestException as exc:
-            raise SourceError(f"Pixabay 連線失敗：{exc}") from exc
+            # requests 的錯誤訊息會整串帶出網址，而 Pixabay 的 key 就在網址裡：
+            # 只報錯誤種類，並切斷例外鏈（--debug 的 traceback 也會印出鏈上的訊息）。
+            raise SourceError(f"Pixabay 連線失敗（{type(exc).__name__}）：網路不通或被擋") from None
         if resp.status_code in (401, 403):
             raise SourceError("Pixabay 拒絕這把 API key（401/403）：確認 key 是否正確")
         if resp.status_code == 400:

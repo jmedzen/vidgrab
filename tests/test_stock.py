@@ -442,3 +442,18 @@ def test_make_search_job_passes_orientation(monkeypatch):
     job = web.make_search_job({"keywords": ["x"], "platform": "stock", "orientation": "portrait"})
     assert web.wait_job(job, 5)
     assert seen["orientation"] == "portrait" and seen["platform"] == "stock"
+
+
+def test_pixabay_connection_error_never_leaks_key(monkeypatch):
+    import requests
+
+    src = PixabaySource(key="SECRET-KEY-123")
+
+    def boom(url, params=None, timeout=None):
+        raise requests.ConnectionError(f"Max retries exceeded with url: {url}?key=SECRET-KEY-123")
+
+    monkeypatch.setattr(src.session, "get", boom)
+    with pytest.raises(SourceError) as info:
+        src.search("x")
+    assert "SECRET-KEY-123" not in str(info.value)
+    assert info.value.__cause__ is None and info.value.__suppress_context__
