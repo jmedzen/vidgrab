@@ -563,4 +563,5 @@ NEEDS_NO_FFMPEG = frozenset({
     "build", "list", "vault", "find", "config", "show",
     "purge", "prune", "forget", "scrub", "login", "logout", "test",
     "web",  # web 本身不處理影片，是背景工作才需要
+    "mcp",  # 同 web：工具真的要下載時才檢查
 })

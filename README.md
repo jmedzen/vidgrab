@@ -355,6 +355,31 @@ curl -H "$H" -X POST http://127.0.0.1:8310/api/batch -d '{
 - `/api/pick` 的 job 結果也帶 `new_clips[]`
 - **所有 HTTP 錯誤**都是 `{"ok": false, "error": {"code", "message", "retryable", "hint"}}`，code 跟 CLI 同一套
 
+### MCP server（Claude Code 等 MCP client 直接用）
+
+兩種接法，工具一樣：
+
+```bash
+# stdio（本機，client 以子行程啟動）
+claude mcp add vidgrab -- /path/to/vidgrab mcp
+
+# Streamable HTTP（vidgrab web 已經在跑，容器或另一台機器也行）
+claude mcp add --transport http vidgrab http://127.0.0.1:8310/mcp \
+  --header "Authorization: Bearer $VIDGRAB_API_TOKEN"
+```
+
+| 工具 | 做什麼 |
+|---|---|
+| `search_footage` | 去 B 站／YouTube 搜新片，回候選清單（含授權、時長、原始頁面） |
+| `list_assets` | 查素材庫：概況、單一專案、或用關鍵字在已下載的素材裡搜 |
+| `find_asset` | 用 asset id／片段 id 找回素材 |
+| `grab_clip` | 下載整支或切片（冪等、可設期限），回新片段的 id、path、url、授權 |
+| `get_job` | 搜尋／下載超過等待時間（預設 90 秒）時，用 job id 回頭查 |
+
+工具**只回 JSON 與網址，不回影片內容**；片段用 `url`（`/file/...`，接在 vidgrab 位址後面）或同機器的 `path` 取用。
+失敗是 `isError: true` 加 `{code, message, retryable, hint}`，跟 CLI／REST 同一套。
+沒有引入 `mcp` 套件（協定子集自己實作），所以 Docker 映像不會變大。
+
 ### 在已下載的素材裡搜尋
 
 `search` 是去平台找**新片**；`vault --query` 是在你**手上的素材**裡找。

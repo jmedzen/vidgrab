@@ -750,6 +750,13 @@ def cmd_logout(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """MCP server（stdio）。HTTP 版本在 `vidgrab web` 的 POST /mcp。"""
+    from .mcp import serve_stdio
+
+    return serve_stdio()
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     from .web import serve
 
@@ -955,6 +962,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     lo = sub.add_parser("logout", help="登出 B 站並刪除 cookie")
     lo.set_defaults(func=cmd_logout)
+
+    mc = sub.add_parser("mcp", help="MCP server（stdio），給 Claude Code 等 MCP client 用")
+    mc.set_defaults(func=cmd_mcp)
 
     w = sub.add_parser("web", help="開 Web UI（本機網頁介面）")
     w.add_argument("--host", default=None, help="預設讀 VIDGRAB_HOST，否則 127.0.0.1")

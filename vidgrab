@@ -25,7 +25,7 @@ for _a in "$@"; do
   esac
 done
 if [ -n "$_first_cmd" ]; then
-  case " build list vault find config show login logout purge prune forget scrub test web " in
+  case " build list vault find config show login logout purge prune forget scrub test web mcp " in
     *" $_first_cmd "*) needs_ffmpeg=0 ;;
   esac
 fi
