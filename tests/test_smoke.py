@@ -3250,7 +3250,8 @@ def test_compose_publishes_loopback_only():
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text(encoding="utf-8")
-    assert '"127.0.0.1:8310:8310"' in text
+    # 預設只對本機發佈；要對外得在 .env 明確把 VIDGRAB_BIND 改掉
+    assert '"${VIDGRAB_BIND:-127.0.0.1}:${VIDGRAB_PUBLISH_PORT:-8310}:8310"' in text
     assert "VIDGRAB_API_TOKEN" in text
 
 
