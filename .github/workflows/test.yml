@@ -41,11 +41,14 @@ jobs:
 
       - name: 跑起來確認健康
         run: |
-          docker run -d --name vidgrab-ci -p 8310:8310 vidgrab:ci
+          docker run -d --name vidgrab-ci -p 8310:8310 -e VIDGRAB_API_TOKEN=ci-token vidgrab:ci
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8310/api/version; then
               echo
               echo "healthy"
+              # 認證要真的生效：沒帶 token 401，帶了 200
+              test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8310/api/projects)" = "401"
+              curl -fsS -H "Authorization: Bearer ci-token" http://127.0.0.1:8310/api/projects
               exit 0
             fi
             sleep 2

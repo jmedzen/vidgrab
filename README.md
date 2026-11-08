@@ -45,7 +45,8 @@ docker compose up -d
 ```bash
 # 不用 compose
 docker build -t vidgrab .
-docker run --rm -p 8310:8310 -v vidgrab-data:/data vidgrab
+docker run --rm -p 127.0.0.1:8310:8310 -e VIDGRAB_NO_AUTH=1 -v vidgrab-data:/data vidgrab
+# 要對外發佈 port 的話改用 token：-p 8310:8310 -e VIDGRAB_API_TOKEN=<token>
 ```
 
 ### 本機 Python

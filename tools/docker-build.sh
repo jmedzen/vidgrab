@@ -24,5 +24,5 @@ docker build --build-arg "VIDGRAB_BUILD=$BUILD" -t "$TAG" .
 
 echo
 echo "✔ 完成：$TAG"
-echo "  跑起來：docker run --rm -p 8310:8310 -v vidgrab-data:/data $TAG"
+echo "  跑起來：docker run --rm -p 127.0.0.1:8310:8310 -e VIDGRAB_NO_AUTH=1 -v vidgrab-data:/data $TAG"
 echo "  開起來：http://127.0.0.1:8310"
