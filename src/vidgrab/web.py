@@ -80,6 +80,41 @@ class Job:
         }
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    """path 是否在 root 底下（以目錄層級判斷，兩者都先 resolve）。"""
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def parse_range(header: str | None, size: int) -> tuple[int, int] | None | str:
+    """解析單一 Range。回傳 (start, end)、None（沒有 Range 或無法解析，當整檔）、
+    或 "unsatisfiable"（要回 416）。支援 `a-b`、`a-` 與 suffix `-N`（最後 N bytes）。"""
+    if not header or not header.startswith("bytes="):
+        return None
+    spec = header.split("=", 1)[1].split(",")[0].strip()
+    lo, sep, hi = spec.partition("-")
+    if not sep:
+        return None
+    try:
+        if not lo:
+            n = int(hi)
+            if n <= 0:
+                return "unsatisfiable"
+            if size == 0:
+                return "unsatisfiable"
+            return max(0, size - n), size - 1
+        start = int(lo)
+        end = int(hi) if hi else size - 1
+    except ValueError:
+        return None
+    if start < 0 or start >= size or (hi and end < start):
+        return "unsatisfiable"
+    return start, min(end, size - 1)
+
+
 def _jsonable(data: Any) -> Any:
     if isinstance(data, Path):
         return str(data)
@@ -1009,9 +1044,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _project_dir(self, name: str) -> Path | None:
         name = urllib.parse.unquote(name)
-        path = (tasks.projects_root() / name).resolve()
+        # 專案名稱只能是單層資料夾名：拒絕 / \\ .. 與空字串
+        if not name or name in (".", "..") or "/" in name or "\\" in name or "\0" in name:
+            return None
         root = tasks.projects_root().resolve()
-        if not str(path).startswith(str(root)) or not (path / "manifest.json").exists():
+        path = (root / name).resolve()
+        # 用 relative_to 比目錄層級；str.startswith 會讓 projects-old 通過 projects 的檢查
+        if not _is_within(path, root) or path == root or not (path / "manifest.json").exists():
             return None
         return path
 
@@ -1428,15 +1467,32 @@ class Handler(BaseHTTPRequestHandler):
 
         if route.startswith("/api/delete-clip"):
             try:
-                target = Path(body.get("path", "")).resolve()
                 root = tasks.projects_root().resolve()
-                if not str(target).startswith(str(root)) or not target.exists():
+                target = Path(body.get("path", "")).resolve()
+                if not _is_within(target, root) or not target.is_file():
                     raise ValueError("不合法路徑")
-                project = target.parents[1]
-                target.unlink()
+                rel = target.relative_to(root).parts
+                if len(rel) < 2:
+                    raise ValueError("不合法路徑")
+                project = root / rel[0]
+                if not (project / "manifest.json").exists():
+                    raise ValueError("不合法路徑")
                 manifest, items = tasks.load_project(project)
+                # 只能刪 manifest 登記過的片段檔，且只移除「路徑相同」的那筆記錄
+                def same(c):
+                    cp = c.get("path", "")
+                    if not cp:
+                        return False
+                    cpath = Path(cp)
+                    if not cpath.is_absolute():
+                        cpath = project / cpath
+                    return cpath.resolve() == target
+
+                if not any(same(c) for item in items for c in item.clips):
+                    raise ValueError("這個檔案不是已登記的片段")
+                target.unlink()
                 for item in items:
-                    item.clips = [c for c in item.clips if Path(c.get("path", "")).name != target.name]
+                    item.clips = [c for c in item.clips if not same(c)]
                 tasks.save_project(project, manifest, items)
                 self._json({"ok": True})
             except Exception as exc:  # noqa: BLE001
@@ -1589,7 +1645,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
             return
         project_name, rel = urllib.parse.unquote(parts[0]), urllib.parse.unquote(parts[1])
-        project = tasks.projects_root() / project_name
+        root = tasks.projects_root().resolve()
+        project = root / project_name
         target = (project / rel).resolve()
         # 不能用 str.startswith 判斷！那是路徑穿越漏洞：
         #   /projects/victim  vs  /projects/victim-evil/secret.txt
@@ -1597,6 +1654,9 @@ class Handler(BaseHTTPRequestHandler):
         # 用 relative_to 才是真的在比目錄層級。
         try:
             base = project.resolve()
+            base.relative_to(root)
+            if base == root:
+                raise ValueError("project root")
             target.relative_to(base)
         except (ValueError, OSError):
             self._send(404, b"not found", "text/plain")
@@ -1611,27 +1671,23 @@ class Handler(BaseHTTPRequestHandler):
         }.get(target.suffix.lower(), "application/octet-stream")
 
         size = target.stat().st_size
-        range_header = self.headers.get("Range")
+        rng = parse_range(self.headers.get("Range"), size)
+        if rng == "unsatisfiable":
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         start, end = 0, size - 1
-        if range_header and range_header.startswith("bytes="):
-            spec = range_header.split("=", 1)[1].split(",")[0]
-            lo, _, hi = spec.partition("-")
-            try:
-                if lo:
-                    start = int(lo)
-                if hi:
-                    end = int(hi)
-            except ValueError:
-                start, end = 0, size - 1
-            start = max(0, min(start, size - 1))
-            end = max(start, min(end, size - 1))
+        if rng:
+            start, end = rng
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         else:
             self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Content-Length", str(max(0, end - start + 1)))
         self.end_headers()
         try:
             with target.open("rb") as fh:

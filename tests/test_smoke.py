@@ -2988,3 +2988,101 @@ def test_clip_schema_documents_missing_flag(web):
     spec = get(web + "/api/openapi.json")
     props = spec["components"]["schemas"]["Clip"]["properties"]
     assert "missing" in props, "Clip 少了 missing"
+
+
+# ---------------------------------------------------------------- 路徑安全與 Range（#1 #4）
+
+
+def _raw(base: str, method: str, path: str, headers=None, body: bytes | None = None):
+    import http.client
+
+    host, port = base.replace("http://", "").split(":")
+    c = http.client.HTTPConnection(host, int(port), timeout=5)
+    c.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+    c.putheader("Host", f"{host}:{port}")
+    for k, v in (headers or {}).items():
+        c.putheader(k, v)
+    if body is not None:
+        c.putheader("Content-Length", str(len(body)))
+    c.endheaders(body)
+    r = c.getresponse()
+    data = r.read()
+    out = (r.status, dict(r.getheaders()), data)
+    c.close()
+    return out
+
+
+def test_project_dir_rejects_sibling_prefix(tmp_path, web):
+    """`projects-old` 不能通過 `projects` 的根目錄檢查（issue #1）。"""
+    victim = tmp_path / "projects-old" / "victim"
+    victim.mkdir(parents=True)
+    (victim / "manifest.json").write_text("{}", encoding="utf-8")
+    (victim / "keep.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "projects").mkdir(exist_ok=True)
+
+    code, _, _ = _raw(web, "GET", "/api/project/..%2Fprojects-old%2Fvictim")
+    assert code == 404
+
+    body = json.dumps({"project": "../projects-old/victim"}).encode()
+    code, _, _ = _raw(web, "POST", "/api/project/delete", {"Content-Type": "application/json"}, body)
+    assert code == 404
+    assert victim.exists()
+
+    body = json.dumps({"path": str(victim / "keep.txt")}).encode()
+    code, _, _ = _raw(web, "POST", "/api/delete-clip", {"Content-Type": "application/json"}, body)
+    assert code == 400
+    assert (victim / "keep.txt").exists(), "根目錄外的檔案不能被刪"
+
+
+def test_delete_clip_only_registered_clips(tmp_path, web):
+    """delete-clip 只能刪 manifest 登記過的片段，不能刪 manifest.json 或同名的別支（issue #1）。"""
+    proj = _make_project(tmp_path, name="dc")
+    clips = proj / "clips"
+    clips.mkdir()
+    a = clips / "same.mp4"
+    a.write_bytes(b"a")
+    other = proj / "other"
+    other.mkdir()
+    b = other / "same.mp4"
+    b.write_bytes(b"b")
+    results = json.loads((proj / "results.json").read_text(encoding="utf-8"))
+    results[0]["clips"] = [
+        {"path": str(a), "start": 0.0, "end": 5.0},
+        {"path": str(b), "start": 5.0, "end": 10.0},
+    ]
+    (proj / "results.json").write_text(json.dumps(results), encoding="utf-8")
+    hdr = {"Content-Type": "application/json"}
+
+    code, _, _ = _raw(web, "POST", "/api/delete-clip", hdr,
+                      json.dumps({"path": str(proj / "manifest.json")}).encode())
+    assert code == 400 and (proj / "manifest.json").exists()
+
+    code, _, _ = _raw(web, "POST", "/api/delete-clip", hdr, json.dumps({"path": str(a)}).encode())
+    assert code == 200 and not a.exists() and b.exists()
+    left = json.loads((proj / "results.json").read_text(encoding="utf-8"))[0]["clips"]
+    assert [c["path"] for c in left] == [str(b)], "同檔名的另一筆記錄不能被一起刪"
+
+
+def test_file_range_semantics(tmp_path, web):
+    """suffix range、超出範圍、0 byte 檔案（issue #4）。"""
+    proj = _make_project(tmp_path, name="rg")
+    (proj / "clips").mkdir()
+    (proj / "clips" / "a.bin").write_bytes(bytes(range(100)) * 10)  # 1000 bytes
+    (proj / "clips" / "empty.bin").write_bytes(b"")
+    url = "/file/rg/clips/a.bin"
+
+    code, h, body = _raw(web, "GET", url, {"Range": "bytes=-100"})
+    assert code == 206 and h["Content-Range"] == "bytes 900-999/1000" and len(body) == 100
+    code, h, body = _raw(web, "GET", url, {"Range": "bytes=10-19"})
+    assert code == 206 and h["Content-Range"] == "bytes 10-19/1000" and len(body) == 10
+    code, h, body = _raw(web, "GET", url, {"Range": "bytes=990-"})
+    assert code == 206 and h["Content-Range"] == "bytes 990-999/1000"
+    code, h, _ = _raw(web, "GET", url, {"Range": "bytes=2000-"})
+    assert code == 416 and h["Content-Range"] == "bytes */1000"
+    code, h, body = _raw(web, "GET", url)
+    assert code == 200 and len(body) == 1000
+
+    code, h, body = _raw(web, "GET", "/file/rg/clips/empty.bin")
+    assert code == 200 and body == b"" and h["Content-Length"] == "0"
+    code, _, _ = _raw(web, "GET", "/file/rg/clips/empty.bin", {"Range": "bytes=0-"})
+    assert code == 416
