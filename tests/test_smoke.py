@@ -3159,3 +3159,74 @@ def test_job_without_subscribers_holds_no_queue_and_ids_unique():
     while not q.empty():
         last = q.get_nowait()
     assert last == ("error", "boom"), "結尾事件不會被丟掉"
+
+
+# ---------------------------------------------------------------- API token（#5）
+
+
+def test_token_auth_protects_api_and_files(tmp_path, web, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_API_TOKEN", "s3cret")
+    proj = _make_project(tmp_path, name="au")
+    (proj / "clips").mkdir()
+    (proj / "clips" / "a.txt").write_bytes(b"hi")
+
+    for path in ("/api/projects", "/api/config", "/file/au/clips/a.txt", "/api/project/au"):
+        code, h, body = _raw(web, "GET", path)
+        assert code == 401, path
+        assert h.get("WWW-Authenticate", "").startswith("Bearer")
+        assert json.loads(body)["code"] == "unauthorized"
+    code, _, _ = _raw(web, "POST", "/api/project/delete", {"Content-Type": "application/json"},
+                      json.dumps({"project": "au"}).encode())
+    assert code == 401 and proj.exists()
+
+    # 公開路徑
+    for path in ("/", "/api/version", "/api/openapi.json"):
+        assert _raw(web, "GET", path)[0] == 200, path
+
+    # Bearer
+    ok = {"Authorization": "Bearer s3cret"}
+    assert _raw(web, "GET", "/api/projects", ok)[0] == 200
+    assert _raw(web, "GET", "/file/au/clips/a.txt", ok)[2] == b"hi"
+    assert _raw(web, "GET", "/api/projects", {"Authorization": "Bearer nope"})[0] == 401
+
+    # 瀏覽器：/?token= 種 cookie
+    code, h, _ = _raw(web, "GET", "/?token=wrong")
+    assert code == 200 and "Set-Cookie" not in h
+    code, h, _ = _raw(web, "GET", "/?token=s3cret")
+    assert code == 302 and "HttpOnly" in h["Set-Cookie"] and "SameSite=Strict" in h["Set-Cookie"]
+    cookie = h["Set-Cookie"].split(";")[0]
+    assert _raw(web, "GET", "/api/projects", {"Cookie": cookie})[0] == 200
+
+
+def test_no_token_means_open(web):
+    assert _raw(web, "GET", "/api/projects")[0] == 200
+
+
+def test_web_refuses_lan_bind_without_token(monkeypatch, capsys):
+    import argparse
+
+    from vidgrab import cli
+
+    monkeypatch.delenv("VIDGRAB_API_TOKEN", raising=False)
+    monkeypatch.delenv("VIDGRAB_NO_AUTH", raising=False)
+    served = []
+    monkeypatch.setattr("vidgrab.web.serve", lambda **kw: served.append(kw))
+    ns = argparse.Namespace(host="0.0.0.0", port=8399, allow_lan=True, no_auth=False, no_open=True)
+    assert cli.cmd_web(ns) == 2 and not served
+    assert "VIDGRAB_API_TOKEN" in capsys.readouterr().err
+
+    ns.no_auth = True
+    assert cli.cmd_web(ns) == 0 and served
+
+    served.clear()
+    ns.no_auth = False
+    monkeypatch.setenv("VIDGRAB_API_TOKEN", "t")
+    assert cli.cmd_web(ns) == 0 and served
+
+
+def test_compose_publishes_loopback_only():
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert '"127.0.0.1:8310:8310"' in text
+    assert "VIDGRAB_API_TOKEN" in text

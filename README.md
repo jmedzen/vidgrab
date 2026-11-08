@@ -188,6 +188,20 @@ brew install ffmpeg uv
 `login` / `logout` 成對存在：`login` 寫入 `auth/` 下的 cookie，`logout` 把它刪掉。
 換帳號、或懷疑 cookie 壞掉時就 `logout` 再 `login`。
 
+### API token（要讓別台機器／容器裡的 agent 連進來時）
+
+```bash
+export VIDGRAB_API_TOKEN=$(openssl rand -hex 24)
+./vidgrab web --host 0.0.0.0 --allow-lan
+```
+
+設了 `VIDGRAB_API_TOKEN` 之後，`/api/*` 與 `/file/*` 都要帶 `Authorization: Bearer <token>`，
+否則回 `401 {"code":"unauthorized"}`。頁面外殼、`/api/version`（healthcheck）與 API 文件維持公開。
+瀏覽器先開一次 `http://host:8310/?token=<token>`，會種一個 HttpOnly、SameSite=Strict 的 cookie，之後網頁介面（含 `<img>`／`<video>`）就能用。
+
+**綁非本機位址又沒設 token → 拒絕啟動**（`--allow-lan` 也一樣）。外層已經有保護、確定要裸奔時才加 `--no-auth`（或 `VIDGRAB_NO_AUTH=1`）。
+`docker-compose.yml` 預設只對 `127.0.0.1` 發佈 port；要對外請同時設 token。
+
 ### 這件事沒有登入機制，所以不預設對外開放
 
 `vidgrab web` 預設綁 `127.0.0.1`。**這個介面本身沒有任何認證**，
