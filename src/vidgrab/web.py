@@ -10,6 +10,7 @@ import socket
 import threading
 import time
 import traceback
+import uuid
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,43 +30,81 @@ LICENSE_SHORT = {
 }
 
 JOBS: dict[str, dict[str, Any]] = {}
-QR: dict[str, float] = {}
 LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------- jobs
 
 
+SUBSCRIBER_QUEUE_SIZE = 500
+
+
 class Job:
+    """一個背景作業。進度事件用 pub/sub 廣播：每個 SSE 連線各自一個有上限的 queue，
+    沒有訂閱者（agent 只輪詢 /api/job/{id}）時不累積任何東西。"""
+
     def __init__(self, kind: str, label: str):
-        self.id = f"{int(time.time() * 1000)}-{abs(hash(label)) % 10000}"
+        self.id = uuid.uuid4().hex
         self.kind = kind
         self.label = label
         self.messages: list[str] = []
         self.done = False
         self.error = ""
         self.result: dict[str, Any] = {}
-        self.queue: queue.Queue = queue.Queue()
         self.started = time.time()
         self.finished = 0.0
+        self._lock = threading.Lock()
+        self._subs: list[queue.Queue] = []
+
+    def _publish(self, event: tuple[str, Any]) -> None:
+        for q in list(self._subs):
+            while True:
+                try:
+                    q.put_nowait(event)
+                    break
+                except queue.Full:
+                    # 慢的訂閱者：丟最舊的進度，但結尾事件一定要送到
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
 
     def emit(self, message: str) -> None:
-        # 日誌限長：長時間下載會產生上萬行，全留在記憶體裡沒有意義
-        if len(self.messages) < _job_limits()[2]:
-            self.messages.append(message)
-        self.queue.put(("log", message))
+        with self._lock:
+            # 日誌限長：長時間下載會產生上萬行，全留在記憶體裡沒有意義
+            if len(self.messages) < _job_limits()[2]:
+                self.messages.append(message)
+            self._publish(("log", message))
 
     def finish(self, result: dict[str, Any]) -> None:
-        self.done = True
-        self.finished = time.time()
-        self.result = result
-        self.queue.put(("done", result))
+        with self._lock:
+            self.done = True
+            self.finished = time.time()
+            self.result = result
+            self._publish(("done", result))
 
     def fail(self, message: str) -> None:
-        self.done = True
-        self.finished = time.time()
-        self.error = message
-        self.queue.put(("error", message))
+        with self._lock:
+            self.done = True
+            self.finished = time.time()
+            self.error = message
+            self._publish(("error", message))
+
+    def subscribe(self) -> tuple[list[str], queue.Queue | None, tuple[str, Any] | None]:
+        """回傳 (歷史日誌, 訂閱用 queue, 已結束時的結尾事件)。歷史與訂閱在同一把鎖內取得，不漏不重。"""
+        with self._lock:
+            history = list(self.messages)
+            if self.done:
+                final = ("error", self.error) if self.error else ("done", self.result)
+                return history, None, final
+            q: queue.Queue = queue.Queue(maxsize=SUBSCRIBER_QUEUE_SIZE)
+            self._subs.append(q)
+            return history, q, None
+
+    def unsubscribe(self, q: queue.Queue | None) -> None:
+        with self._lock:
+            if q in self._subs:
+                self._subs.remove(q)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -1510,8 +1549,6 @@ class Handler(BaseHTTPRequestHandler):
             qr = auth.generate()
             png = auth.home() / "bilibili-qr.png"
             png.write_bytes(qr["png"])
-            with LOCK:
-                QR[f"{qr['key']}"] = time.time()
             self._json({"key": qr["key"], "image": "/api/login/qr", "expires_in": 180})
             return
 
@@ -1536,25 +1573,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
+        history, q, final = job.subscribe()
         try:
-            for message in job.messages:
+            for message in history:
                 self._log_event(message)
-            # 歷史已經重播過，佇列裡同一批 log 丟掉，只留結尾事件
+            if final is not None:
+                self._event(*final)
+                return
+            assert q is not None
             while True:
                 try:
-                    kind, payload = job.queue.get_nowait()
+                    kind, payload = q.get(timeout=5)
                 except queue.Empty:
-                    break
-                if kind in ("done", "error"):
-                    self._event(kind, payload)
-                    return
-            while True:
-                try:
-                    kind, payload = job.queue.get(timeout=5)
-                except queue.Empty:
-                    # 客戶端可能早就斷了。只寫 ping 的話，
-                    # 要等到下一次 flush 失敗才發現（原本是 20 秒一輪）。
-                    # 先用 select 確認連線還在，斷了就立刻收工。
+                    # 客戶端可能早就斷了。先用 select 確認連線還在，斷了就立刻收工。
                     if self._peer_gone():
                         return
                     self.wfile.write(b": ping\n\n")
@@ -1568,6 +1599,8 @@ class Handler(BaseHTTPRequestHandler):
                     break
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return
+        finally:
+            job.unsubscribe(q)
 
     def _peer_gone(self) -> bool:
         """連線的另一端還在嗎？（不回傳資料，只問 socket 狀態）"""

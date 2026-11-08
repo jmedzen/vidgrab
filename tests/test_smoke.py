@@ -3121,3 +3121,41 @@ def test_run_stream_check_hook_kills_process():
         media._run_stream([sys.executable, "-c", "import time; time.sleep(60)"],
                           timeout=30, check=lambda: RuntimeError("stop"))
     assert _t.time() - t0 < 10
+
+
+def test_job_pubsub_each_subscriber_gets_every_event():
+    """兩個訂閱者各自收到全部事件，done 不會被另一邊搶走（issue #3）。"""
+    from vidgrab.web import Job
+
+    job = Job("t", "x")
+    job.emit("early")
+    h1, q1, f1 = job.subscribe()
+    h2, q2, f2 = job.subscribe()
+    assert h1 == h2 == ["early"] and f1 is None and f2 is None
+    job.emit("a")
+    job.finish({"ok": 1})
+    for q in (q1, q2):
+        assert q.get_nowait() == ("log", "a")
+        assert q.get_nowait() == ("done", {"ok": 1})
+    _, q3, final = job.subscribe()
+    assert q3 is None and final == ("done", {"ok": 1})
+
+
+def test_job_without_subscribers_holds_no_queue_and_ids_unique():
+    from vidgrab.web import SUBSCRIBER_QUEUE_SIZE, Job
+
+    job = Job("t", "same")
+    for i in range(SUBSCRIBER_QUEUE_SIZE * 3):
+        job.emit(f"m{i}")
+    assert not job._subs
+    assert len({Job("t", "same").id for _ in range(500)}) == 500
+
+    _, q, _ = job.subscribe()
+    for i in range(SUBSCRIBER_QUEUE_SIZE * 2):
+        job.emit(f"n{i}")
+    job.fail("boom")
+    assert q.qsize() == SUBSCRIBER_QUEUE_SIZE, "慢訂閱者有上限"
+    last = None
+    while not q.empty():
+        last = q.get_nowait()
+    assert last == ("error", "boom"), "結尾事件不會被丟掉"
