@@ -3394,7 +3394,7 @@ def test_mcp_initialize_and_list_tools(web):
 
     code, out = _mcp(web, "tools/list")
     names = {t["name"] for t in out["result"]["tools"]}
-    assert names == {"search_footage", "list_assets", "find_asset", "grab_clip", "get_job"}
+    assert names == {"search_footage", "list_assets", "find_asset", "grab_clip", "grab_frame", "get_job"}
     for t in out["result"]["tools"]:
         assert t["inputSchema"]["type"] == "object" and t["description"]
     assert _mcp(web, "nope")[1]["error"]["code"] == -32601
@@ -3486,3 +3486,101 @@ def test_mcp_stdio_roundtrip(tmp_path):
     lines = [json.loads(ln) for ln in proc.stdout.splitlines() if ln.strip()]
     assert [m["id"] for m in lines] == [1, 2, 3], proc.stdout + proc.stderr
     assert lines[2]["result"]["structuredContent"]["schema"] == "vidgrab.vault/1"
+
+
+# ---------------------------------------------------------------- 單格畫面（#7）
+
+
+def _real_clip(tmp_path, name="fr", start=60.0, end=64.0):
+    """造一個真的 4 秒 mp4（ffmpeg testsrc）並登記成 [start, end] 的片段。"""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("需要 ffmpeg")
+    proj = _make_project(tmp_path, name=name)
+    clips = proj / "clips"
+    clips.mkdir()
+    mp4 = clips / "youtube_v1_clip.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc=size=640x360:rate=10:duration=4", "-pix_fmt", "yuv420p", str(mp4)], check=True)
+    results = json.loads((proj / "results.json").read_text(encoding="utf-8"))
+    results[0]["duration"] = 600
+    results[0]["clips"] = [{"path": str(mp4), "start": start, "end": end, "width": 640, "height": 360}]
+    (proj / "results.json").write_text(json.dumps(results), encoding="utf-8")
+    return proj
+
+
+def test_api_frame_from_clip_and_cache(tmp_path, web):
+    _real_clip(tmp_path)
+    code, out = _post_json(web, "/api/frame", {"id": "youtube:v1#60-64", "at": 62, "width": 320})
+    assert code == 200, out
+    assert out["schema"] == "vidgrab.frame/1" and out["source"] == "clip"
+    assert out["width"] == 320 and out["format"] == "jpg" and out["at"] == 62
+    assert out["url"].startswith("/file/fr/frames/")
+    code, headers, body = _raw(web, "GET", out["url"])
+    assert code == 200 and body[:2] == b"\xff\xd8", "要是真的 JPEG"
+    assert "credit_hint" in out and out["clip_id"] == "youtube:v1#60-64"
+
+    code, again = _post_json(web, "/api/frame", {"id": "youtube:v1#60-64", "at": 62, "width": 320})
+    assert code == 200 and again["path"] == out["path"]
+
+    # 不給 at：片段正中間；asset id 且片段涵蓋 at：同樣從片段抽
+    code, mid = _post_json(web, "/api/frame", {"id": "youtube:v1#60-64"})
+    assert code == 200 and mid["at"] == 62
+    code, viaasset = _post_json(web, "/api/frame", {"id": "youtube:v1", "at": 61, "format": "png"})
+    assert code == 200 and viaasset["source"] == "clip" and viaasset["format"] == "png"
+    assert _raw(web, "GET", viaasset["url"])[2][:4] == b"\x89PNG"
+
+
+def test_api_frame_bad_input(tmp_path, web):
+    _real_clip(tmp_path, name="fb")
+    cases = [
+        ({"id": "youtube:v1#60-64", "at": 100}, 400, "bad_input"),      # 不在片段內
+        ({"id": "youtube:v1"}, 400, "bad_input"),                         # asset id 沒給 at
+        ({"id": "youtube:v1", "at": 9999}, 400, "bad_input"),             # 超過影片長度
+        ({"id": "youtube:v1#60-64", "at": 61, "width": 5}, 400, "bad_input"),
+        ({"id": "youtube:v1#60-64", "at": 61, "format": "gif"}, 400, "bad_input"),
+        ({"id": "youtube:nope", "at": 1}, 404, "not_found"),
+        ({}, 400, "bad_input"),
+    ]
+    for payload, status, code_ in cases:
+        code, out = _post_json(web, "/api/frame", payload)
+        assert code == status and out["error"]["code"] == code_, (payload, code, out)
+
+
+def test_api_frame_remote_when_no_clip_covers(tmp_path, web, monkeypatch):
+    """asset id 的時間點沒有已下載片段 → 走遠端單秒抓取（這裡用假的 probe_frames）。"""
+    import shutil
+    import subprocess
+
+    from vidgrab import media
+
+    _real_clip(tmp_path, name="fr2")
+    calls = []
+
+    def fake_probe(item, outdir, n=3, opts=None, points=None, width=480):
+        calls.append(points)
+        dest = Path(outdir) / "x_00.jpg"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=1:duration=1",
+                        "-frames:v", "1", str(dest)], check=True)
+        return [dest]
+
+    monkeypatch.setattr(media, "probe_frames", fake_probe)
+    code, out = _post_json(web, "/api/frame", {"id": "youtube:v1", "at": 300, "width": 160})
+    assert code == 200, out
+    assert out["source"] == "remote" and calls == [[300.0]] and out["clip_id"] is None
+    code, again = _post_json(web, "/api/frame", {"id": "youtube:v1", "at": 300, "width": 160})
+    assert again["path"] == out["path"] and len(calls) == 1, "第二次要吃快取"
+
+    monkeypatch.setattr(media, "probe_frames", lambda *a, **k: [])
+    code, fail = _post_json(web, "/api/frame", {"id": "youtube:v1", "at": 400})
+    assert code == 502 and fail["error"]["code"] == "download_failed" and fail["error"]["retryable"]
+
+
+def test_mcp_grab_frame(tmp_path, web):
+    _real_clip(tmp_path, name="fm")
+    code, out = _mcp(web, "tools/call", {"name": "grab_frame",
+                                         "arguments": {"id": "youtube:v1#60-64", "at": 63, "width": 200}})
+    res = out["result"]
+    assert res["isError"] is False and res["structuredContent"]["url"].startswith("/file/fm/frames/")

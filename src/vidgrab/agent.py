@@ -431,3 +431,147 @@ def run_batch(project: Path, targets: list[int], *, timeout: float | None = None
     if error:
         out["error"] = error
     return out
+
+
+FRAME_FORMATS = ("jpg", "png")
+
+
+def _locate(needle: str, project: str = "") -> tuple[Path, list[Item], int, dict[str, Any] | None]:
+    """id（asset id 或片段 id）→ (專案資料夾, 該專案的候選, 素材索引, 片段或 None)。"""
+    from . import tasks
+    from .models import NotFound
+
+    asset_id, _, _span = needle.partition("#")
+    root = tasks.projects_root()
+    names = [project] if project else sorted(
+        p.name for p in root.glob("*") if (p / "manifest.json").exists())
+    for name in names:
+        folder = root / name
+        if not (folder / "manifest.json").exists():
+            continue
+        _, items = tasks.load_project(folder)
+        for idx, item in enumerate(items):
+            if item.asset_id() != asset_id:
+                continue
+            if "#" not in needle:
+                return folder, items, idx, None
+            from .models import clip_id
+
+            for c in item.clips:
+                cid = c.get("id") or clip_id(item.platform, item.vid, c.get("start"), c.get("end"))
+                if cid == needle:
+                    return folder, items, idx, c
+    raise NotFound(f"找不到：{needle}", hint="id 長得像 bilibili:BV1xx 或 bilibili:BV1xx#60-75；也可以指定 project")
+
+
+def grab_frame(needle: str, at: float | None = None, *, width: int = 640, fmt: str = "jpg",
+               project: str = "") -> dict[str, Any]:
+    """單格畫面：回 PNG/JPG 的絕對路徑與 `/file/...` 網址（封面、縮圖、分鏡用）。
+
+    - `needle` 是片段 id：從那個已下載的片段抽（本機 ffmpeg，很快）。`at` 是**原影片的秒數**
+      （跟片段 id 裡的 60-75 同一條時間軸），不給就取片段正中間。
+    - `needle` 是 asset id：若已下載的片段涵蓋 `at` 就從片段抽，否則只下載該時間點的 1 秒去抽
+      （需要網路，成本很低）。這種一定要給 `at`。
+    - 同一個 (素材, 秒數, 寬度, 格式) 只會做一次，之後直接回快取。
+    """
+    from . import media, tasks
+    from .models import BadInput, DownloadFailed, clip_id
+
+    fmt = (fmt or "jpg").lower().lstrip(".")
+    if fmt == "jpeg":
+        fmt = "jpg"
+    if fmt not in FRAME_FORMATS:
+        raise BadInput(f"format 只能是 {'／'.join(FRAME_FORMATS)}", hint="例如 jpg")
+    try:
+        width = int(width)
+    except (TypeError, ValueError):
+        raise BadInput("width 必須是整數") from None
+    if not 16 <= width <= 3840:
+        raise BadInput("width 要在 16–3840 之間")
+    if at is not None:
+        try:
+            at = float(at)
+        except (TypeError, ValueError):
+            raise BadInput("at 必須是秒數") from None
+        if at < 0:
+            raise BadInput("at 不能是負的")
+
+    folder, items, idx, clip = _locate(str(needle), project)
+    item = items[idx]
+    root = tasks.projects_root()
+
+    def covering(c: dict[str, Any], t: float) -> bool:
+        p = Path(_rel_or_abs(c.get("path") or "", root))
+        if not p.exists():
+            return False
+        if c.get("start") is None:
+            return True  # 整支
+        return float(c["start"]) - 0.01 <= t <= float(c.get("end") or 0) + 0.01
+
+    if clip is not None:
+        if at is None:
+            if clip.get("start") is None:
+                dur = float(media.ffprobe(Path(_rel_or_abs(clip.get("path") or "", root))).get("duration") or 0)
+                at = dur / 2
+            else:
+                at = (float(clip["start"]) + float(clip.get("end") or clip["start"])) / 2
+        if not covering(clip, at):
+            raise BadInput(
+                f"at={at} 不在這個片段內（{clip.get('start')}–{clip.get('end')} 秒）或檔案不見了",
+                hint="at 是原影片的秒數；要別的時間點請改用 asset id（會另外下載那一秒）")
+        source_clip = clip
+    else:
+        if at is None:
+            raise BadInput("用 asset id 抽畫面一定要給 at（秒）", hint="例如 at: 12.5")
+        if item.duration and at > float(item.duration):
+            raise BadInput(f"at={at} 超過影片長度 {item.duration} 秒")
+        source_clip = next((c for c in item.clips if covering(c, at)), None)
+
+    frames_dir = folder / "frames"
+    name = f"{item.platform}_{item.vid}_at{int(round(at * 1000)):08d}_w{width}.{fmt}"
+    dest = frames_dir / name
+    source = "cache"
+    if not (dest.exists() and dest.stat().st_size > 0):
+        if source_clip is not None:
+            video = Path(_rel_or_abs(source_clip.get("path") or "", root))
+            offset = 0.0 if source_clip.get("start") is None else at - float(source_clip["start"])
+            if source_clip.get("start") is None:
+                offset = at
+            if media.extract_frame(video, dest, offset, width) is None:
+                raise DownloadFailed("抽畫面失敗（ffmpeg）", hint="檔案可能壞了，試試重新下載該片段")
+            source = "clip"
+        else:
+            import shutil
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                got = media.probe_frames(item, Path(tmp), points=[at], width=width)
+                if not got:
+                    raise DownloadFailed("抓不到那個時間點的畫面", hint="可能需要登入 B 站，或影片暫時不可用")
+                frames_dir.mkdir(parents=True, exist_ok=True)
+                if fmt == "jpg":
+                    shutil.move(str(got[0]), dest)
+                else:  # probe_frames 只產 jpg；要 png 就轉一次
+                    proc = media._run(["ffmpeg", "-v", "error", "-y", "-i", str(got[0]), str(dest)], timeout=60)
+                    if proc.returncode != 0:
+                        raise DownloadFailed("轉檔失敗（ffmpeg）")
+            source = "remote"
+
+    probe = media.ffprobe(dest)
+    return {
+        "schema": "vidgrab.frame/1",
+        "id": f"{item.asset_id()}@{at:g}",
+        "asset_id": item.asset_id(),
+        "clip_id": (source_clip.get("id") or clip_id(item.platform, item.vid, source_clip.get("start"),
+                                                      source_clip.get("end"))) if source_clip else None,
+        "project": folder.name,
+        "at": at,
+        "width": probe.get("width") or width,
+        "height": probe.get("height"),
+        "format": fmt,
+        "source": source,
+        "path": str(dest.resolve()),
+        "url": file_url(str(dest)),
+        "license": {"kind": item.license_kind, "label": item.license_label},
+        "credit_hint": contact_block(item)["credit_hint"],
+    }

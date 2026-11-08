@@ -690,6 +690,26 @@ COMPONENTS = {
                 "clip": {"$ref": "#/components/schemas/AgentClip"},
             },
         },
+        "Frame": {
+            "type": "object",
+            "description": "vidgrab.frame/1：單格畫面。同一個（素材、秒數、寬度、格式）只做一次，之後回快取。",
+            "properties": {
+                "schema": {"type": "string", "example": "vidgrab.frame/1"},
+                "id": {"type": "string", "example": "bilibili:BV1xx@65"},
+                "asset_id": {"type": "string"},
+                "clip_id": {"type": "string", "nullable": True},
+                "project": {"type": "string"},
+                "at": {"type": "number"},
+                "width": {"type": "integer"},
+                "height": {"type": "integer", "nullable": True},
+                "format": {"type": "string"},
+                "source": {"type": "string", "enum": ["cache", "clip", "remote"]},
+                "path": {"type": "string"},
+                "url": {"type": "string", "description": "/file/... 圖檔網址"},
+                "license": {"type": "object"},
+                "credit_hint": {"type": "string"},
+            },
+        },
         "BatchResult": {
             "type": "object",
             "description": "vidgrab.batch/1；非同步呼叫時回 {job, status_url}，結果在 job.result",
@@ -1193,6 +1213,24 @@ OPENAPI: dict[str, Any] = {
                     "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"},
                                     "description": "bilibili:BV1xx 或 bilibili:BV1xx#60-75（# 要編成 %23）"}],
                     "responses": {"200": {"description": "命中的素材（與片段）", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/FindResult"}}}}}},
+        },
+        "/api/frame": {
+            "post": {
+                "tags": ["agent"], "summary": "單格畫面（封面、縮圖、分鏡）→ 圖檔網址",
+                "requestBody": {"content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string", "description": "片段 id（bilibili:BV1xx#60-75）或 asset id；asset id 一定要給 at"},
+                        "at": {"type": "number", "description": "原影片的秒數；片段 id 不給就取片段正中間"},
+                        "width": {"type": "integer", "default": 640},
+                        "format": {"type": "string", "enum": ["jpg", "png"], "default": "jpg"},
+                        "project": {"type": "string", "description": "同一支素材出現在多個專案時指定"},
+                    },
+                }}}},
+                "responses": {"200": {"description": "vidgrab.frame/1", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Frame"}}}},
+                              "400": {"description": "參數錯誤", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}},
+            },
         },
         "/api/batch": {
             "post": {
@@ -1789,6 +1827,22 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/batch":
             self._batch(body)
+            return
+
+        if route == "/api/frame":
+            from . import agent
+
+            try:
+                needle = str(body.get("id") or body.get("clip_id") or body.get("asset_id") or "")
+                if not needle:
+                    from .models import BadInput
+
+                    raise BadInput("要給 id（asset id 或片段 id）", hint='例如 {"id": "bilibili:BV1xx#60-75", "at": 65}')
+                self._json(agent.grab_frame(
+                    needle, body.get("at"), width=body.get("width") or 640,
+                    fmt=body.get("format") or "jpg", project=str(body.get("project") or "")))
+            except Exception as exc:  # noqa: BLE001
+                self._fail(exc)
             return
 
         if route == "/api/pick":

@@ -382,6 +382,26 @@ def thumb_from_clip(clip_path: Path, dest: Path, at: float | None = None,
     return None
 
 
+def extract_frame(video: Path, dest: Path, offset: float, width: int = 640) -> Path | None:
+    """從本機影片抽一格：offset 是檔案內的秒數。jpg 用高畫質，png 無損。已存在就直接回傳（快取）。"""
+    video, dest = Path(video), Path(dest)
+    if not video.exists():
+        return None
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    quality = ["-q:v", "2"] if dest.suffix.lower() in (".jpg", ".jpeg") else []
+    proc = _run(
+        ["ffmpeg", "-v", "error", "-y", "-ss", f"{max(0.0, offset):.3f}", "-i", str(video),
+         "-frames:v", "1", "-vf", f"scale={int(width)}:-2", *quality, str(dest)],
+        timeout=60,
+    )
+    if proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+        return dest
+    dest.unlink(missing_ok=True)
+    return None
+
+
 def contact_sheet(frames: list[Path], dest: Path, height: int = 270) -> bool:
     """幾格畫面和成一張橫排圖，一眼看完整段素材。"""
     frames = [f for f in frames if Path(f).exists()]
