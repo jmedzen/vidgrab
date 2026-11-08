@@ -5,6 +5,7 @@
 給剪片用的：找 B 站／YouTube 上的長素材（街景、空景、寺廟、人物走動…），
 要留檔就整支抓，只要幾秒就只切那幾秒，順手記下出處與授權狀態。
 
+- **三個來源**：B 站、YouTube，以及授權明確的 Pexels（[說明](#pexels授權明確的免費素材)）
 - **三種下載方式**：整支、固定長度切片、自訂區段（`1:00-2:30`）
 - **介面內直接播放**：下載完不必離開網頁就能預覽、跳到你想確認的那一格
 - **6 組主題**（3 深 3 淺）＋ 可拖曳側欄寬度，選擇會記住
@@ -379,6 +380,27 @@ claude mcp add --transport http vidgrab http://127.0.0.1:8310/mcp \
 工具**只回 JSON 與網址，不回影片內容**；片段用 `url`（`/file/...`，接在 vidgrab 位址後面）或同機器的 `path` 取用。
 失敗是 `isError: true` 加 `{code, message, retryable, hint}`，跟 CLI／REST 同一套。
 沒有引入 `mcp` 套件（協定子集自己實作），所以 Docker 映像不會變大。
+
+### Pexels：授權明確的免費素材
+
+B 站／YouTube 的素材大多「授權未標示」，公開發佈有風險。Pexels 的影片可商用、不必標註
+（[Pexels License](https://www.pexels.com/license/)，不可原樣轉售），而且是直式／橫式都有的短片，
+很適合做 Shorts 的 B-roll。
+
+```bash
+export PEXELS_API_KEY=...        # 免費申請：https://www.pexels.com/api/
+./vidgrab search "city night" --platform pexels
+./vidgrab pick <專案> --select 1 --range 0:02-0:08
+```
+
+- **key 放哪**：環境變數 `PEXELS_API_KEY`（或 `VIDGRAB_PEXELS_KEY`），或寫進 `auth/pexels.key`。沒有 key 時明講怎麼申請，不會默默略過。
+- **`platform: pexels`** 在 CLI、REST、MCP 都能用；`both` 仍是 B 站＋YouTube，不會因為你有 key 就多打一個 API。
+- **授權**：每支都標成「可自由使用」，`credit_hint` 帶攝影師名字與頁面連結（建議仍標註）。
+- **關鍵字用英文效果最好**；含中文時會帶 `locale=zh-TW`，但 Pexels 的中文索引很薄。
+- **不套用長度與觀看數篩選**：`min_duration`（出廠 10 分鐘）是為長片設計的，Pexels 的片子只有幾十秒，會被直接略過這些條件。
+- **下載**：直連檔案，不經 yt-dlp。整支原樣存下；指定區段則用 ffmpeg 重新編碼切出（起點精準）。不支援「只要聲音」。
+- **配額**：Pexels 每小時 200 次、每月 2 萬次。被限流（429）時會明確回報。
+- 直連網址偶爾會失效；下載報 404 時先 `./vidgrab refresh <專案>` 取得新網址。
 
 ### 在已下載的素材裡搜尋
 

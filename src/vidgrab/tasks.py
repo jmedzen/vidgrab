@@ -36,6 +36,7 @@ def _timeout(key: str, fallback: float) -> float:
 from .models import (
     VidgrabError,
     Item,
+    STOCK_PLATFORMS,
     fmt_duration,
     fmt_ts,
     human_size,
@@ -66,18 +67,30 @@ def _apply_filters(items: list[Item], *, fresh_days: int, min_duration: float,
             continue
         if fresh_after and item.pubdate and item.pubdate < fresh_after:
             continue
-        if min_duration and (item.duration or 0) < min_duration * 60:
-            continue
-        if max_duration and item.duration and item.duration > max_duration * 60:
-            continue
-        if min_views and (item.views or 0) < min_views:
-            continue
+        # 素材站的片子本來就短、也沒有觀看數；長度與熱度篩選是為長片設計的
+        if not item.is_stock():
+            if min_duration and (item.duration or 0) < min_duration * 60:
+                continue
+            if max_duration and item.duration and item.duration > max_duration * 60:
+                continue
+            if min_views and (item.views or 0) < min_views:
+                continue
         if only_free and item.license_kind not in ("free", "free-attribution"):
             continue
         if drop_reposts and item.repost:
             continue
         out.append(item)
     return out
+
+
+def _length_kwargs(src, min_duration: float, max_duration: float) -> dict[str, float]:
+    """長度篩選的單位是「分鐘」，為長片設計；素材站的片子只有幾十秒，不套用。"""
+    if getattr(src, "name", "") in STOCK_PLATFORMS:
+        return {}
+    return {
+        "min_seconds": min_duration * 60 if min_duration else 0,
+        "max_seconds": max_duration * 60 if max_duration else 0,
+    }
 
 
 def run_search(
@@ -128,8 +141,7 @@ def run_search(
                         order=order,
                         duration=duration,
                         exclude=exclude,
-                        min_seconds=min_duration * 60 if min_duration else 0,
-                        max_seconds=max_duration * 60 if max_duration else 0,
+                        **_length_kwargs(src, min_duration, max_duration),
                     )
                 except SourceError as exc:
                     # 搜尋失敗多半是網路抽動或對方暫時限流 —— 這種重試有用。
@@ -149,8 +161,7 @@ def run_search(
                                 order=order,
                                 duration=duration,
                                 exclude=exclude,
-                                min_seconds=min_duration * 60 if min_duration else 0,
-                                max_seconds=max_duration * 60 if max_duration else 0,
+                                **_length_kwargs(src, min_duration, max_duration),
                             )
                             last = None
                             break
@@ -302,10 +313,6 @@ def run_pick(
         cookies_from_browser=cookies_from_browser,
         extra_format=fmt,
     )
-    sources = {}
-    for src in get_sources("both"):
-        sources[src.name] = src
-
     clips_dir = project / "clips"
     frames_dir = project / "frames"
     thumb_dir = project / "thumbs"
@@ -355,7 +362,7 @@ def run_pick(
         if dry_run or frame_only:
             continue
 
-        if not item.duration:
+        if not item.duration and not item.media_url:
             try:
                 info = media.probe_video(item.url, opts,
                                                timeout=_timeout("probe_timeout", 180.0))
