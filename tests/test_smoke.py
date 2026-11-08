@@ -952,6 +952,28 @@ def test_vault_manifest_shape(tmp_path, monkeypatch):
     assert "credit_hint" in item
 
 
+def test_vault_items_carry_a_safe_remote_thumbnail_for_uis(tmp_path, monkeypatch):
+    """搜尋結果的封面網址要帶出來（UI 選素材要看縮圖）；只放行 http(s)，不然是 XSS 管道。"""
+    monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
+    from vidgrab import agent
+
+    def item(vid, thumbnail):
+        return {"platform": "pixabay", "vid": vid, "url": f"https://p/{vid}",
+                "title": vid, "thumbnail": thumbnail}
+
+    _make_project(tmp_path, "p1", items=[
+        item("a", "https://i.vimeocdn.com/video/1_640x360.jpg"),
+        item("b", "//i0.hdslb.com/bfs/archive/x.jpg"),
+        item("c", "javascript:alert(1)"),
+        item("d", "data:image/svg+xml,<svg onload=alert(1)>"),
+        item("e", ""),
+    ])
+    found = {i["vid"]: i["thumbnail"] for i in agent.vault_manifest(with_items=True)
+             ["projects"][0]["items"]}
+    assert found == {"a": "https://i.vimeocdn.com/video/1_640x360.jpg",
+                     "b": "https://i0.hdslb.com/bfs/archive/x.jpg", "c": "", "d": "", "e": ""}
+
+
 def test_vault_clip_ids_computed_for_old_data(tmp_path, monkeypatch):
     """舊片段沒有存 id，vault 要當場算出來，agent 才拿得到穩定鍵。"""
     monkeypatch.setenv("VIDGRAB_HOME", str(tmp_path / "projects"))
