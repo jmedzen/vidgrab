@@ -842,6 +842,19 @@ docker exec vidgrab vidgrab build                 # 確認跑的是哪次建置
 資料都掛在 `/data`：`projects/`（素材）、`auth/`（cookie）、`config.json`（設定）。
 容器以非 root（uid 1000）執行。
 
+### 設定：`.env`
+
+```bash
+cp .env.example .env     # 填 token 與素材站金鑰；.env 不進 git、不進映像
+docker compose up -d
+```
+
+`.env.example` 列了 `VIDGRAB_API_TOKEN`、`PIXABAY_API_KEY`、`JAMENDO_CLIENT_ID`、`PEXELS_API_KEY`
+與發佈位址（`VIDGRAB_BIND`、`VIDGRAB_PUBLISH_PORT`）。沒填金鑰的來源會自己略過。
+健康檢查是映像內建的（打 `/api/version`），`docker compose ps` 看得到 `healthy`。
+與 [vidpipe](https://github.com/jmedzen/vidpipe) 一起跑的完整組合（含網頁介面、字型、連主機上的 audio.cpp）
+見 vidpipe 的 `docker-compose.yml`。
+
 ### 容器版的曝露範圍由 `-p` 決定
 
 容器內的 `CMD` 是 `vidgrab web --no-open --allow-lan` —— 容器裡一定要綁
@@ -849,6 +862,14 @@ docker exec vidgrab vidgrab build                 # 確認跑的是哪次建置
 
 | 寫法 | 誰連得到 |
 |---|---|
+| `-p 127.0.0.1:8310:8310` | 只有這台機器（建議，compose 預設） |
+| `-p 8310:8310` | **整個區網** —— 沒設 token 的話這個介面沒有密碼 |
+
+`docker-compose.yml` 預設只對 `127.0.0.1` 發佈；要讓區網連，`.env` 設 `VIDGRAB_BIND=0.0.0.0`，
+**同時**設 `VIDGRAB_API_TOKEN` 並把 `VIDGRAB_NO_AUTH` 改成 `0`。
+
+
+---|---|
 | `-p 127.0.0.1:8310:8310` | 只有這台機器（建議） |
 | `-p 8310:8310` | **整個區網** —— 這個介面沒有密碼 |
 
