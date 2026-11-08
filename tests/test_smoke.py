@@ -3363,3 +3363,126 @@ def test_all_api_errors_are_structured(web):
     code, _, body = _raw(web, "GET", "/api/project/nope")
     err = json.loads(body)["error"]
     assert code == 404 and err["code"] == "not_found" and err["retryable"] is False
+
+
+# ---------------------------------------------------------------- MCP（#6）
+
+
+def _mcp(base, method, params=None, msg_id=1, headers=None):
+    payload = {"jsonrpc": "2.0", "method": method}
+    if msg_id is not None:
+        payload["id"] = msg_id
+    if params is not None:
+        payload["params"] = params
+    hdr = {"Content-Type": "application/json"}
+    hdr.update(headers or {})
+    code, _, body = _raw(base, "POST", "/mcp", hdr, json.dumps(payload).encode())
+    return code, (json.loads(body) if body else None)
+
+
+def test_mcp_initialize_and_list_tools(web):
+    code, out = _mcp(web, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                          "clientInfo": {"name": "t", "version": "0"}})
+    assert code == 200 and out["result"]["serverInfo"]["name"] == "vidgrab"
+    assert out["result"]["protocolVersion"] == "2025-06-18"
+    assert "tools" in out["result"]["capabilities"]
+    code, out = _mcp(web, "initialize", {"protocolVersion": "1999-01-01"})
+    assert out["result"]["protocolVersion"] in ("2025-06-18", "2025-03-26", "2024-11-05")
+
+    code, body = _mcp(web, "notifications/initialized", msg_id=None)
+    assert code == 202 and body is None
+
+    code, out = _mcp(web, "tools/list")
+    names = {t["name"] for t in out["result"]["tools"]}
+    assert names == {"search_footage", "list_assets", "find_asset", "grab_clip", "get_job"}
+    for t in out["result"]["tools"]:
+        assert t["inputSchema"]["type"] == "object" and t["description"]
+    assert _mcp(web, "nope")[1]["error"]["code"] == -32601
+    assert _mcp(web, "ping")[1]["result"] == {}
+    code, _, body = _raw(web, "POST", "/mcp", {"Content-Type": "application/json"}, b"{bad")
+    assert json.loads(body)["error"]["code"] == -32700
+    assert _raw(web, "GET", "/mcp")[0] == 405
+
+
+def test_mcp_tools_call_flow(tmp_path, web, monkeypatch):
+    _make_project(tmp_path, name="mc")
+    _fake_pick(monkeypatch)
+
+    def call(name, args):
+        code, out = _mcp(web, "tools/call", {"name": name, "arguments": args})
+        assert code == 200
+        res = out["result"]
+        assert json.loads(res["content"][0]["text"]) == res["structuredContent"]
+        return res
+
+    res = call("grab_clip", {"project": "mc", "asset_ids": ["youtube:v1"], "ranges": [[5, 20]]})
+    assert res["isError"] is False
+    clip = res["structuredContent"]["results"][0]["new_clips"][0]
+    assert clip["id"] == "youtube:v1#5-20" and clip["url"].startswith("/file/mc/")
+
+    again = call("grab_clip", {"project": "mc", "asset_ids": ["youtube:v1"], "ranges": [[5, 20]]})
+    assert again["structuredContent"]["results"][0]["new_clips"] == []
+
+    res = call("list_assets", {})
+    assert res["structuredContent"]["totals"]["clips"] == 1
+    res = call("list_assets", {"query": "測試"})
+    assert res["structuredContent"]["matches"]
+    res = call("find_asset", {"id": "youtube:v1#5-20"})
+    assert res["structuredContent"]["clip"]["id"] == "youtube:v1#5-20"
+
+    # 錯誤：isError＋結構化，不是 JSON-RPC error
+    res = call("find_asset", {"id": "youtube:none"})
+    assert res["isError"] and res["structuredContent"]["error"]["code"] == "not_found"
+    res = call("grab_clip", {"project": "mc"})
+    assert res["isError"] and res["structuredContent"]["error"]["code"] == "no_targets"
+    res = call("search_footage", {"keywords": []})
+    assert res["isError"] and res["structuredContent"]["error"]["code"] == "bad_input"
+    res = call("nope", {})
+    assert res["isError"]
+    res = call("get_job", {"job_id": "zzz"})
+    assert res["isError"] and res["structuredContent"]["error"]["code"] == "not_found"
+
+
+def test_mcp_search_and_get_job(tmp_path, web, monkeypatch):
+    from vidgrab import tasks
+
+    def fake_search(queries, emit=print, **kw):
+        proj = _make_project(tmp_path, name="found")
+        return {"project": proj, "items": [object()]}
+
+    monkeypatch.setattr(tasks, "run_search", fake_search)
+    code, out = _mcp(web, "tools/call", {"name": "search_footage", "arguments": {"keywords": ["廚房"]}})
+    res = out["result"]["structuredContent"]
+    assert res["done"] and res["project"] == "found"
+    assert res["candidates"][0]["id"] == "youtube:v1" and res["candidates"][0]["index"] == 0
+    code, out = _mcp(web, "tools/call", {"name": "get_job", "arguments": {"job_id": res["job"]}})
+    assert out["result"]["structuredContent"]["done"] is True
+
+
+def test_mcp_requires_token(web, monkeypatch):
+    monkeypatch.setenv("VIDGRAB_API_TOKEN", "tok")
+    code, _, body = _raw(web, "POST", "/mcp", {"Content-Type": "application/json"},
+                         b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+    assert code == 401
+    code, out = _mcp(web, "tools/list", headers={"Authorization": "Bearer tok"})
+    assert code == 200 and out["result"]["tools"]
+
+
+def test_mcp_stdio_roundtrip(tmp_path):
+    import subprocess
+    import sys
+
+    env = dict(os.environ, VIDGRAB_HOME=str(tmp_path / "projects"), VIDGRAB_AUTH_DIR=str(tmp_path / "auth"))
+    msgs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_assets", "arguments": {}}},
+    ]
+    proc = subprocess.run(
+        [sys.executable, "-m", "vidgrab", "mcp"], input="\n".join(json.dumps(m) for m in msgs) + "\n",
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    lines = [json.loads(ln) for ln in proc.stdout.splitlines() if ln.strip()]
+    assert [m["id"] for m in lines] == [1, 2, 3], proc.stdout + proc.stderr
+    assert lines[2]["result"]["structuredContent"]["schema"] == "vidgrab.vault/1"

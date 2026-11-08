@@ -147,6 +147,7 @@ def _is_loopback(host: str) -> bool:
 
 # HTTP 狀態 ↔ 錯誤碼（與 CLI 的 code 同一套）
 STATUS_CODES = {400: "bad_input", 401: "unauthorized", 403: "forbidden", 404: "not_found",
+                405: "method_not_allowed",
                 409: "conflict", 413: "too_large", 429: "rate_limited", 500: "internal",
                 503: "unavailable", 504: "timeout"}
 ERROR_STATUS = {"bad_input": 400, "no_targets": 400, "ambiguous_project": 409, "unauthorized": 401,
@@ -163,6 +164,20 @@ def error_body(message: str, *, status: int = 400, code: str | None = None, hint
     if hint:
         err["hint"] = hint
     return {"ok": False, "error": err}
+
+
+def project_dir(name: str) -> Path | None:
+    """專案名稱 → 專案資料夾；名稱不合法或不在素材庫根目錄內就回 None。"""
+    name = urllib.parse.unquote(name)
+    # 專案名稱只能是單層資料夾名：拒絕 / \\ .. 與空字串
+    if not name or name in (".", "..") or "/" in name or "\\" in name or "\0" in name:
+        return None
+    root = tasks.projects_root().resolve()
+    path = (root / name).resolve()
+    # 用 relative_to 比目錄層級；str.startswith 會讓 projects-old 通過 projects 的檢查
+    if not _is_within(path, root) or path == root or not (path / "manifest.json").exists():
+        return None
+    return path
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -282,6 +297,98 @@ def start_job(kind: str, label: str, fn) -> Job:
 
     threading.Thread(target=runner, daemon=True).start()
     return job
+
+
+def wait_job(job: Job, limit_seconds: float) -> bool:
+    """等 job 做完，最多 limit_seconds 秒；回傳是否已完成。"""
+    until = time.time() + limit_seconds
+    while not job.done and time.time() < until:
+        time.sleep(0.2)
+    return job.done
+
+
+def make_search_job(body: dict[str, Any]) -> Job:
+    """啟動搜尋 job（HTTP /api/search 與 MCP search_footage 共用）。壞輸入丟 BadInput。"""
+    from . import config as cfg
+    from .models import BadInput
+
+    queries = body.get("keywords") or []
+    if isinstance(queries, str):
+        queries = [queries]
+    queries = [str(q) for q in queries if str(q).strip()]
+    if not queries:
+        raise BadInput("請至少輸入一個關鍵字", hint='keywords 是字串陣列，例如 ["台北 街景"]')
+
+    saved = cfg.load()
+
+    def pick(key, cast=None):
+        if body.get(key) is not None:
+            return body[key]
+        value = saved.get(key, cfg.DEFAULTS.get(key))
+        return cast(value) if cast and value is not None else value
+
+    try:
+        opts = {
+            "platform": pick("platform"),
+            "per_keyword": int(pick("per_keyword")),
+            "order": pick("order"),
+            "duration": pick("duration"),
+            "exclude": body.get("exclude") or saved.get("exclude") or [],
+            "fresh_days": int(pick("fresh_days")),
+            "min_duration": float(pick("min_duration")),
+            "max_duration": float(pick("max_duration")),
+            "min_views": int(pick("min_views")),
+            "only_free": bool(pick("only_free")),
+            "drop_reposts": bool(pick("drop_reposts")),
+            "verify_license": bool(pick("verify_license")),
+            "sort": pick("sort"),
+            "name": body.get("name") or None,
+        }
+    except (TypeError, ValueError) as exc:
+        raise BadInput(f"參數格式不對：{exc}") from None
+    if body.get("save_settings"):
+        cfg.save_patch({k: opts[k] for k in opts if k in cfg.DEFAULTS})
+
+    def work(emit):
+        res = tasks.run_search(queries, emit=emit, **opts)
+        return {"project": res["project"].name, "count": len(res["items"])}
+
+    return start_job("search", "、".join(queries), work)
+
+
+def make_batch_job(body: dict[str, Any]) -> tuple[Job, float | None]:
+    """驗證參數並啟動批次 job（HTTP /api/batch 與 MCP grab_clip 共用）。回 (job, timeout)。"""
+    from . import agent
+    from . import config as cfg
+    from .models import BadInput, NotFound, VidgrabError
+
+    project = project_dir(str(body.get("project", "")))
+    if not project:
+        raise NotFound(f"找不到專案：{body.get('project', '')}", hint="用 vault／list_assets 看有哪些專案")
+    _, items = tasks.load_project(project)
+    targets = agent.resolve_targets(
+        items, indexes=body.get("indexes"), asset_ids=body.get("asset_ids"),
+        top=body.get("top"), all_items=bool(body.get("all")),
+    )
+    if not targets:
+        raise VidgrabError("沒有指定要抓的項目", code="no_targets",
+                           hint="給 indexes、asset_ids、top 或 all 其中一個")
+    timeout = body.get("timeout")
+    try:
+        timeout = float(timeout) if timeout not in (None, "", 0) else None
+    except (TypeError, ValueError):
+        raise BadInput("timeout 必須是秒數") from None
+    try:
+        opts = resolve_pick_options(body, cfg.load())
+    except (TypeError, ValueError) as exc:
+        raise BadInput(f"參數格式不對：{exc}",
+                       hint="ranges 例如 [[60,75]] 或 [\"1:00-1:15\"]") from None
+    opts["dry_run"] = bool(body.get("dry_run"))
+
+    def work(emit):
+        return agent.run_batch(project, targets, timeout=timeout, emit=emit, **opts)
+
+    return start_job("batch", f"{project.name} · batch {len(targets)} 支", work), timeout
 
 
 # ---------------------------------------------------------------- 資料
@@ -1285,16 +1392,7 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def _project_dir(self, name: str) -> Path | None:
-        name = urllib.parse.unquote(name)
-        # 專案名稱只能是單層資料夾名：拒絕 / \\ .. 與空字串
-        if not name or name in (".", "..") or "/" in name or "\\" in name or "\0" in name:
-            return None
-        root = tasks.projects_root().resolve()
-        path = (root / name).resolve()
-        # 用 relative_to 比目錄層級；str.startswith 會讓 projects-old 通過 projects 的檢查
-        if not _is_within(path, root) or path == root or not (path / "manifest.json").exists():
-            return None
-        return path
+        return project_dir(name)
 
     # -- 認證 ---------------------------------------------------------
 
@@ -1361,6 +1459,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/projects":
             self._json(projects_payload())
+            return
+        if route == "/mcp":
+            self._json({"error": "MCP 端點只接受 POST（JSON-RPC）"}, 405)
             return
         if route == "/api/vault":
             from . import agent
@@ -1592,6 +1693,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "跨站請求已被拒絕"}, 403)
             return
 
+        if route == "/mcp":
+            self._mcp()
+            return
+
         body = self._body()
 
         if route == "/api/library":
@@ -1674,44 +1779,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/search":
-            queries = [q for q in (body.get("keywords") or []) if str(q).strip()]
-            if not queries:
-                self._json({"error": "請至少輸入一個關鍵字"}, 400)
+            try:
+                job = make_search_job(body)
+            except Exception as exc:  # noqa: BLE001
+                self._fail(exc)
                 return
-            from . import config as cfg
-
-            saved = cfg.load()
-            def pick(key, cast=None):
-                if body.get(key) is not None:
-                    return body[key]
-                value = saved.get(key, cfg.DEFAULTS.get(key))
-                return cast(value) if cast and value is not None else value
-
-            opts = {
-                "platform": pick("platform"),
-                "per_keyword": int(pick("per_keyword")),
-                "order": pick("order"),
-                "duration": pick("duration"),
-                "exclude": body.get("exclude") or saved.get("exclude") or [],
-                "fresh_days": int(pick("fresh_days")),
-                "min_duration": float(pick("min_duration")),
-                "max_duration": float(pick("max_duration")),
-                "min_views": int(pick("min_views")),
-                "only_free": bool(pick("only_free")),
-                "drop_reposts": bool(pick("drop_reposts")),
-                "verify_license": bool(pick("verify_license")),
-                "sort": pick("sort"),
-                "name": body.get("name") or None,
-            }
-            if body.get("save_settings"):
-                patch = {k: opts[k] for k in opts if k in cfg.DEFAULTS}
-                cfg.save_patch(patch)
-
-            def work(emit):
-                res = tasks.run_search(queries, emit=emit, **opts)
-                return {"project": res["project"].name, "count": len(res["items"])}
-
-            job = start_job("search", "、".join(queries), work)
             self._json({"job": job.id})
             return
 
@@ -1862,55 +1934,40 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- SSE ----------------------------------------------------------
 
+    def _mcp(self) -> None:
+        """POST /mcp：MCP streamable HTTP（JSON-RPC，回 application/json）。"""
+        from . import mcp
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            reply: Any = mcp._rpc_error(None, -32700, "Parse error")
+        else:
+            reply = mcp.handle_payload(payload)
+        if reply is None:  # 只有通知：202、沒有內容
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self._send(200, json.dumps(reply, ensure_ascii=False).encode())
+
     def _batch(self, body: dict[str, Any]) -> None:
         """POST /api/batch：agent 的批次入口，跟 CLI `batch` 同一份實作。
 
         預設非同步（回 job，結果是 vidgrab.batch/1）；`wait: true` 時在這個請求裡等到做完
         （最多 `timeout` 秒，到期會中止下載並回部分結果）。
         """
-        from . import agent
-        from . import config as cfg
-        from .models import BadInput, NotFound, VidgrabError
-
         try:
-            project = self._project_dir(str(body.get("project", "")))
-            if not project:
-                raise NotFound(f"找不到專案：{body.get('project', '')}", hint="用 GET /api/vault 看有哪些專案")
-            _, items = tasks.load_project(project)
-            targets = agent.resolve_targets(
-                items, indexes=body.get("indexes"), asset_ids=body.get("asset_ids"),
-                top=body.get("top"), all_items=bool(body.get("all")),
-            )
-            if not targets:
-                raise VidgrabError("沒有指定要抓的項目", code="no_targets",
-                                   hint="給 indexes、asset_ids、top 或 all 其中一個")
-            timeout = body.get("timeout")
-            try:
-                timeout = float(timeout) if timeout not in (None, "", 0) else None
-            except (TypeError, ValueError):
-                raise BadInput("timeout 必須是秒數") from None
-            try:
-                opts = resolve_pick_options(body, cfg.load())
-            except (TypeError, ValueError) as exc:
-                raise BadInput(f"參數格式不對：{exc}",
-                               hint="ranges 例如 [[60,75]] 或 [\"1:00-1:15\"]") from None
-            opts["dry_run"] = bool(body.get("dry_run"))
+            job, timeout = make_batch_job(body)
         except Exception as exc:  # noqa: BLE001
             self._fail(exc)
             return
-
-        def work(emit):
-            return agent.run_batch(project, targets, timeout=timeout, emit=emit, **opts)
-
-        job = start_job("batch", f"{project.name} · batch {len(targets)} 支", work)
         if not body.get("wait"):
             self._json({"job": job.id, "status_url": f"/api/job/{job.id}"})
             return
         # 同步等待：比批次期限多留一點時間收尾；沒設期限就最多等 30 分鐘
-        limit = time.time() + (timeout + 30 if timeout else 1800)
-        while not job.done and time.time() < limit:
-            time.sleep(0.2)
-        if not job.done:
+        if not wait_job(job, timeout + 30 if timeout else 1800):
             self._json({"job": job.id, "done": False, "status_url": f"/api/job/{job.id}"}, 202)
             return
         if job.error:
