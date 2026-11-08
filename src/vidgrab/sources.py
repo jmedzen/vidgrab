@@ -483,7 +483,15 @@ def get_source(platform: str, http: _Http | None = None):
         from .stock import PixabaySource
 
         return PixabaySource()
-    if platform in ("both", "all", "stock", "free"):
+    if platform == "openverse":
+        from .music import OpenverseSource
+
+        return OpenverseSource()
+    if platform == "jamendo":
+        from .music import JamendoSource
+
+        return JamendoSource()
+    if platform in ("both", "all", "stock", "free", "music"):
         raise ValueError(f"{platform} 請用 get_sources()")
     raise ValueError(f"不認識的平台：{platform}")
 
@@ -516,6 +524,14 @@ def get_sources(platform: str, http: _Http | None = None) -> list:
                 log(f"! {name} 不可用：{exc}")
         if not out:
             raise SourceError("素材站都不能用。" + "；".join(reasons))
+        return out
+    if platform == "music":
+        # 音樂庫：Openverse 免 key 一定可用；Jamendo 有 client id 才加
+        out = [get_source("openverse")]
+        try:
+            out.append(get_source("jamendo"))
+        except SourceError as exc:
+            log(f"· jamendo 略過：{exc}")
         return out
     return [get_source(platform, http)]
 

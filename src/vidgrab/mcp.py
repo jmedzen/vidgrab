@@ -42,7 +42,7 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _obj({
             "keywords": {"type": "array", "items": {"type": "string"},
                          "description": "關鍵字，每個分開搜再合併（B 站建議也試簡體）"},
-            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube", "pexels", "pixabay", "stock"]},
+            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube", "pexels", "pixabay", "stock", "openverse", "jamendo", "music"]},
             "orientation": {"type": "string", "enum": ["any", "portrait", "landscape", "square"],
                             "description": "畫面方向，只對素材站有效；做 Shorts 用 portrait"},
             "per_keyword": {"type": "integer", "description": "每個關鍵字抓幾支"},

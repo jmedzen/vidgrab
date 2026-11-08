@@ -5,7 +5,7 @@
 給剪片用的：找 B 站／YouTube 上的長素材（街景、空景、寺廟、人物走動…），
 要留檔就整支抓，只要幾秒就只切那幾秒，順手記下出處與授權狀態。
 
-- **四個來源**：B 站、YouTube，以及授權明確的 Pexels／Pixabay（[說明](#pexelspixabay授權明確的免費素材)）
+- **多個來源**：B 站、YouTube，授權明確的影片站 Pexels／Pixabay（[說明](#pexelspixabay授權明確的免費素材)），以及背景音樂庫 Openverse／Jamendo（[說明](#背景音樂)）
 - **三種下載方式**：整支、固定長度切片、自訂區段（`1:00-2:30`）
 - **介面內直接播放**：下載完不必離開網頁就能預覽、跳到你想確認的那一格
 - **6 組主題**（3 深 3 淺）＋ 可拖曳側欄寬度，選擇會記住
@@ -403,6 +403,27 @@ export PEXELS_API_KEY=...        # 免費：https://www.pexels.com/api/
 - **下載**：直連檔案，不經 yt-dlp。整支原樣存；指定區段用 ffmpeg 重新編碼切出（起點精準）。不支援「只要聲音」。
 - **配額**：Pexels 每小時 200 次、每月 2 萬次；Pixabay 每分鐘 100 次。被限流（429）時會明確回報。
 - 直連網址偶爾會失效；下載報 404 時先 `./vidgrab refresh <專案>` 取得新網址。
+
+### 背景音樂
+
+Shorts 的背景音樂有兩條路，可以並用：
+
+1. **用「只要聲音」從 B 站／YouTube 抓**：`./vidgrab pick <專案> --select 1 --audio --per 60`（授權照該影片自己的標示，多半未標示，公開使用前自己確認）。
+2. **接免版權音樂庫**（授權明確、有直連檔案）：
+
+```bash
+./vidgrab search "calm piano" --platform music            # Openverse（免 key）＋ Jamendo（有 client id 才加）
+./vidgrab pick <專案> --select 1 --full                    # 整首原格式存下
+./vidgrab pick <專案> --select 1 --range 0:10-0:55         # 切 45 秒，轉成 m4a
+```
+
+- **`platform`**：`openverse`、`jamendo`，或 `music`（兩個都搜；Jamendo 沒設 client id 就略過並說明）。
+- **Jamendo client id**：[免費申請](https://devportal.jamendo.com/)，設成 `JAMENDO_CLIENT_ID`（或寫進 `auth/jamendo.key`）。Openverse 匿名可用，限流較低。
+- **授權策略（刻意保守）**：只收 CC0、公共領域、**CC BY**（需標註，`credit_hint` 已經寫好「作者（CC BY 版本）— 頁面」）。含 NC（禁商用）、ND（禁改作，混進影片就是改作）、SA（衍生作品要同授權，會牽連整支影片）的一律不收。
+- **不套用長度與觀看數篩選**，也不抽畫面（音樂沒有畫面）。
+
+> **順手修的一個 bug**：`--audio`（只要聲音）下載完會被當成「沒有影像軌的壞檔」而刪掉。
+> 判斷原本只看有沒有影像尺寸，對 m4a／mp3 永遠不成立。現在只要聲音的下載改檢查有沒有音訊軌。
 
 ### 在已下載的素材裡搜尋
 

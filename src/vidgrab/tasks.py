@@ -347,7 +347,7 @@ def run_pick(
         if item.license_kind in ("unknown", "none"):
             emit("     ⚠ 沒有授權資訊：公開使用前請自行確認")
 
-        if frames:
+        if frames and not item.is_music():  # 音樂沒有畫面可抽
             # 抽畫面只是輔助：抓不到就算了，不能讓它把整個作業帶走。
             # 真的發生過：YouTube 長片抽幀逾時 → 整批 batch 回 internal，
             # 明明片段已經下載成功，使用者卻收到失敗。

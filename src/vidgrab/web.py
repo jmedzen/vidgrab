@@ -1129,7 +1129,7 @@ OPENAPI: dict[str, Any] = {
                         "properties": {
                             "keywords": {"type": "array", "items": {"type": "string"},
                                          "example": ["台北 街景", "北歐 空景"]},
-                            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube", "pexels", "pixabay", "stock"]},
+                            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube", "pexels", "pixabay", "stock", "openverse", "jamendo", "music"]},
                             "per_keyword": {"type": "integer"},
                             "orientation": {"type": "string", "enum": ["any", "portrait", "landscape", "square"],
                                             "description": "只對素材站（pexels／pixabay）有效"},

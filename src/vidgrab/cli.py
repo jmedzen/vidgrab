@@ -825,8 +825,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("search", help="用關鍵字搜一輪，建立素材專案")
     s.add_argument("keywords", nargs="+", help="一個或多個關鍵字（多個 = 分開搜再合併）")
-    s.add_argument("--platform", choices=["both", "bilibili", "youtube", "pexels", "pixabay", "stock"],
-                   help="預設讀設定（出廠 both）；pexels／pixabay 要 API key，stock = 兩個素材站都搜")
+    s.add_argument("--platform", choices=["both", "bilibili", "youtube", "pexels", "pixabay", "stock",
+                            "openverse", "jamendo", "music"],
+                   help="預設讀設定（出廠 both）；pexels／pixabay 要 API key，stock = 兩個影片素材站都搜；"
+                        "openverse／jamendo 是背景音樂庫，music = 兩個都搜")
     s.add_argument("--orientation", choices=["any", "portrait", "landscape", "square"],
                    default="any", help="只對素材站有效；Shorts 用 portrait")
     s.add_argument("--per-keyword", type=int, help="每個關鍵字抓幾支（出廠 12）")

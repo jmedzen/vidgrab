@@ -562,17 +562,24 @@ def _grab_direct(item: Item, start: float | None, end: float | None, outdir: Pat
     """
     import tempfile
 
-    if opts.audio_only:
+    music = item.is_music()
+    if opts.audio_only and not music:
         raise MediaError("這個來源沒有獨立的音訊檔，不支援只要聲音")
     if not ffmpeg_ok():
-        raise MediaError("缺 ffmpeg／ffprobe，無法處理素材站影片")
+        raise MediaError("缺 ffmpeg／ffprobe，無法處理素材站檔案")
 
-    final = outdir / f"{stem}.mp4"
+    # 音樂：整支保留原格式（認得的副檔名），切片一律轉 m4a（AAC，ffmpeg 內建編碼器）
+    src_ext = Path(item.media_url.split("?", 1)[0]).suffix.lower()
+    if music:
+        keep = start is None and src_ext in MEDIA_EXTS
+        final = outdir / f"{stem}{src_ext if keep else '.m4a'}"
+    else:
+        final = outdir / f"{stem}.mp4"
     limit = _retries()
     last_error = ""
     tmpdir = Path(tempfile.mkdtemp(prefix=f".{stem}.", dir=str(outdir)))
     try:
-        src = tmpdir / "source.mp4"
+        src = tmpdir / ("source" + (src_ext if music and src_ext else ".mp4"))
         log(f"    ↓ {item.platform} {item.vid} " + ("整支" if start is None
             else f"{fmt_ts(start)}→{fmt_ts(end or 0)}"))
         for attempt in range(1, limit + 1):
@@ -588,17 +595,23 @@ def _grab_direct(item: Item, start: float | None, end: float | None, outdir: Pat
                 log(f"    ↻ 第 {attempt}/{limit} 次失敗，{wait:.0f} 秒後重試：{last_error[:90]}")
                 time.sleep(wait)
 
-        if start is None:
+        if start is None and final.suffix == src.suffix:
             shutil.move(str(src), str(final))
         else:
-            span = max(0.1, float(end) - float(start))
-            part = tmpdir / "cut.mp4"
-            proc = _run(
-                ["ffmpeg", "-v", "error", "-y", "-ss", f"{float(start):.3f}", "-i", str(src),
-                 "-t", f"{span:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(part)],
-                timeout=max(60.0, min(timeout, 900.0)),
-            )
+            # 切片，或整支但格式不是素材庫認得的（音樂轉 m4a）
+            part = tmpdir / f"cut{final.suffix}"
+            cmd = ["ffmpeg", "-v", "error", "-y"]
+            if start is not None:
+                cmd += ["-ss", f"{float(start):.3f}"]
+            cmd += ["-i", str(src)]
+            if start is not None:
+                cmd += ["-t", f"{max(0.1, float(end) - float(start)):.3f}"]
+            if music:
+                cmd += ["-vn", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+            else:
+                cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"]
+            proc = _run(cmd + [str(part)], timeout=max(60.0, min(timeout, 900.0)))
             if proc.returncode != 0 or not part.exists():
                 tail = (proc.stderr or "").strip().splitlines()[-1:] or ["ffmpeg 切片失敗"]
                 raise MediaError(tail[0])
@@ -607,7 +620,11 @@ def _grab_direct(item: Item, start: float | None, end: float | None, outdir: Pat
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     probe = ffprobe(final)
-    if not (probe.get("width") or probe.get("height")):
+    if music:
+        if not probe.get("has_audio"):
+            final.unlink(missing_ok=True)
+            raise MediaError("下載回來的檔案是壞的（沒有音訊軌），已刪除")
+    elif not (probe.get("width") or probe.get("height")):
         final.unlink(missing_ok=True)
         raise MediaError("下載回來的檔案是壞的（沒有影像軌），已刪除")
     return {"path": str(final), "cached": False, **probe}
@@ -757,7 +774,14 @@ def grab_range(
     # 這種檔進到素材庫就是一格「無圖、尺寸空白」的垃圾，而且不會報錯。
     # 判斷依據只有一個：有沒有影像尺寸。壞檔的 duration 可能還是 6.0，
     # 用「duration 也沒有」當條件會漏掉它。
-    if not (probe.get("width") or probe.get("height")):
+    # 只要聲音的下載本來就沒有影像軌，不能拿這條判斷（否則好好的 m4a 會被當壞檔刪掉）；
+    # 這種檔改看有沒有音訊軌。
+    if opts.audio_only:
+        if not probe.get("has_audio"):
+            final.unlink(missing_ok=True)
+            _clean_partials(outdir, stem)
+            raise MediaError("下載回來的檔案是壞的（沒有音訊軌），已刪除")
+    elif not (probe.get("width") or probe.get("height")):
         final.unlink(missing_ok=True)
         _clean_partials(outdir, stem)
         raise MediaError("下載回來的檔案是壞的（沒有影像軌），已刪除")
