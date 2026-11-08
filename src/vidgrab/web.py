@@ -10,6 +10,7 @@ import socket
 import threading
 import time
 import traceback
+import uuid
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,43 +30,81 @@ LICENSE_SHORT = {
 }
 
 JOBS: dict[str, dict[str, Any]] = {}
-QR: dict[str, float] = {}
 LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------- jobs
 
 
+SUBSCRIBER_QUEUE_SIZE = 500
+
+
 class Job:
+    """一個背景作業。進度事件用 pub/sub 廣播：每個 SSE 連線各自一個有上限的 queue，
+    沒有訂閱者（agent 只輪詢 /api/job/{id}）時不累積任何東西。"""
+
     def __init__(self, kind: str, label: str):
-        self.id = f"{int(time.time() * 1000)}-{abs(hash(label)) % 10000}"
+        self.id = uuid.uuid4().hex
         self.kind = kind
         self.label = label
         self.messages: list[str] = []
         self.done = False
         self.error = ""
         self.result: dict[str, Any] = {}
-        self.queue: queue.Queue = queue.Queue()
         self.started = time.time()
         self.finished = 0.0
+        self._lock = threading.Lock()
+        self._subs: list[queue.Queue] = []
+
+    def _publish(self, event: tuple[str, Any]) -> None:
+        for q in list(self._subs):
+            while True:
+                try:
+                    q.put_nowait(event)
+                    break
+                except queue.Full:
+                    # 慢的訂閱者：丟最舊的進度，但結尾事件一定要送到
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
 
     def emit(self, message: str) -> None:
-        # 日誌限長：長時間下載會產生上萬行，全留在記憶體裡沒有意義
-        if len(self.messages) < _job_limits()[2]:
-            self.messages.append(message)
-        self.queue.put(("log", message))
+        with self._lock:
+            # 日誌限長：長時間下載會產生上萬行，全留在記憶體裡沒有意義
+            if len(self.messages) < _job_limits()[2]:
+                self.messages.append(message)
+            self._publish(("log", message))
 
     def finish(self, result: dict[str, Any]) -> None:
-        self.done = True
-        self.finished = time.time()
-        self.result = result
-        self.queue.put(("done", result))
+        with self._lock:
+            self.done = True
+            self.finished = time.time()
+            self.result = result
+            self._publish(("done", result))
 
     def fail(self, message: str) -> None:
-        self.done = True
-        self.finished = time.time()
-        self.error = message
-        self.queue.put(("error", message))
+        with self._lock:
+            self.done = True
+            self.finished = time.time()
+            self.error = message
+            self._publish(("error", message))
+
+    def subscribe(self) -> tuple[list[str], queue.Queue | None, tuple[str, Any] | None]:
+        """回傳 (歷史日誌, 訂閱用 queue, 已結束時的結尾事件)。歷史與訂閱在同一把鎖內取得，不漏不重。"""
+        with self._lock:
+            history = list(self.messages)
+            if self.done:
+                final = ("error", self.error) if self.error else ("done", self.result)
+                return history, None, final
+            q: queue.Queue = queue.Queue(maxsize=SUBSCRIBER_QUEUE_SIZE)
+            self._subs.append(q)
+            return history, q, None
+
+    def unsubscribe(self, q: queue.Queue | None) -> None:
+        with self._lock:
+            if q in self._subs:
+                self._subs.remove(q)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -78,6 +117,41 @@ class Job:
             "result": _jsonable(self.result),
             "elapsed": round(time.time() - self.started, 1),
         }
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """path 是否在 root 底下（以目錄層級判斷，兩者都先 resolve）。"""
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def parse_range(header: str | None, size: int) -> tuple[int, int] | None | str:
+    """解析單一 Range。回傳 (start, end)、None（沒有 Range 或無法解析，當整檔）、
+    或 "unsatisfiable"（要回 416）。支援 `a-b`、`a-` 與 suffix `-N`（最後 N bytes）。"""
+    if not header or not header.startswith("bytes="):
+        return None
+    spec = header.split("=", 1)[1].split(",")[0].strip()
+    lo, sep, hi = spec.partition("-")
+    if not sep:
+        return None
+    try:
+        if not lo:
+            n = int(hi)
+            if n <= 0:
+                return "unsatisfiable"
+            if size == 0:
+                return "unsatisfiable"
+            return max(0, size - n), size - 1
+        start = int(lo)
+        end = int(hi) if hi else size - 1
+    except ValueError:
+        return None
+    if start < 0 or start >= size or (hi and end < start):
+        return "unsatisfiable"
+    return start, min(end, size - 1)
 
 
 def _jsonable(data: Any) -> Any:
@@ -1009,9 +1083,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _project_dir(self, name: str) -> Path | None:
         name = urllib.parse.unquote(name)
-        path = (tasks.projects_root() / name).resolve()
+        # 專案名稱只能是單層資料夾名：拒絕 / \\ .. 與空字串
+        if not name or name in (".", "..") or "/" in name or "\\" in name or "\0" in name:
+            return None
         root = tasks.projects_root().resolve()
-        if not str(path).startswith(str(root)) or not (path / "manifest.json").exists():
+        path = (root / name).resolve()
+        # 用 relative_to 比目錄層級；str.startswith 會讓 projects-old 通過 projects 的檢查
+        if not _is_within(path, root) or path == root or not (path / "manifest.json").exists():
             return None
         return path
 
@@ -1428,15 +1506,32 @@ class Handler(BaseHTTPRequestHandler):
 
         if route.startswith("/api/delete-clip"):
             try:
-                target = Path(body.get("path", "")).resolve()
                 root = tasks.projects_root().resolve()
-                if not str(target).startswith(str(root)) or not target.exists():
+                target = Path(body.get("path", "")).resolve()
+                if not _is_within(target, root) or not target.is_file():
                     raise ValueError("不合法路徑")
-                project = target.parents[1]
-                target.unlink()
+                rel = target.relative_to(root).parts
+                if len(rel) < 2:
+                    raise ValueError("不合法路徑")
+                project = root / rel[0]
+                if not (project / "manifest.json").exists():
+                    raise ValueError("不合法路徑")
                 manifest, items = tasks.load_project(project)
+                # 只能刪 manifest 登記過的片段檔，且只移除「路徑相同」的那筆記錄
+                def same(c):
+                    cp = c.get("path", "")
+                    if not cp:
+                        return False
+                    cpath = Path(cp)
+                    if not cpath.is_absolute():
+                        cpath = project / cpath
+                    return cpath.resolve() == target
+
+                if not any(same(c) for item in items for c in item.clips):
+                    raise ValueError("這個檔案不是已登記的片段")
+                target.unlink()
                 for item in items:
-                    item.clips = [c for c in item.clips if Path(c.get("path", "")).name != target.name]
+                    item.clips = [c for c in item.clips if not same(c)]
                 tasks.save_project(project, manifest, items)
                 self._json({"ok": True})
             except Exception as exc:  # noqa: BLE001
@@ -1454,8 +1549,6 @@ class Handler(BaseHTTPRequestHandler):
             qr = auth.generate()
             png = auth.home() / "bilibili-qr.png"
             png.write_bytes(qr["png"])
-            with LOCK:
-                QR[f"{qr['key']}"] = time.time()
             self._json({"key": qr["key"], "image": "/api/login/qr", "expires_in": 180})
             return
 
@@ -1480,25 +1573,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
+        history, q, final = job.subscribe()
         try:
-            for message in job.messages:
+            for message in history:
                 self._log_event(message)
-            # 歷史已經重播過，佇列裡同一批 log 丟掉，只留結尾事件
+            if final is not None:
+                self._event(*final)
+                return
+            assert q is not None
             while True:
                 try:
-                    kind, payload = job.queue.get_nowait()
+                    kind, payload = q.get(timeout=5)
                 except queue.Empty:
-                    break
-                if kind in ("done", "error"):
-                    self._event(kind, payload)
-                    return
-            while True:
-                try:
-                    kind, payload = job.queue.get(timeout=5)
-                except queue.Empty:
-                    # 客戶端可能早就斷了。只寫 ping 的話，
-                    # 要等到下一次 flush 失敗才發現（原本是 20 秒一輪）。
-                    # 先用 select 確認連線還在，斷了就立刻收工。
+                    # 客戶端可能早就斷了。先用 select 確認連線還在，斷了就立刻收工。
                     if self._peer_gone():
                         return
                     self.wfile.write(b": ping\n\n")
@@ -1512,6 +1599,8 @@ class Handler(BaseHTTPRequestHandler):
                     break
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return
+        finally:
+            job.unsubscribe(q)
 
     def _peer_gone(self) -> bool:
         """連線的另一端還在嗎？（不回傳資料，只問 socket 狀態）"""
@@ -1589,7 +1678,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
             return
         project_name, rel = urllib.parse.unquote(parts[0]), urllib.parse.unquote(parts[1])
-        project = tasks.projects_root() / project_name
+        root = tasks.projects_root().resolve()
+        project = root / project_name
         target = (project / rel).resolve()
         # 不能用 str.startswith 判斷！那是路徑穿越漏洞：
         #   /projects/victim  vs  /projects/victim-evil/secret.txt
@@ -1597,6 +1687,9 @@ class Handler(BaseHTTPRequestHandler):
         # 用 relative_to 才是真的在比目錄層級。
         try:
             base = project.resolve()
+            base.relative_to(root)
+            if base == root:
+                raise ValueError("project root")
             target.relative_to(base)
         except (ValueError, OSError):
             self._send(404, b"not found", "text/plain")
@@ -1611,27 +1704,23 @@ class Handler(BaseHTTPRequestHandler):
         }.get(target.suffix.lower(), "application/octet-stream")
 
         size = target.stat().st_size
-        range_header = self.headers.get("Range")
+        rng = parse_range(self.headers.get("Range"), size)
+        if rng == "unsatisfiable":
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         start, end = 0, size - 1
-        if range_header and range_header.startswith("bytes="):
-            spec = range_header.split("=", 1)[1].split(",")[0]
-            lo, _, hi = spec.partition("-")
-            try:
-                if lo:
-                    start = int(lo)
-                if hi:
-                    end = int(hi)
-            except ValueError:
-                start, end = 0, size - 1
-            start = max(0, min(start, size - 1))
-            end = max(start, min(end, size - 1))
+        if rng:
+            start, end = rng
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         else:
             self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Content-Length", str(max(0, end - start + 1)))
         self.end_headers()
         try:
             with target.open("rb") as fh:

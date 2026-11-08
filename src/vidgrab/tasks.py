@@ -34,6 +34,7 @@ def _timeout(key: str, fallback: float) -> float:
         return fallback
 
 from .models import (
+    VidgrabError,
     Item,
     fmt_duration,
     fmt_ts,
@@ -529,6 +530,9 @@ def _emit_over(emit, text: str, payload: dict | None = None) -> None:
         line += "\x00" + json.dumps(payload, ensure_ascii=False)
     try:
         emit(line)
+    except VidgrabError:
+        # 有意的中止（例如 batch --timeout 期限到了）：必須往上傳，不能當成顯示錯誤吞掉
+        raise
     except Exception:  # noqa: BLE001
         # 進度行送不出去不該讓下載中斷，但也不該假裝沒事。
         # json 沒 import 這種錯就是在這裡被吞掉的（真的發生過）。

@@ -99,16 +99,45 @@ def _parse_progress(line: str) -> dict[str, Any] | None:
     }
 
 
-def _run_stream(cmd: list[str], on_progress=None, timeout: float = 7200) -> tuple[int, str]:
-    """邊跑邊送進度；回傳 (returncode, 最後幾行錯誤)。"""
+def _kill_group(proc: subprocess.Popen) -> None:
+    """整組殺掉（yt-dlp 會再生 ffmpeg），並 wait() 回收，避免 zombie 與孤兒行程。"""
+    import os
+    import signal
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_stream(cmd: list[str], on_progress=None, timeout: float = 7200,
+                check=None) -> tuple[int, str]:
+    """邊跑邊送進度；回傳 (returncode, 最後幾行錯誤)。
+
+    - on_progress 丟例外（例如批次期限到了）時，reader 不會死：它記下例外、繼續把
+      stdout 讀完（不然 pipe 滿了 yt-dlp 會卡住），由主執行緒殺掉整個 process group
+      後把同一個例外拋出去。
+    - check() 回傳例外物件時（heartbeat thread 用），行為同上。
+    """
     import threading
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, errors="replace",
+        text=True, bufsize=1, errors="replace", start_new_session=True,
     )
     tail: list[str] = []
     state = {"last_emit": 0.0, "last_pct": -1.0}
+    aborted: list[BaseException] = []
 
     def reader() -> None:
         assert proc.stdout is not None
@@ -116,7 +145,8 @@ def _run_stream(cmd: list[str], on_progress=None, timeout: float = 7200) -> tupl
             line = raw.rstrip("\n")
             if not line:
                 continue
-            if line.startswith("VIDGRAB ") or line.startswith("[download]") or "[Merger]" in line:
+            if (line.startswith("VIDGRAB ") or line.startswith("[download]") or "[Merger]" in line) \
+                    and not aborted:
                 parsed = _parse_progress(line)
                 if parsed and on_progress:
                     import time as _t
@@ -127,18 +157,37 @@ def _run_stream(cmd: list[str], on_progress=None, timeout: float = 7200) -> tupl
                     if pct is None or pct - state["last_pct"] >= 1 or now - state["last_emit"] >= 2:
                         state["last_pct"] = pct if pct is not None else state["last_pct"]
                         state["last_emit"] = now
-                        on_progress(parsed)
+                        try:
+                            on_progress(parsed)
+                        except BaseException as exc:  # noqa: BLE001 - 交給主執行緒處理
+                            aborted.append(exc)
             tail.append(line)
             del tail[:-40]
 
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
-    try:
-        code = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        raise MediaError(f"逾時（>{int(timeout)}s）")
+    deadline = time.time() + timeout
+    while True:
+        try:
+            code = proc.wait(timeout=0.25)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if not aborted and check is not None:
+            err = check()
+            if err is not None:
+                aborted.append(err)
+        if aborted:
+            _kill_group(proc)
+            thread.join(timeout=5)
+            raise aborted[0]
+        if time.time() > deadline:
+            _kill_group(proc)
+            thread.join(timeout=5)
+            raise MediaError(f"逾時（>{int(timeout)}s）")
     thread.join(timeout=5)
+    if aborted:
+        raise aborted[0]
     return code, "\n".join(tail[-12:])
 
 
@@ -490,6 +539,7 @@ def grab_range(
     # 所以另外掛一個心跳：確實有東西在下載，就讓前端看到「還在動」，
     # 但標成 estimated，不假裝知道真實百分比。
     stop_beat = threading.Event()
+    beat_error: list[BaseException] = []
     beater = None
     if start is not None and on_progress:
         span = max(1.0, float(end or start) - float(start))
@@ -508,7 +558,9 @@ def grab_range(
                         "speed": "", "eta": "", "fragment": "", "bytes": "",
                         "estimated": True,
                     })
-                except Exception:  # noqa: BLE001
+                except BaseException as exc:  # noqa: BLE001
+                    # 例如批次期限到了：記下來，讓 _run_stream 殺掉 yt-dlp 並拋出
+                    beat_error.append(exc)
                     return
 
         beater = threading.Thread(target=beat, daemon=True)
@@ -520,7 +572,14 @@ def grab_range(
     limit = _retries()
     for attempt in range(1, limit + 1):
         try:
-            code, tail = _run_stream(cmd, on_progress=on_progress, timeout=timeout)
+            code, tail = _run_stream(
+                cmd, on_progress=on_progress, timeout=timeout,
+                check=lambda: beat_error[0] if beat_error else None,
+            )
+        except BaseException:
+            # 逾時、批次期限、Ctrl-C：殘檔一定要清，不然下次會從壞掉的地方續傳
+            _clean_partials(outdir, stem)
+            raise
         finally:
             stop_beat.set()
 
@@ -540,14 +599,14 @@ def grab_range(
             raise MediaError(last_error)
 
         wait = _backoff(attempt)
-        log(f"    ↻ 第 {attempt}/{MAX_DOWNLOAD_RETRIES} 次失敗，{wait:.0f} 秒後重試：{last_error[:90]}")
+        log(f"    ↻ 第 {attempt}/{limit} 次失敗，{wait:.0f} 秒後重試：{last_error[:90]}")
         if on_progress:
             try:
                 on_progress({
                     "downloaded": None, "total": None, "percent": None,
                     "speed": "", "eta": "", "fragment": "",
                     "bytes": "", "estimated": True,
-                    "retry": attempt, "max_retries": MAX_DOWNLOAD_RETRIES,
+                    "retry": attempt, "max_retries": limit,
                 })
             except Exception:  # noqa: BLE001
                 pass

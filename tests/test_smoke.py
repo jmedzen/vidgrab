@@ -2022,7 +2022,7 @@ def test_download_retries_up_to_ten_times(monkeypatch, tmp_path):
 
     calls = {"n": 0}
 
-    def fake_run(cmd, on_progress=None, timeout=None):
+    def fake_run(cmd, on_progress=None, timeout=None, check=None):
         calls["n"] += 1
         if calls["n"] < 4:
             return 1, "ERROR: HTTP Error 503: Service Unavailable"
@@ -2052,7 +2052,7 @@ def test_download_gives_up_after_ten_and_does_not_retry_404(monkeypatch, tmp_pat
     # 404：只打一次
     seen = {"n": 0}
 
-    def not_found(cmd, on_progress=None, timeout=None):
+    def not_found(cmd, on_progress=None, timeout=None, check=None):
         seen["n"] += 1
         return 1, "ERROR: HTTP Error 404: Not Found"
 
@@ -2064,7 +2064,7 @@ def test_download_gives_up_after_ten_and_does_not_retry_404(monkeypatch, tmp_pat
     # 503：試滿 10 次
     seen["n"] = 0
 
-    def always_busy(cmd, on_progress=None, timeout=None):
+    def always_busy(cmd, on_progress=None, timeout=None, check=None):
         seen["n"] += 1
         return 1, "ERROR: HTTP Error 503: Service Unavailable"
 
@@ -2162,7 +2162,7 @@ def test_retry_progress_event_carries_attempt(monkeypatch, tmp_path):
     events = []
     state = {"n": 0}
 
-    def flaky(cmd, on_progress=None, timeout=None):
+    def flaky(cmd, on_progress=None, timeout=None, check=None):
         state["n"] += 1
         if state["n"] == 1:
             return 1, "ERROR: HTTP Error 503: Service Unavailable"
@@ -2278,7 +2278,7 @@ def test_corrupt_download_is_rejected_not_saved(monkeypatch, tmp_path):
 
     monkeypatch.setattr(media.time, "sleep", lambda _s: None)
 
-    def fake_run(cmd, on_progress=None, timeout=None):
+    def fake_run(cmd, on_progress=None, timeout=None, check=None):
         stem = next((a for a in cmd if a.endswith(".%(ext)s")), "")
         out = Path(stem.replace(".%(ext)s", ".mp4"))
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -2301,7 +2301,7 @@ def test_good_download_is_accepted(monkeypatch, tmp_path):
     """正常的檔案不能被誤擋。"""
     from vidgrab import media
 
-    def fake_run(cmd, on_progress=None, timeout=None):
+    def fake_run(cmd, on_progress=None, timeout=None, check=None):
         stem = next((a for a in cmd if a.endswith(".%(ext)s")), "")
         out = Path(stem.replace(".%(ext)s", ".mp4"))
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -2375,7 +2375,7 @@ def test_retry_recovers_from_transient_failure_for_real_binary(tmp_path, monkeyp
     real = media._run_stream
     seen = {"n": 0, "cmds": []}
 
-    def flaky(cmd, on_progress=None, timeout=None):
+    def flaky(cmd, on_progress=None, timeout=None, check=None):
         seen["n"] += 1
         seen["cmds"].append(list(cmd))
         if seen["n"] <= 2:
@@ -2988,3 +2988,174 @@ def test_clip_schema_documents_missing_flag(web):
     spec = get(web + "/api/openapi.json")
     props = spec["components"]["schemas"]["Clip"]["properties"]
     assert "missing" in props, "Clip 少了 missing"
+
+
+# ---------------------------------------------------------------- 路徑安全與 Range（#1 #4）
+
+
+def _raw(base: str, method: str, path: str, headers=None, body: bytes | None = None):
+    import http.client
+
+    host, port = base.replace("http://", "").split(":")
+    c = http.client.HTTPConnection(host, int(port), timeout=5)
+    c.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+    c.putheader("Host", f"{host}:{port}")
+    for k, v in (headers or {}).items():
+        c.putheader(k, v)
+    if body is not None:
+        c.putheader("Content-Length", str(len(body)))
+    c.endheaders(body)
+    r = c.getresponse()
+    data = r.read()
+    out = (r.status, dict(r.getheaders()), data)
+    c.close()
+    return out
+
+
+def test_project_dir_rejects_sibling_prefix(tmp_path, web):
+    """`projects-old` 不能通過 `projects` 的根目錄檢查（issue #1）。"""
+    victim = tmp_path / "projects-old" / "victim"
+    victim.mkdir(parents=True)
+    (victim / "manifest.json").write_text("{}", encoding="utf-8")
+    (victim / "keep.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "projects").mkdir(exist_ok=True)
+
+    code, _, _ = _raw(web, "GET", "/api/project/..%2Fprojects-old%2Fvictim")
+    assert code == 404
+
+    body = json.dumps({"project": "../projects-old/victim"}).encode()
+    code, _, _ = _raw(web, "POST", "/api/project/delete", {"Content-Type": "application/json"}, body)
+    assert code == 404
+    assert victim.exists()
+
+    body = json.dumps({"path": str(victim / "keep.txt")}).encode()
+    code, _, _ = _raw(web, "POST", "/api/delete-clip", {"Content-Type": "application/json"}, body)
+    assert code == 400
+    assert (victim / "keep.txt").exists(), "根目錄外的檔案不能被刪"
+
+
+def test_delete_clip_only_registered_clips(tmp_path, web):
+    """delete-clip 只能刪 manifest 登記過的片段，不能刪 manifest.json 或同名的別支（issue #1）。"""
+    proj = _make_project(tmp_path, name="dc")
+    clips = proj / "clips"
+    clips.mkdir()
+    a = clips / "same.mp4"
+    a.write_bytes(b"a")
+    other = proj / "other"
+    other.mkdir()
+    b = other / "same.mp4"
+    b.write_bytes(b"b")
+    results = json.loads((proj / "results.json").read_text(encoding="utf-8"))
+    results[0]["clips"] = [
+        {"path": str(a), "start": 0.0, "end": 5.0},
+        {"path": str(b), "start": 5.0, "end": 10.0},
+    ]
+    (proj / "results.json").write_text(json.dumps(results), encoding="utf-8")
+    hdr = {"Content-Type": "application/json"}
+
+    code, _, _ = _raw(web, "POST", "/api/delete-clip", hdr,
+                      json.dumps({"path": str(proj / "manifest.json")}).encode())
+    assert code == 400 and (proj / "manifest.json").exists()
+
+    code, _, _ = _raw(web, "POST", "/api/delete-clip", hdr, json.dumps({"path": str(a)}).encode())
+    assert code == 200 and not a.exists() and b.exists()
+    left = json.loads((proj / "results.json").read_text(encoding="utf-8"))[0]["clips"]
+    assert [c["path"] for c in left] == [str(b)], "同檔名的另一筆記錄不能被一起刪"
+
+
+def test_file_range_semantics(tmp_path, web):
+    """suffix range、超出範圍、0 byte 檔案（issue #4）。"""
+    proj = _make_project(tmp_path, name="rg")
+    (proj / "clips").mkdir()
+    (proj / "clips" / "a.bin").write_bytes(bytes(range(100)) * 10)  # 1000 bytes
+    (proj / "clips" / "empty.bin").write_bytes(b"")
+    url = "/file/rg/clips/a.bin"
+
+    code, h, body = _raw(web, "GET", url, {"Range": "bytes=-100"})
+    assert code == 206 and h["Content-Range"] == "bytes 900-999/1000" and len(body) == 100
+    code, h, body = _raw(web, "GET", url, {"Range": "bytes=10-19"})
+    assert code == 206 and h["Content-Range"] == "bytes 10-19/1000" and len(body) == 10
+    code, h, body = _raw(web, "GET", url, {"Range": "bytes=990-"})
+    assert code == 206 and h["Content-Range"] == "bytes 990-999/1000"
+    code, h, _ = _raw(web, "GET", url, {"Range": "bytes=2000-"})
+    assert code == 416 and h["Content-Range"] == "bytes */1000"
+    code, h, body = _raw(web, "GET", url)
+    assert code == 200 and len(body) == 1000
+
+    code, h, body = _raw(web, "GET", "/file/rg/clips/empty.bin")
+    assert code == 200 and body == b"" and h["Content-Length"] == "0"
+    code, _, _ = _raw(web, "GET", "/file/rg/clips/empty.bin", {"Range": "bytes=0-"})
+    assert code == 416
+
+
+def test_run_stream_aborts_fast_when_progress_callback_raises(tmp_path):
+    """on_progress 丟例外（批次期限）時，要立刻殺掉行程並拋出同一個例外（issue #2）。"""
+    import sys
+    import time as _t
+
+    from vidgrab import media
+    from vidgrab.models import VidgrabError
+
+    cmd = [sys.executable, "-c",
+           "import time\nfor i in range(200000):\n"
+           "    print(f'VIDGRAB {i} 1000000 1000 5 1 10', flush=True)\n"
+           "time.sleep(60)"]
+
+    def boom(_info):
+        raise VidgrabError("deadline", code="timeout", retryable=True)
+
+    t0 = _t.time()
+    with pytest.raises(VidgrabError):
+        media._run_stream(cmd, on_progress=boom, timeout=30)
+    assert _t.time() - t0 < 10, "應該很快中止，而不是卡到逾時"
+
+
+def test_run_stream_check_hook_kills_process():
+    import sys
+    import time as _t
+
+    from vidgrab import media
+
+    t0 = _t.time()
+    with pytest.raises(RuntimeError):
+        media._run_stream([sys.executable, "-c", "import time; time.sleep(60)"],
+                          timeout=30, check=lambda: RuntimeError("stop"))
+    assert _t.time() - t0 < 10
+
+
+def test_job_pubsub_each_subscriber_gets_every_event():
+    """兩個訂閱者各自收到全部事件，done 不會被另一邊搶走（issue #3）。"""
+    from vidgrab.web import Job
+
+    job = Job("t", "x")
+    job.emit("early")
+    h1, q1, f1 = job.subscribe()
+    h2, q2, f2 = job.subscribe()
+    assert h1 == h2 == ["early"] and f1 is None and f2 is None
+    job.emit("a")
+    job.finish({"ok": 1})
+    for q in (q1, q2):
+        assert q.get_nowait() == ("log", "a")
+        assert q.get_nowait() == ("done", {"ok": 1})
+    _, q3, final = job.subscribe()
+    assert q3 is None and final == ("done", {"ok": 1})
+
+
+def test_job_without_subscribers_holds_no_queue_and_ids_unique():
+    from vidgrab.web import SUBSCRIBER_QUEUE_SIZE, Job
+
+    job = Job("t", "same")
+    for i in range(SUBSCRIBER_QUEUE_SIZE * 3):
+        job.emit(f"m{i}")
+    assert not job._subs
+    assert len({Job("t", "same").id for _ in range(500)}) == 500
+
+    _, q, _ = job.subscribe()
+    for i in range(SUBSCRIBER_QUEUE_SIZE * 2):
+        job.emit(f"n{i}")
+    job.fail("boom")
+    assert q.qsize() == SUBSCRIBER_QUEUE_SIZE, "慢訂閱者有上限"
+    last = None
+    while not q.empty():
+        last = q.get_nowait()
+    assert last == ("error", "boom"), "結尾事件不會被丟掉"
