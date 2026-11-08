@@ -475,9 +475,21 @@ def get_source(platform: str, http: _Http | None = None):
         return BilibiliSource(http)
     if platform in ("youtube", "yt", "y"):
         return YoutubeSource()
+    if platform in ("pexels", "stock", "free"):
+        from .stock import PexelsSource
+
+        return PexelsSource()
     if platform in ("both", "all"):
         raise ValueError("both 請用 get_sources()")
     raise ValueError(f"不認識的平台：{platform}")
+
+
+def source_for(platform: str):
+    """依 item.platform 取回對應來源（給 refresh 用）；建不起來（缺 key、缺套件）就回 None。"""
+    try:
+        return get_source(platform)
+    except (SourceError, ValueError):
+        return None
 
 
 def get_sources(platform: str, http: _Http | None = None) -> list:

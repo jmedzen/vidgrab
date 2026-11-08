@@ -1128,7 +1128,7 @@ OPENAPI: dict[str, Any] = {
                         "properties": {
                             "keywords": {"type": "array", "items": {"type": "string"},
                                          "example": ["台北 街景", "北歐 空景"]},
-                            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube"]},
+                            "platform": {"type": "string", "enum": ["both", "bilibili", "youtube", "pexels"]},
                             "per_keyword": {"type": "integer"},
                             "order": {"type": "string", "enum": ["smart", "relevance", "views", "new"]},
                             "min_duration": {"type": "number", "description": "分鐘"},
@@ -1848,11 +1848,13 @@ class Handler(BaseHTTPRequestHandler):
 
             def work(emit):
                 manifest, items = tasks.load_project(project)
-                from .sources import get_sources
+                from .sources import source_for
 
-                sources = {s.name: s for s in get_sources("both")}
+                sources: dict[str, Any] = {}
                 for item in items:
-                    src = sources.get(item.platform)
+                    if item.platform not in sources:
+                        sources[item.platform] = source_for(item.platform)
+                    src = sources[item.platform]
                     if not src:
                         continue
                     src.detail(item)

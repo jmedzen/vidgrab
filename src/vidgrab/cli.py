@@ -359,11 +359,15 @@ def cmd_batch(args: argparse.Namespace) -> int:
 def cmd_refresh(args: argparse.Namespace) -> int:
     project = resolve_project(args.project)
     manifest, items = tasks.load_project(project)
-    sources = {s.name: s for s in __import__("vidgrab.sources", fromlist=["get_sources"]).get_sources("both")}
+    from .sources import source_for
+
+    sources: dict[str, Any] = {}
     changed = gone = 0
     for item in items:
         before = (item.license_kind, item.repost)
-        src = sources.get(item.platform)
+        if item.platform not in sources:
+            sources[item.platform] = source_for(item.platform)
+        src = sources[item.platform]
         if not src:
             continue
         src.detail(item)
@@ -820,8 +824,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("search", help="用關鍵字搜一輪，建立素材專案")
     s.add_argument("keywords", nargs="+", help="一個或多個關鍵字（多個 = 分開搜再合併）")
-    s.add_argument("--platform", choices=["both", "bilibili", "youtube"],
-                   help="預設讀設定（出廠 both）")
+    s.add_argument("--platform", choices=["both", "bilibili", "youtube", "pexels"],
+                   help="預設讀設定（出廠 both）；pexels 需要 PEXELS_API_KEY")
     s.add_argument("--per-keyword", type=int, help="每個關鍵字抓幾支（出廠 12）")
     s.add_argument("--order", choices=["smart", "relevance", "views", "new"])
     s.add_argument("--duration", choices=["any", "short", "medium", "long", "verylong"],
