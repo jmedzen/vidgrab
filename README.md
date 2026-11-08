@@ -1,11 +1,18 @@
-# vidgrab · 關鍵字找素材
+# vidgrab · 素材庫（影片、畫面、背景音樂）
 
-打幾個關鍵字 → 看到實際畫面 → **整支下載，或只切你要的那幾秒**，連同授權資訊整理成一份清單。
+打幾個關鍵字 → 看到實際畫面 → **整支下載，或只切你要的那幾秒**，連同授權資訊整理成一份**素材庫**，
+人用網頁介面，AI agent 用 CLI／REST／MCP，三條路看到同一份資料。
 
-給剪片用的：找 B 站／YouTube 上的長素材（街景、空景、寺廟、人物走動…），
+給剪片與做 Shorts 用的：找 B 站／YouTube 的長素材（街景、空景、寺廟、人物走動…），
+或授權明確的免費素材站（Pixabay、Pexels）與背景音樂庫（Openverse、Jamendo）；
 要留檔就整支抓，只要幾秒就只切那幾秒，順手記下出處與授權狀態。
+下游的 [vidpipe](https://github.com/jmedzen/vidpipe)（腳本 → 9:16 成品的 Shorts 流水線）就是拿 vidgrab 當素材來源。
 
-- **多個來源**：B 站、YouTube，授權明確的影片站 Pexels／Pixabay（[說明](#pexelspixabay授權明確的免費素材)），以及背景音樂庫 Openverse／Jamendo（[說明](#背景音樂)）
+- **多個來源**：B 站、YouTube，授權明確的影片站 Pixabay／Pexels（[說明](#pexelspixabay授權明確的免費素材)），以及背景音樂庫 Openverse／Jamendo（[說明](#背景音樂)）
+- **給 agent 的三種介面**：CLI（stdout 只有 JSON）、REST（含 OpenAPI）、MCP（stdio 與 HTTP），`vault`／`find`／`batch` 在三邊行為一致，錯誤都是同一套結構
+- **可選的 API token**：`VIDGRAB_API_TOKEN` 設了就要 `Authorization: Bearer`；綁非本機位址沒設 token 會拒絕啟動（[說明](#api-token要讓別台機器容器裡的-agent-連進來時)）
+- **穩定 id、冪等下載**：素材與片段的 id 可重算，`batch` 重跑不會重複下載
+- **抓畫面**：不下載整支，只抓幾格畫面與縮圖（`--frames`／`--frame-only`、REST 的 `frames`／`frame_only`）
 - **三種下載方式**：整支、固定長度切片、自訂區段（`1:00-2:30`）
 - **介面內直接播放**：下載完不必離開網頁就能預覽、跳到你想確認的那一格
 - **6 組主題**（3 深 3 淺）＋ 可拖曳側欄寬度，選擇會記住
@@ -173,6 +180,9 @@ brew install ffmpeg uv
 # 只要聲音
 ./vidgrab pick demo-taipei --select 2 --audio --per 60
 
+# 只抓畫面（不切片段、不下載整支）
+./vidgrab pick demo-taipei --select 1,3 --frame-only --frame-count 5
+
 ./vidgrab purge demo-taipei        # 篩掉教學／課程
 ./vidgrab prune demo-taipei        # 清孤兒檔案
 ./vidgrab forget demo-taipei       # 從清單移除記錄
@@ -333,6 +343,7 @@ agent 可以把它存進自己的記憶，之後永遠找得回來。
 | `download_failed` | 下載失敗 | **是** |
 | `timeout` | 批次逾時 | **是** |
 | `missing_ffmpeg` | 缺 ffmpeg | 否 |
+| `unauthorized` | 設了 `VIDGRAB_API_TOKEN` 卻沒帶或帶錯（HTTP 401） | 否 |
 | `internal` | 未預期錯誤 | **是** |
 | `interrupted` | 使用者按 Ctrl-C 中斷（結束碼 `130`） | **是** |
 
@@ -374,10 +385,10 @@ claude mcp add --transport http vidgrab http://127.0.0.1:8310/mcp \
 
 | 工具 | 做什麼 |
 |---|---|
-| `search_footage` | 去 B 站／YouTube 搜新片，回候選清單（含授權、時長、原始頁面） |
+| `search_footage` | 去 B 站／YouTube／Pixabay／Pexels／音樂庫搜新素材（`platform`、`orientation`），回候選清單（含授權、時長、縮圖、原始頁面） |
 | `list_assets` | 查素材庫：概況、單一專案、或用關鍵字在已下載的素材裡搜 |
 | `find_asset` | 用 asset id／片段 id 找回素材 |
-| `grab_clip` | 下載整支或切片（冪等、可設期限），回新片段的 id、path、url、授權 |
+| `grab_clip` | 下載整支或切片（冪等、可設期限；`frames` 順便抓畫面），回新片段的 id、path、url、授權 |
 | `get_job` | 搜尋／下載超過等待時間（預設 90 秒）時，用 job id 回頭查 |
 
 工具**只回 JSON 與網址，不回影片內容**；片段用 `url`（`/file/...`，接在 vidgrab 位址後面）或同機器的 `path` 取用。
@@ -404,6 +415,7 @@ export PEXELS_API_KEY=...        # 免費：https://www.pexels.com/api/
 - **關鍵字用英文效果最好**；含中文時 Pexels 帶 `locale=zh-TW`、Pixabay 帶 `lang=zh`，但索引都很薄。
 - **不套用長度與觀看數篩選**：`min_duration`（出廠 10 分鐘）是為長片設計的，素材站的片子只有幾十秒，會被直接略過這些條件。
 - **下載**：直連檔案，不經 yt-dlp。整支原樣存；指定區段用 ffmpeg 重新編碼切出（起點精準）。不支援「只要聲音」。
+- **Pexels 目前不好申請**：Pexels 暫停了新的 API key 申請，沒有 key 就用 Pixabay（`stock` 沒 key 的來源會自己略過）。
 - **配額**：Pexels 每小時 200 次、每月 2 萬次；Pixabay 每分鐘 100 次。被限流（429）時會明確回報。
 - 直連網址偶爾會失效；下載報 404 時先 `./vidgrab refresh <專案>` 取得新網址。
 
@@ -661,7 +673,7 @@ CLI 和 API 共用。重開容器也還在。
 
 | 項目 | 預設 | 說明 |
 |---|---|---|
-| `platform` | `both` | `both` / `bilibili` / `youtube` |
+| `platform` | `both` | `both`（B 站＋YouTube）/ `bilibili` / `youtube` / `pexels` / `pixabay` / `stock`（Pexels＋Pixabay）/ `openverse` / `jamendo` / `music`（Openverse＋Jamendo） |
 | `per_keyword` | `12` | 每個關鍵字抓幾支 |
 | `order` | `smart` | `smart` / `relevance` / `views` / `new` |
 | `duration` | `any` | `any` / `short` / `medium` / `long` / `verylong` |
@@ -704,6 +716,9 @@ CLI 和 API 共用。重開容器也還在。
 環境變數的優先序比設定檔高：`VIDGRAB_HOST`、`VIDGRAB_PORT`、`VIDGRAB_BUILD`、
 `VIDGRAB_HOME`、`VIDGRAB_AUTH_DIR`、`VIDGRAB_CONFIG`、`VIDGRAB_YTDLP`
 （最後一個是指定 yt-dlp 執行檔路徑，路徑不存在就退回內建的）。
+認證與素材站金鑰也走環境變數：`VIDGRAB_API_TOKEN`、`VIDGRAB_NO_AUTH`，以及
+`PIXABAY_API_KEY`／`PEXELS_API_KEY`／`JAMENDO_CLIENT_ID`（也認 `VIDGRAB_PIXABAY_KEY`、`VIDGRAB_PEXELS_KEY`、`VIDGRAB_JAMENDO_KEY`，
+或 `auth/` 底下的 `pixabay.key`、`pexels.key`、`jamendo.key`）。
 
 讀設定時是「出廠預設 + 檔案覆蓋」：檔案裡沒有的項目自動用預設值，
 所以升級後新增的設定不會被舊的 `config.json` 卡住或缺欄位。
@@ -997,7 +1012,7 @@ tools/check_frontend.sh            # 只比對「前端產物 vs 原始碼」
 python tools/make_fixture.py /tmp/x   # 造一份假素材庫（給 UI 檢查用，不碰真資料）
 ```
 
-目前 `tests/` 有 **155** 個測試，全部離線（不打 B 站、不抓 YouTube）。
+目前 `tests/` 有 200 多個測試，全部離線（不打 B 站、不抓 YouTube）。
 
 ### 前端
 
