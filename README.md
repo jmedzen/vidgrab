@@ -266,6 +266,7 @@ agent 可以把它存進自己的記憶，之後永遠找得回來。
     "items": [{
       "id": "bilibili:BV1xx",
       "title": "…",
+      "thumbnail": "https://…/cover.jpg",
       "license": {"kind": "unknown", "label": "未標示"},
       "search_terms": ["手碟", "音樂"],
       "credit_hint": "授權未標示，使用前請先聯繫 …",
@@ -287,6 +288,8 @@ agent 可以把它存進自己的記憶，之後永遠找得回來。
 - **`exists` 旗標**：清單有記錄但檔案被刪掉時，agent 看得出來
 - **`cached` 旗標**：分辨「這次真的下載」與「本來就在」
 - **`credit_hint` 直接给可讀句子**，agent 不用自己判斷授權風險
+- **`thumbnail` 是平台給的遠端封面網址**（還沒下載就有，UI 挑素材時直接顯示）；只會是 `http(s)://`，
+  沒有或不是 http(s) 就是空字串。下載後的片段縮圖是另一回事（片段的 `thumb_url`）
 
 ### 冪等：重跑不會重複下載
 
