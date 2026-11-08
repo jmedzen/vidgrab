@@ -24,6 +24,28 @@ def _rel_or_abs(path: str, root: Path) -> str:
     return str(p if p.is_absolute() else (root / p).resolve())
 
 
+def file_url(path_like: str | None) -> str:
+    """素材庫裡的檔案 → `/file/<專案>/<相對路徑>`（HTTP 取檔用）；不在素材庫內或不存在就回空字串。
+
+    agent 不一定跟 vidgrab 同一台機器／同一個檔案系統，所以除了絕對路徑也要給 URL。
+    """
+    import urllib.parse
+
+    from . import tasks
+
+    if not path_like:
+        return ""
+    try:
+        p = Path(path_like).resolve()
+        rel = p.relative_to(tasks.projects_root().resolve())
+    except (OSError, ValueError):
+        return ""
+    if len(rel.parts) < 2 or not p.is_file():
+        return ""
+    return (f"/file/{urllib.parse.quote(rel.parts[0])}/"
+            f"{urllib.parse.quote('/'.join(rel.parts[1:]))}")
+
+
 def clip_summary(clip: dict[str, Any], root: Path, item: Item | None = None) -> dict[str, Any]:
     """一個片段對 agent 有用的全部資訊。
 
@@ -62,6 +84,9 @@ def clip_summary(clip: dict[str, Any], root: Path, item: Item | None = None) -> 
         # 縮圖路徑：任務清單要看到畫面，就得把這個帶出去
         "thumb": _rel_or_abs(clip.get("thumb") or "", root),
         "has_thumb": bool(clip.get("thumb")) and Path(clip["thumb"]).exists(),
+        # HTTP 取檔網址（跨機器／容器時用這個，不要用 path）
+        "url": file_url(path),
+        "thumb_url": file_url(_rel_or_abs(clip.get("thumb") or "", root)) if clip.get("thumb") else "",
     }
 
 
@@ -251,3 +276,158 @@ def fingerprint(paths: list[str]) -> str:
         except OSError:
             h.update(f"{p}:missing".encode())
     return h.hexdigest()[:16]
+
+
+def find_by_id(needle: str) -> dict[str, Any] | None:
+    """用 asset id（`bilibili:BV1xx`）或片段 id（`bilibili:BV1xx#60-75`）找回素材。"""
+    vault = vault_manifest(with_items=True)
+    for proj in vault["projects"]:
+        for item in proj.get("items", []) or []:
+            if item["id"] == needle:
+                return {"project": proj["name"], "item": item}
+            for clip in item.get("clips", []):
+                if clip["id"] == needle:
+                    return {"project": proj["name"], "item": item, "clip": clip}
+    return None
+
+
+def vault_query(*, project: str = "", query: str = "", limit: int = 20,
+                with_items: bool = True, with_description: bool = False) -> dict[str, Any]:
+    """`vault` 的共用實作（CLI 與 HTTP 同一份）。找不到專案丟 NotFound。"""
+    from .models import NotFound
+
+    manifest = vault_manifest(with_items=with_items or bool(query), with_description=with_description)
+    if project:
+        for p in manifest["projects"]:
+            if p["name"] == project:
+                return p
+        raise NotFound(f"找不到專案：{project}")
+    if query:
+        manifest["query"] = query
+        manifest["matches"] = [
+            {"project": h["project"], "score": h["score"], "matched": h["matched"], "item": h["item"]}
+            for h in search_assets(manifest, query, limit=limit)
+        ]
+        del manifest["projects"]  # 只回命中，agent 才不用自己篩
+    return manifest
+
+
+def _clip_key(c: dict[str, Any]) -> tuple:
+    # 用「範圍」當去重鍵，不用 label／id：舊資料沒有 id，混用會讓同一個片段被當成新的
+    return (c.get("start"), c.get("end"))
+
+
+def clip_keys(items: list[Item], targets: list[int]) -> dict[int, set]:
+    """記下這些素材目前有哪些片段，之後用 new_clips() 算出「這次新增的」。"""
+    return {i: {_clip_key(c) for c in items[i].clips} for i in targets}
+
+
+def new_clips(project: Path, targets: list[int], before: dict[int, set]) -> list[dict[str, Any]]:
+    """每個目標素材：這次新增的片段（含 id、url、duration、orientation、授權）與錯誤。"""
+    from . import tasks
+
+    _, after = tasks.load_project(project)
+    out = []
+    for i in targets:
+        item = after[i]
+        fresh = [c for c in item.clips if _clip_key(c) not in before.get(i, set())]
+        credit = contact_block(item)["credit_hint"]
+        clips = []
+        for c in fresh:
+            summary = clip_summary(c, project, item)
+            summary["license"] = {"kind": item.license_kind, "label": item.license_label}
+            summary["credit_hint"] = credit
+            clips.append(summary)
+        out.append({
+            "index": i,
+            "asset_id": item.asset_id(),
+            "title": item.title,
+            "new_clips": clips,
+            "total_clips": len(item.clips),
+            "error": item.error or None,
+        })
+    return out
+
+
+def resolve_targets(items: list[Item], *, indexes=None, asset_ids=None,
+                    top: int | None = None, all_items: bool = False) -> list[int]:
+    """批次要抓哪幾支：索引、asset id、前 N 支、或全部。不合法就丟 BadInput。"""
+    from .models import BadInput
+
+    if asset_ids:
+        lookup = {it.asset_id(): n for n, it in enumerate(items)}
+        missing = [a for a in asset_ids if a not in lookup]
+        if missing:
+            raise BadInput(f"這個專案沒有這些素材：{missing}", hint="用 vault 查 asset id")
+        return [lookup[a] for a in asset_ids]
+    if indexes:
+        try:
+            idx = [int(i) for i in indexes]
+        except (TypeError, ValueError):
+            raise BadInput("indexes 必須是整數陣列") from None
+        bad = [i for i in idx if i < 0 or i >= len(items)]
+        if bad:
+            raise BadInput(f"編號超出範圍（0–{len(items) - 1}）：{bad}")
+        return idx
+    if top:
+        return list(range(min(int(top), len(items))))
+    if all_items:
+        return list(range(len(items)))
+    return []
+
+
+def run_batch(project: Path, targets: list[int], *, timeout: float | None = None,
+              emit=None, **pick_opts) -> dict[str, Any]:
+    """批次抓片（CLI `batch` 與 HTTP `/api/batch` 共用），回 `vidgrab.batch/1`。
+
+    - 冪等：同一個範圍已經抓過就不會重下載，new_clips 為空
+    - 部分成功：每支各自回報
+    - timeout：到期就中止正在跑的下載（殺掉 yt-dlp），已抓好的保留，
+      回傳 `timed_out: true` 與結構化的 `error`，而不是整個丟例外
+    """
+    import time
+
+    from . import tasks
+    from .models import VidgrabError
+
+    _, items = tasks.load_project(project)
+    before = clip_keys(items, targets)
+    started = time.time()
+    deadline = started + float(timeout) if timeout else None
+    sink = emit or (lambda _msg: None)
+
+    def tick(msg: str) -> None:
+        if deadline and time.time() > deadline:
+            raise VidgrabError(
+                f"批次超過 {timeout} 秒，已中止", code="timeout", retryable=True,
+                hint="已經抓好的片段都會保留；調高 timeout 或縮小批次重試",
+            )
+        sink(msg)
+
+    error = None
+    summary: Any = None
+    try:
+        summary = tasks.run_pick(project, targets, emit=tick, **pick_opts)
+    except VidgrabError as exc:
+        if exc.code != "timeout":
+            raise
+        error = exc.to_dict()
+
+    results = new_clips(project, targets, before)
+    failed = sum(1 for r in results if r["error"])
+    out = {
+        "schema": "vidgrab.batch/1",
+        "project": project.name,
+        "requested": len(targets),
+        "ok": len(results) - failed,
+        "failed": failed,
+        "elapsed_seconds": round(time.time() - started, 2),
+        "dry_run": bool(pick_opts.get("dry_run")),
+        "timed_out": error is not None,
+        "results": results,
+    }
+    if summary is not None:
+        out["summary"] = summary
+    if error:
+        out["error"] = error
+    return out

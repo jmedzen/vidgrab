@@ -339,31 +339,9 @@ def cmd_batch(args: argparse.Namespace) -> int:
         patch = {k: v for k, v in values.items() if getattr(args, k, None) is not None}
         config.save_patch(patch)
 
-    # 用「範圍」當去重鍵，不用 label／id：
-    # 舊資料沒有 id，混用會讓同一個片段被當成新的
-    def _key(c: dict) -> tuple:
-        return (c.get("start"), c.get("end"))
-
-    before = {i: {_key(c) for c in items[i].clips} for i in targets}
-
-    started = time.time()
-
-    # agent 呼叫要有上限，不能讓一個批次把整個 session 卡死
-    deadline = started + float(args.timeout) if args.timeout else None
-
-    def _tick(_msg: str) -> None:
-        if deadline and time.time() > deadline:
-            from .models import VidgrabError
-
-            raise VidgrabError(
-                f"批次超過 {args.timeout} 秒，已中止",
-                code="timeout",
-                retryable=True,
-                hint="已經抓好的片段都會保留；調高 --timeout 或縮小批次重試",
-            )
-
-    result = tasks.run_pick(
+    out = agent.run_batch(
         project, targets,
+        timeout=float(args.timeout) if args.timeout else None,
         per=float(values["per"]),
         ranges=_parse_ranges(args.range or []),
         full=bool(args.full),
@@ -373,38 +351,9 @@ def cmd_batch(args: argparse.Namespace) -> int:
         frames=bool(args.frames),
         frame_count=int(args.frame_count),
         dry_run=bool(args.dry_run),
-        emit=_tick if deadline else (lambda _msg: None),  # stdout 只能有 JSON
-    )
-
-    # 重新載入拿最終狀態
-    _, after_items = tasks.load_project(project)
-    grabbed = []
-    for i in targets:
-        item = after_items[i]
-        new_clips = [c for c in item.clips if _key(c) not in before.get(i, set())]
-        grabbed.append({
-            "index": i,
-            "asset_id": item.asset_id(),
-            "title": item.title,
-            "new_clips": [agent.clip_summary(c, project, item) for c in new_clips],
-            "total_clips": len(item.clips),
-            "error": item.error or None,
-        })
-
-    ok = sum(1 for g in grabbed if not g["error"])
-    failed = sum(1 for g in grabbed if g["error"])
-    emit_json({
-        "schema": "vidgrab.batch/1",
-        "project": project.name,
-        "requested": len(targets),
-        "ok": ok,
-        "failed": failed,
-        "elapsed_seconds": round(time.time() - started, 2),
-        "dry_run": bool(args.dry_run),
-        "results": grabbed,
-        "summary": result,
-    })
-    return 0 if failed == 0 else 1
+    )  # emit 不給：stdout 只能有 JSON
+    emit_json(out)
+    return 0 if out["failed"] == 0 and not out["timed_out"] else 1
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
@@ -585,33 +534,11 @@ def cmd_vault(args: argparse.Namespace) -> int:
     """整個素材庫的快照——agent 的主要入口。"""
     from . import agent
 
-    manifest = agent.vault_manifest(
-        with_items=not args.no_items,
-        with_description=args.with_description,
-    )
-
-    if args.project:
-        project = resolve_project(args.project)
-        for p in manifest["projects"]:
-            if p["name"] == project.name:
-                emit_json(p)
-                return 0
-        emit_json({"error": {"code": "not_found", "message": f"找不到專案：{args.project}",
-                             "retryable": False}})
-        return 1
-
-    if args.query:
-        manifest["query"] = args.query
-        manifest["matches"] = [
-            {"project": h["project"], "score": h["score"], "matched": h["matched"],
-             "item": h["item"]}
-            for h in agent.search_assets(manifest, args.query, limit=args.limit)
-        ]
-        del manifest["projects"]  # 只回命中，agent 才不用自己篩
-        emit_json(manifest)
-        return 0
-
-    emit_json(manifest)
+    project = resolve_project(args.project).name if args.project else ""
+    emit_json(agent.vault_query(
+        project=project, query=args.query or "", limit=args.limit,
+        with_items=not args.no_items, with_description=args.with_description,
+    ))
     return 0
 
 
@@ -619,22 +546,13 @@ def cmd_find(args: argparse.Namespace) -> int:
     """用片段 id 或 asset id 找回素材。"""
     from . import agent
 
-    vault = agent.vault_manifest(with_items=True)
-    needle = args.id
-
-    for proj in vault["projects"]:
-        for item in proj.get("items", []) or []:
-            if item["id"] == needle:
-                emit_json({"project": proj["name"], "item": item})
-                return 0
-            for clip in item.get("clips", []):
-                if clip["id"] == needle:
-                    emit_json({"project": proj["name"], "item": item, "clip": clip})
-                    return 0
-
-    emit_json({"error": {"code": "not_found", "message": f"找不到：{needle}",
-                         "retryable": False}})
-    return 1
+    hit = agent.find_by_id(args.id)
+    if hit is None:
+        emit_json({"error": {"code": "not_found", "message": f"找不到：{args.id}",
+                             "retryable": False}})
+        return 1
+    emit_json(hit)
+    return 0
 
 
 def cmd_show(args: argparse.Namespace) -> int:

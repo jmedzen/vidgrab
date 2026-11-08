@@ -145,6 +145,26 @@ def _is_loopback(host: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+# HTTP 狀態 ↔ 錯誤碼（與 CLI 的 code 同一套）
+STATUS_CODES = {400: "bad_input", 401: "unauthorized", 403: "forbidden", 404: "not_found",
+                409: "conflict", 413: "too_large", 429: "rate_limited", 500: "internal",
+                503: "unavailable", 504: "timeout"}
+ERROR_STATUS = {"bad_input": 400, "no_targets": 400, "ambiguous_project": 409, "unauthorized": 401,
+                "forbidden": 403, "not_found": 404, "no_project": 404, "login_required": 403,
+                "missing_ffmpeg": 503, "download_failed": 502, "timeout": 504, "internal": 500}
+
+
+def error_body(message: str, *, status: int = 400, code: str | None = None, hint: str = "") -> dict[str, Any]:
+    err: dict[str, Any] = {
+        "code": code or STATUS_CODES.get(status, "error"),
+        "message": message,
+        "retryable": status >= 500 or status == 429,
+    }
+    if hint:
+        err["hint"] = hint
+    return {"ok": False, "error": err}
+
+
 def _is_within(path: Path, root: Path) -> bool:
     """path 是否在 root 底下（以目錄層級判斷，兩者都先 resolve）。"""
     try:
@@ -458,6 +478,19 @@ def projects_payload() -> list[dict[str, Any]]:
 
 
 
+def _ranges(raw: list) -> list[tuple[float, float]]:
+    """ranges 可以是 [[60, 75], ...]，也可以是 ["1:00-1:15", ...]（跟 CLI --range 同寫法）。"""
+    from .cli import _parse_ranges
+
+    out: list[tuple[float, float]] = []
+    for pair in raw:
+        if isinstance(pair, str):
+            out.extend(_parse_ranges([pair]))
+        else:
+            out.append(tuple(float(x) for x in pair))  # type: ignore[arg-type]
+    return out
+
+
 def resolve_pick_options(body: dict, saved: dict) -> dict[str, Any]:
     """把 API 請求與設定檔合成 run_pick 的參數。
 
@@ -472,7 +505,7 @@ def resolve_pick_options(body: dict, saved: dict) -> dict[str, Any]:
     return {
         "per": float(pick("per")),
         "starts": [float(s) for s in (body.get("starts") or [])],
-        "ranges": [tuple(float(x) for x in pair) for pair in (body.get("ranges") or [])],
+        "ranges": _ranges(body.get("ranges") or []),
         "full": bool(body.get("full")),
         "frames": bool(pick("frames")),
         "frame_count": int(pick("frame_count")),
@@ -493,9 +526,90 @@ COMPONENTS = {
     "schemas": {
         "Error": {
             "type": "object",
-            "description": "出錯時的回應（HTTP 4xx／5xx）",
-            "properties": {"error": {"type": "string"}},
+            "description": "出錯時的回應（HTTP 4xx／5xx），與 CLI 同一套 code",
+            "properties": {
+                "ok": {"type": "boolean", "enum": [False]},
+                "error": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "bad_input / not_found / unauthorized / timeout / internal …"},
+                        "message": {"type": "string"},
+                        "retryable": {"type": "boolean", "description": "重試有沒有機會成功"},
+                        "hint": {"type": "string", "description": "下一步該怎麼做"},
+                    },
+                    "required": ["code", "message", "retryable"],
+                },
+            },
             "required": ["error"],
+        },
+        "AgentClip": {
+            "type": "object",
+            "description": "給 agent 的片段資訊（穩定 id、絕對路徑與 HTTP 網址）",
+            "properties": {
+                "id": {"type": "string", "example": "bilibili:BV1xx#60-75"},
+                "asset_id": {"type": "string"},
+                "path": {"type": "string", "description": "伺服器上的絕對路徑"},
+                "url": {"type": "string", "description": "/file/... 取檔網址（跨機器用這個）"},
+                "thumb_url": {"type": "string"},
+                "exists": {"type": "boolean"},
+                "start": {"type": "number", "nullable": True},
+                "end": {"type": "number", "nullable": True},
+                "duration": {"type": "number", "nullable": True},
+                "width": {"type": "integer", "nullable": True},
+                "height": {"type": "integer", "nullable": True},
+                "orientation": {"type": "string", "enum": ["portrait", "landscape", ""]},
+                "cached": {"type": "boolean"},
+                "license": {"type": "object"},
+                "credit_hint": {"type": "string"},
+            },
+        },
+        "Vault": {
+            "type": "object",
+            "description": "vidgrab.vault/1：整個素材庫（或單一專案、或 query 命中）",
+            "properties": {
+                "schema": {"type": "string", "example": "vidgrab.vault/1"},
+                "root": {"type": "string"},
+                "totals": {"type": "object"},
+                "projects": {"type": "array", "items": {"type": "object"}},
+                "query": {"type": "string"},
+                "matches": {"type": "array", "items": {"type": "object"}},
+            },
+        },
+        "FindResult": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "item": {"type": "object"},
+                "clip": {"$ref": "#/components/schemas/AgentClip"},
+            },
+        },
+        "BatchResult": {
+            "type": "object",
+            "description": "vidgrab.batch/1；非同步呼叫時回 {job, status_url}，結果在 job.result",
+            "properties": {
+                "schema": {"type": "string", "example": "vidgrab.batch/1"},
+                "project": {"type": "string"},
+                "requested": {"type": "integer"},
+                "ok": {"type": "integer"},
+                "failed": {"type": "integer"},
+                "timed_out": {"type": "boolean"},
+                "elapsed_seconds": {"type": "number"},
+                "dry_run": {"type": "boolean"},
+                "results": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "asset_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "new_clips": {"type": "array", "items": {"$ref": "#/components/schemas/AgentClip"}},
+                        "total_clips": {"type": "integer"},
+                        "error": {"type": "string", "nullable": True},
+                    },
+                }},
+                "error": {"type": "object", "description": "逾時時的結構化錯誤"},
+                "job": {"type": "string"},
+                "status_url": {"type": "string"},
+            },
         },
         "Version": {
             "type": "object",
@@ -859,6 +973,7 @@ OPENAPI: dict[str, Any] = {
         {"name": "project", "description": "素材專案"},
         {"name": "auth", "description": "B 站登入"},
         {"name": "job", "description": "非同步工作"},
+        {"name": "agent", "description": "給 AI agent：穩定 id、一次拿完整狀態、冪等批次"},
     ],
     "paths": {
         "/api/version": {
@@ -952,6 +1067,53 @@ OPENAPI: dict[str, Any] = {
                     }}}
                 },
                 "responses": {"200": {"description": "完整備份（版本、設定、登入狀態、專案索引）", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Export"}}}}},
+            },
+        },
+        "/api/vault": {
+            "get": {"tags": ["agent"], "summary": "素材庫快照（agent 主要入口）",
+                    "parameters": [
+                        {"name": "project", "in": "query", "schema": {"type": "string"}, "description": "只看單一專案"},
+                        {"name": "query", "in": "query", "schema": {"type": "string"}, "description": "在已下載的素材裡搜尋"},
+                        {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 20}},
+                        {"name": "items", "in": "query", "schema": {"type": "string", "default": "1"}, "description": "0 = 不要逐支明細"},
+                        {"name": "description", "in": "query", "schema": {"type": "string"}, "description": "1 = 附完整簡介"},
+                    ],
+                    "responses": {"200": {"description": "vidgrab.vault/1", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Vault"}}}},
+                                  "404": {"description": "找不到專案", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}}},
+        },
+        "/api/find/{id}": {
+            "get": {"tags": ["agent"], "summary": "用 asset id 或片段 id 找回素材（/api/clip/{id} 同義）",
+                    "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"},
+                                    "description": "bilibili:BV1xx 或 bilibili:BV1xx#60-75（# 要編成 %23）"}],
+                    "responses": {"200": {"description": "命中的素材（與片段）", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/FindResult"}}}}}},
+        },
+        "/api/batch": {
+            "post": {
+                "tags": ["agent"], "summary": "批次抓片（冪等、部分成功、可設期限）",
+                "requestBody": {"content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["project"],
+                    "properties": {
+                        "project": {"type": "string"},
+                        "indexes": {"type": "array", "items": {"type": "integer"}},
+                        "asset_ids": {"type": "array", "items": {"type": "string"}},
+                        "top": {"type": "integer"},
+                        "all": {"type": "boolean"},
+                        "ranges": {"type": "array", "items": {}, "description": "[[60,75]] 或 [\"1:00-1:15\"]"},
+                        "starts": {"type": "array", "items": {"type": "number"}},
+                        "per": {"type": "number"},
+                        "full": {"type": "boolean"},
+                        "height": {"type": "integer"},
+                        "audio": {"type": "boolean"},
+                        "audio_format": {"type": "string"},
+                        "frames": {"type": "boolean"},
+                        "frame_count": {"type": "integer"},
+                        "dry_run": {"type": "boolean"},
+                        "timeout": {"type": "number", "description": "批次最多跑幾秒"},
+                        "wait": {"type": "boolean", "description": "true = 這個請求等到做完才回"},
+                    },
+                }}}},
+                "responses": {"200": {"description": "wait=true 時是 vidgrab.batch/1，否則 {job, status_url}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchResult"}}}}},
             },
         },
         "/api/job/{id}": {
@@ -1096,7 +1258,22 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _json(self, data: Any, code: int = 200) -> None:
+        if code >= 400 and isinstance(data, dict) and isinstance(data.get("error"), str):
+            # 錯誤一律是 {ok:false, error:{code,message,retryable,hint}}，跟 CLI 同一套
+            data = error_body(data["error"], status=code, code=data.get("code"), hint=data.get("hint", ""))
         self._send(code, json.dumps(_jsonable(data), ensure_ascii=False).encode())
+
+    def _fail(self, exc: Exception) -> None:
+        """VidgrabError → 對應 HTTP 狀態碼與結構化錯誤；其他例外 → 500 internal。"""
+        from .models import VidgrabError
+
+        if isinstance(exc, VidgrabError):
+            status = ERROR_STATUS.get(exc.code, 400)
+            self._send(status, json.dumps({"ok": False, "error": exc.to_dict()}, ensure_ascii=False).encode())
+            return
+        traceback.print_exc()
+        body = error_body(f"{type(exc).__name__}: {exc}", status=500)
+        self._send(500, json.dumps(body, ensure_ascii=False).encode())
 
     def _body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
@@ -1136,10 +1313,11 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _deny(self) -> None:
-        body = json.dumps({
-            "error": "需要 API token：帶 Authorization: Bearer <token>，或先開 /?token=<token> 登入",
-            "code": "unauthorized",
-        }, ensure_ascii=False).encode()
+        body = json.dumps(error_body(
+            "需要 API token",
+            status=401,
+            hint="帶 Authorization: Bearer <token>，瀏覽器則先開 /?token=<token> 登入",
+        ), ensure_ascii=False).encode()
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Bearer realm="vidgrab"')
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1183,6 +1361,35 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/projects":
             self._json(projects_payload())
+            return
+        if route == "/api/vault":
+            from . import agent
+
+            q = urllib.parse.parse_qs(parsed.query)
+            first = lambda k, d="": (q.get(k) or [d])[0]  # noqa: E731
+            try:
+                limit = max(1, min(200, int(first("limit", "20"))))
+            except ValueError:
+                limit = 20
+            try:
+                self._json(agent.vault_query(
+                    project=first("project"), query=first("query"), limit=limit,
+                    with_items=first("items", "1") not in ("0", "false"),
+                    with_description=first("description") in ("1", "true"),
+                ))
+            except Exception as exc:  # noqa: BLE001
+                self._fail(exc)
+            return
+        if route.startswith("/api/find/") or route.startswith("/api/clip/"):
+            from . import agent
+
+            needle = urllib.parse.unquote(route.split("/", 3)[3])
+            hit = agent.find_by_id(needle) if needle else None
+            if hit is None:
+                self._json({"error": f"找不到：{needle}",
+                            "hint": "id 長得像 bilibili:BV1xx 或 bilibili:BV1xx#60-75"}, 404)
+                return
+            self._json(hit)
             return
         if route.startswith("/api/project/"):
             project = self._project_dir(route.split("/api/project/", 1)[1])
@@ -1508,6 +1715,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"job": job.id})
             return
 
+        if route == "/api/batch":
+            self._batch(body)
+            return
+
         if route == "/api/pick":
             project = self._project_dir(body.get("project", ""))
             if not project:
@@ -1544,8 +1755,14 @@ class Handler(BaseHTTPRequestHandler):
                 })
 
             def work(emit):
+                from . import agent
+
+                before = agent.clip_keys(items, indexes)
                 res = tasks.run_pick(project, indexes, emit=emit, **opts)
-                return {"project": project.name, "grabbed": res["grabbed"], "count": len(indexes)}
+                results = agent.new_clips(project, indexes, before)
+                return {"project": project.name, "grabbed": res["grabbed"], "count": len(indexes),
+                        "results": results,
+                        "new_clips": [c for r in results for c in r["new_clips"]]}
 
             job = start_job("pick", f"{project.name} · {len(indexes)} 支", work)
             self._json({"job": job.id})
@@ -1644,6 +1861,62 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     # -- SSE ----------------------------------------------------------
+
+    def _batch(self, body: dict[str, Any]) -> None:
+        """POST /api/batch：agent 的批次入口，跟 CLI `batch` 同一份實作。
+
+        預設非同步（回 job，結果是 vidgrab.batch/1）；`wait: true` 時在這個請求裡等到做完
+        （最多 `timeout` 秒，到期會中止下載並回部分結果）。
+        """
+        from . import agent
+        from . import config as cfg
+        from .models import BadInput, NotFound, VidgrabError
+
+        try:
+            project = self._project_dir(str(body.get("project", "")))
+            if not project:
+                raise NotFound(f"找不到專案：{body.get('project', '')}", hint="用 GET /api/vault 看有哪些專案")
+            _, items = tasks.load_project(project)
+            targets = agent.resolve_targets(
+                items, indexes=body.get("indexes"), asset_ids=body.get("asset_ids"),
+                top=body.get("top"), all_items=bool(body.get("all")),
+            )
+            if not targets:
+                raise VidgrabError("沒有指定要抓的項目", code="no_targets",
+                                   hint="給 indexes、asset_ids、top 或 all 其中一個")
+            timeout = body.get("timeout")
+            try:
+                timeout = float(timeout) if timeout not in (None, "", 0) else None
+            except (TypeError, ValueError):
+                raise BadInput("timeout 必須是秒數") from None
+            try:
+                opts = resolve_pick_options(body, cfg.load())
+            except (TypeError, ValueError) as exc:
+                raise BadInput(f"參數格式不對：{exc}",
+                               hint="ranges 例如 [[60,75]] 或 [\"1:00-1:15\"]") from None
+            opts["dry_run"] = bool(body.get("dry_run"))
+        except Exception as exc:  # noqa: BLE001
+            self._fail(exc)
+            return
+
+        def work(emit):
+            return agent.run_batch(project, targets, timeout=timeout, emit=emit, **opts)
+
+        job = start_job("batch", f"{project.name} · batch {len(targets)} 支", work)
+        if not body.get("wait"):
+            self._json({"job": job.id, "status_url": f"/api/job/{job.id}"})
+            return
+        # 同步等待：比批次期限多留一點時間收尾；沒設期限就最多等 30 分鐘
+        limit = time.time() + (timeout + 30 if timeout else 1800)
+        while not job.done and time.time() < limit:
+            time.sleep(0.2)
+        if not job.done:
+            self._json({"job": job.id, "done": False, "status_url": f"/api/job/{job.id}"}, 202)
+            return
+        if job.error:
+            self._json({"error": job.error, "job": job.id}, 500)
+            return
+        self._json(job.result)
 
     def _stream(self, job_id: str) -> None:
         job = JOBS.get(job_id)

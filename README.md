@@ -335,6 +335,26 @@ agent 可以把它存進自己的記憶，之後永遠找得回來。
 `interrupted` 只出現在 `KeyboardInterrupt`，而且已經抓好的片段都會保留，
 所以 agent 重跑不會白費前面的工作。
 
+### HTTP 也有同一套（agent 不在同一台機器時）
+
+`vault`、`find`、`batch` 都有 HTTP 版本，回的 JSON 跟 CLI 一樣，另外每個片段多了 `url`／`thumb_url`
+（`/file/...`），跨機器、容器時用網址取檔，不要用 `path`。
+
+```bash
+H="Authorization: Bearer $VIDGRAB_API_TOKEN"
+curl -H "$H" "http://127.0.0.1:8310/api/vault?query=夜晚%20街景"
+curl -H "$H" "http://127.0.0.1:8310/api/find/bilibili%3ABV1xx%2360-75"
+curl -H "$H" -X POST http://127.0.0.1:8310/api/batch -d '{
+  "project": "demo", "asset_ids": ["bilibili:BV1xx"],
+  "ranges": ["1:00-1:15"], "timeout": 300, "wait": true}'
+```
+
+- `batch` 選目標：`indexes`、`asset_ids`、`top`、`all` 擇一
+- `wait: true` 同步回 `vidgrab.batch/1`；不帶就回 `{job, status_url}`，結果在 `/api/job/{id}` 的 `result`
+- `timeout` 到期會真的停掉下載，回部分結果與 `timed_out: true`
+- `/api/pick` 的 job 結果也帶 `new_clips[]`
+- **所有 HTTP 錯誤**都是 `{"ok": false, "error": {"code", "message", "retryable", "hint"}}`，code 跟 CLI 同一套
+
 ### 在已下載的素材裡搜尋
 
 `search` 是去平台找**新片**；`vault --query` 是在你**手上的素材**裡找。
@@ -680,6 +700,9 @@ curl -s -X POST http://127.0.0.1:8310/api/config \
 | POST | `/api/config` | 改設定（`{"set":{...}}` 或 `{"reset":[...]}`） |
 | POST | `/api/search` | 搜尋並建立專案（回 `job`） |
 | POST | `/api/pick` | 整支／切片／抓畫面（回 `job`） |
+| GET | `/api/vault` | 素材庫快照，`?project=` 單一專案、`?query=` 在已下載素材裡搜尋（同 CLI `vault`） |
+| GET | `/api/find/{id}` | 用 asset id 或片段 id 找回素材（`/api/clip/{id}` 同義，`#` 要編成 `%23`） |
+| POST | `/api/batch` | 批次抓片（同 CLI `batch`）：冪等、部分成功、`timeout`、`wait:true` 同步等結果 |
 | GET | `/api/job/{id}` | 工作狀態與完整訊息 |
 | GET | `/api/stream/{id}` | SSE 即時進度（`log` / `done` / `error`） |
 | GET | `/api/projects` | 所有專案索引 |

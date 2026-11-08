@@ -2912,10 +2912,10 @@ def test_pick_rejects_bad_indexes_before_starting_job(web, tmp_path):
 
     code, body = post({"project": "pk-proj", "indexes": [999]})
     assert code == 400, f"越界索引應回 400，實際 {code}"
-    assert "超出範圍" in body["error"], body
+    assert "超出範圍" in body["error"]["message"], body
 
     code, body = post({"project": "pk-proj", "indexes": []})
-    assert code == 400 and "勾選" in body["error"], body
+    assert code == 400 and "勾選" in body["error"]["message"], body
 
     code, body = post({"project": "pk-proj", "indexes": ["x"]})
     assert code == 400, f"非整數索引應回 400，實際 {code}"
@@ -3174,7 +3174,7 @@ def test_token_auth_protects_api_and_files(tmp_path, web, monkeypatch):
         code, h, body = _raw(web, "GET", path)
         assert code == 401, path
         assert h.get("WWW-Authenticate", "").startswith("Bearer")
-        assert json.loads(body)["code"] == "unauthorized"
+        assert json.loads(body)["error"]["code"] == "unauthorized"
     code, _, _ = _raw(web, "POST", "/api/project/delete", {"Content-Type": "application/json"},
                       json.dumps({"project": "au"}).encode())
     assert code == 401 and proj.exists()
@@ -3230,3 +3230,136 @@ def test_compose_publishes_loopback_only():
     text = (Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text(encoding="utf-8")
     assert '"127.0.0.1:8310:8310"' in text
     assert "VIDGRAB_API_TOKEN" in text
+
+
+# ---------------------------------------------------------------- agent REST（#6）
+
+
+def _post_json(base, path, payload):
+    code, _, body = _raw(base, "POST", path, {"Content-Type": "application/json"},
+                         json.dumps(payload).encode())
+    return code, json.loads(body or b"{}")
+
+
+def _fake_pick(monkeypatch, *, slow=False):
+    """假的 run_pick：在 clips/ 生一個檔並登記，已存在就不重複（模擬冪等）。"""
+    from vidgrab import tasks
+
+    def fake(project, indexes, emit=print, **kw):
+        manifest, items = tasks.load_project(project)
+        if slow:
+            for _ in range(100):
+                emit("\rtick")
+                time.sleep(0.05)
+        grabbed = 0
+        for i in indexes:
+            item = items[i]
+            for start, end in (kw.get("ranges") or [(0.0, 15.0)]):
+                if any(c.get("start") == start and c.get("end") == end for c in item.clips):
+                    continue
+                f = project / "clips" / f"{item.vid}_{int(start)}-{int(end)}.mp4"
+                f.parent.mkdir(exist_ok=True)
+                f.write_bytes(b"mp4")
+                item.clips.append({"path": str(f), "start": start, "end": end,
+                                   "width": 1080, "height": 1920, "size_bytes": 3})
+                grabbed += 1
+        tasks.save_project(project, manifest, items)
+        return {"grabbed": grabbed, "items": items}
+
+    monkeypatch.setattr(tasks, "run_pick", fake)
+
+
+def test_api_batch_wait_is_idempotent_and_returns_urls(tmp_path, web, monkeypatch):
+    _make_project(tmp_path, name="bt")
+    _fake_pick(monkeypatch)
+
+    code, out = _post_json(web, "/api/batch", {"project": "bt", "asset_ids": ["youtube:v1"],
+                                               "ranges": ["0:10-0:20"], "wait": True})
+    assert code == 200, out
+    assert out["schema"] == "vidgrab.batch/1" and out["ok"] == 1 and not out["timed_out"]
+    clip = out["results"][0]["new_clips"][0]
+    assert clip["id"] == "youtube:v1#10-20"
+    assert clip["url"].startswith("/file/bt/clips/") and clip["orientation"] == "portrait"
+    assert "credit_hint" in clip and "license" in clip
+    assert _raw(web, "GET", clip["url"])[2] == b"mp4"
+
+    code, again = _post_json(web, "/api/batch", {"project": "bt", "indexes": [0],
+                                                 "ranges": [[10, 20]], "wait": True})
+    assert code == 200 and again["results"][0]["new_clips"] == [], "重跑不能重複下載"
+
+    # 非同步：回 job，結果在 job.result
+    code, out = _post_json(web, "/api/batch", {"project": "bt", "top": 1, "ranges": [[30, 40]]})
+    assert code == 200 and out["job"]
+    for _ in range(50):
+        job = get(web + f"/api/job/{out['job']}")
+        if job["done"]:
+            break
+        time.sleep(0.1)
+    assert job["result"]["results"][0]["new_clips"][0]["id"] == "youtube:v1#30-40"
+
+
+def test_api_batch_timeout_returns_partial(tmp_path, web, monkeypatch):
+    _make_project(tmp_path, name="bto")
+    _fake_pick(monkeypatch, slow=True)
+    code, out = _post_json(web, "/api/batch", {"project": "bto", "indexes": [0],
+                                               "timeout": 0.3, "wait": True})
+    assert code == 200, out
+    assert out["timed_out"] is True and out["error"]["code"] == "timeout" and out["error"]["retryable"]
+
+
+def test_api_batch_bad_input_is_structured(tmp_path, web):
+    _make_project(tmp_path, name="bb")
+    code, out = _post_json(web, "/api/batch", {"project": "bb"})
+    assert code == 400 and out["error"]["code"] == "no_targets"
+    code, out = _post_json(web, "/api/batch", {"project": "bb", "asset_ids": ["youtube:nope"]})
+    assert code == 400 and out["error"]["code"] == "bad_input" and out["error"]["hint"]
+    code, out = _post_json(web, "/api/batch", {"project": "nope", "top": 1})
+    assert code == 404 and out["error"]["code"] == "not_found"
+    code, out = _post_json(web, "/api/batch", {"project": "bb", "top": 1, "ranges": ["abc"]})
+    assert code == 400 and out["error"]["code"] == "bad_input"
+
+
+def test_api_vault_and_find(tmp_path, web, monkeypatch):
+    import urllib.parse as _p
+
+    _make_project(tmp_path, name="vt")
+    _fake_pick(monkeypatch)
+    _post_json(web, "/api/batch", {"project": "vt", "top": 1, "wait": True})
+
+    vault = get(web + "/api/vault")
+    assert vault["schema"] == "vidgrab.vault/1" and vault["totals"]["clips"] == 1
+    clip = vault["projects"][0]["items"][0]["clips"][0]
+    assert clip["url"] and clip["id"] == "youtube:v1#0-15"
+
+    one = get(web + "/api/vault?project=vt")
+    assert one["name"] == "vt"
+    hits = get(web + "/api/vault?query=" + _p.quote("測試"))
+    assert hits["matches"] and "projects" not in hits
+
+    code, _, body = _raw(web, "GET", "/api/vault?project=nope")
+    assert code == 404 and json.loads(body)["error"]["code"] == "not_found"
+
+    found = get(web + "/api/find/" + _p.quote("youtube:v1#0-15", safe=""))
+    assert found["clip"]["id"] == "youtube:v1#0-15" and found["project"] == "vt"
+    assert get(web + "/api/clip/" + _p.quote("youtube:v1", safe=""))["item"]["id"] == "youtube:v1"
+    code, _, body = _raw(web, "GET", "/api/find/youtube%3Anope")
+    assert code == 404 and json.loads(body)["error"]["code"] == "not_found"
+
+
+def test_api_pick_job_result_has_new_clips(tmp_path, web, monkeypatch):
+    _make_project(tmp_path, name="pk")
+    _fake_pick(monkeypatch)
+    code, out = _post_json(web, "/api/pick", {"project": "pk", "indexes": [0]})
+    assert code == 200
+    for _ in range(50):
+        job = get(web + f"/api/job/{out['job']}")
+        if job["done"]:
+            break
+        time.sleep(0.1)
+    assert job["result"]["new_clips"][0]["url"].startswith("/file/pk/")
+
+
+def test_all_api_errors_are_structured(web):
+    code, _, body = _raw(web, "GET", "/api/project/nope")
+    err = json.loads(body)["error"]
+    assert code == 404 and err["code"] == "not_found" and err["retryable"] is False
