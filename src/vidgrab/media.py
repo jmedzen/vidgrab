@@ -306,6 +306,18 @@ def probe_frames(item: Item, outdir: Path, n: int = 3, opts: GrabOptions | None 
         if frame.exists():
             frames.append(frame)
             continue
+        if item.media_url:
+            # 素材站有直連網址：ffmpeg 直接 seek 到那一秒抽一格，不必先下載
+            proc = _run(
+                ["ffmpeg", "-v", "error", "-y", "-ss", f"{point:.2f}", "-i", item.media_url,
+                 "-frames:v", "1", "-vf", f"scale={width}:-2", str(frame)],
+                timeout=120,
+            )
+            if proc.returncode == 0 and frame.exists() and frame.stat().st_size > 0:
+                frames.append(frame)
+            else:
+                frame.unlink(missing_ok=True)
+            continue
         cmd = (
             [ytdlp_bin()]
             + _common_args(GrabOptions(height=480, cookies=opts.cookies,
@@ -511,6 +523,133 @@ def _backoff(attempt: int) -> float:
     return min(max(1.0, cap), float(2 ** max(0, attempt - 1)))
 
 
+def _download_file(url: str, dest: Path, timeout: float, on_progress=None) -> None:
+    """串流下載到 dest（先寫 .part，完成才改名）。
+
+    錯誤訊息刻意用 `_RETRYABLE` 認得的字眼（HTTP error 5xx、timed out、connection），
+    讓外層的退避重試只對真的有機會好的失敗重試。
+    """
+    import requests
+
+    part = dest.with_name(dest.name + ".part")
+    deadline = time.time() + timeout
+    try:
+        with requests.get(url, stream=True, timeout=30,
+                          headers={"User-Agent": "vidgrab"}) as resp:
+            if resp.status_code >= 500 or resp.status_code == 429:
+                raise MediaError(f"HTTP error {resp.status_code}")
+            if resp.status_code >= 400:
+                raise MediaError(f"HTTP {resp.status_code}：素材網址失效，"
+                                 "請先 refresh 取得新網址")
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            began = time.time()
+            last = 0.0
+            with open(part, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=256 * 1024):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    done += len(chunk)
+                    now = time.time()
+                    if now > deadline:
+                        raise MediaError(f"逾時（>{int(timeout)}s）")
+                    if on_progress and now - last >= 0.5:
+                        last = now
+                        speed = done / max(0.001, now - began)
+                        on_progress({
+                            "downloaded": done, "total": total or None,
+                            "percent": round(done / total * 100, 1) if total else None,
+                            "speed": _fmt_speed(speed),
+                            "eta": _fmt_eta((total - done) / speed) if total and speed else "",
+                            "fragment": "", "bytes": human_size(done),
+                        })
+        if total and done < total:
+            raise MediaError("incomplete read：檔案沒下載完整")
+        part.replace(dest)
+    except requests.RequestException as exc:
+        raise MediaError(f"connection error：{type(exc).__name__}") from exc
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def _grab_direct(item: Item, start: float | None, end: float | None, outdir: Path,
+                 stem: str, opts: GrabOptions, timeout: float, on_progress=None) -> dict[str, Any]:
+    """素材站（Pexels 等）：直連下載整支，再用 ffmpeg 切出需要的區段。
+
+    這類影片只有幾十秒、檔案幾 MB，整支抓下來比 yt-dlp 的分段機制更單純可靠。
+    切片一律重新編碼（libx264/aac），這樣起點是精準的，不受關鍵幀影響。
+    """
+    import tempfile
+
+    music = item.is_music()
+    if opts.audio_only and not music:
+        raise MediaError("這個來源沒有獨立的音訊檔，不支援只要聲音")
+    if not ffmpeg_ok():
+        raise MediaError("缺 ffmpeg／ffprobe，無法處理素材站檔案")
+
+    # 音樂：整支保留原格式（認得的副檔名），切片一律轉 m4a（AAC，ffmpeg 內建編碼器）
+    src_ext = Path(item.media_url.split("?", 1)[0]).suffix.lower()
+    if music:
+        keep = start is None and src_ext in MEDIA_EXTS
+        final = outdir / f"{stem}{src_ext if keep else '.m4a'}"
+    else:
+        final = outdir / f"{stem}.mp4"
+    limit = _retries()
+    last_error = ""
+    tmpdir = Path(tempfile.mkdtemp(prefix=f".{stem}.", dir=str(outdir)))
+    try:
+        src = tmpdir / ("source" + (src_ext if music and src_ext else ".mp4"))
+        log(f"    ↓ {item.platform} {item.vid} " + ("整支" if start is None
+            else f"{fmt_ts(start)}→{fmt_ts(end or 0)}"))
+        for attempt in range(1, limit + 1):
+            try:
+                _download_file(item.media_url, src, timeout, on_progress)
+                last_error = ""
+                break
+            except MediaError as exc:
+                last_error = str(exc)
+                if attempt >= limit or not _is_retryable(last_error):
+                    raise
+                wait = _backoff(attempt)
+                log(f"    ↻ 第 {attempt}/{limit} 次失敗，{wait:.0f} 秒後重試：{last_error[:90]}")
+                time.sleep(wait)
+
+        if start is None and final.suffix == src.suffix:
+            shutil.move(str(src), str(final))
+        else:
+            # 切片，或整支但格式不是素材庫認得的（音樂轉 m4a）
+            part = tmpdir / f"cut{final.suffix}"
+            cmd = ["ffmpeg", "-v", "error", "-y"]
+            if start is not None:
+                cmd += ["-ss", f"{float(start):.3f}"]
+            cmd += ["-i", str(src)]
+            if start is not None:
+                cmd += ["-t", f"{max(0.1, float(end) - float(start)):.3f}"]
+            if music:
+                cmd += ["-vn", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+            else:
+                cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"]
+            proc = _run(cmd + [str(part)], timeout=max(60.0, min(timeout, 900.0)))
+            if proc.returncode != 0 or not part.exists():
+                tail = (proc.stderr or "").strip().splitlines()[-1:] or ["ffmpeg 切片失敗"]
+                raise MediaError(tail[0])
+            part.replace(final)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    probe = ffprobe(final)
+    if music:
+        if not probe.get("has_audio"):
+            final.unlink(missing_ok=True)
+            raise MediaError("下載回來的檔案是壞的（沒有音訊軌），已刪除")
+    elif not (probe.get("width") or probe.get("height")):
+        final.unlink(missing_ok=True)
+        raise MediaError("下載回來的檔案是壞的（沒有影像軌），已刪除")
+    return {"path": str(final), "cached": False, **probe}
+
+
 def grab_range(
     item: Item,
     start: float | None,
@@ -537,6 +676,9 @@ def grab_range(
         existing = outdir / f"{stem}{ext}"
         if existing.exists() and existing.stat().st_size > 0:
             return {"path": str(existing), "cached": True, **ffprobe(existing)}
+
+    if item.media_url:
+        return _grab_direct(item, start, end, outdir, stem, opts, timeout, on_progress)
 
     cmd = [ytdlp_bin()] + _common_args(opts) + ["-f", _format_selector(opts)] + _sort_args(opts)
     if start is not None:
@@ -652,7 +794,14 @@ def grab_range(
     # 這種檔進到素材庫就是一格「無圖、尺寸空白」的垃圾，而且不會報錯。
     # 判斷依據只有一個：有沒有影像尺寸。壞檔的 duration 可能還是 6.0，
     # 用「duration 也沒有」當條件會漏掉它。
-    if not (probe.get("width") or probe.get("height")):
+    # 只要聲音的下載本來就沒有影像軌，不能拿這條判斷（否則好好的 m4a 會被當壞檔刪掉）；
+    # 這種檔改看有沒有音訊軌。
+    if opts.audio_only:
+        if not probe.get("has_audio"):
+            final.unlink(missing_ok=True)
+            _clean_partials(outdir, stem)
+            raise MediaError("下載回來的檔案是壞的（沒有音訊軌），已刪除")
+    elif not (probe.get("width") or probe.get("height")):
         final.unlink(missing_ok=True)
         _clean_partials(outdir, stem)
         raise MediaError("下載回來的檔案是壞的（沒有影像軌），已刪除")

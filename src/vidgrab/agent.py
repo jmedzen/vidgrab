@@ -90,6 +90,17 @@ def clip_summary(clip: dict[str, Any], root: Path, item: Item | None = None) -> 
     }
 
 
+def thumbnail_url(raw: str | None) -> str:
+    """素材的封面網址（遠端，不是下載後的縮圖）：只放行 http(s)，`//host/x` 補成 https。
+
+    給 UI 直接放進 <img src>，所以其他 scheme（javascript:、data: …）一律當作沒有。
+    """
+    url = (raw or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    return url if url.lower().startswith(("http://", "https://")) else ""
+
+
 def item_summary(item: Item, root: Path, *, with_description: bool = False) -> dict[str, Any]:
     """一支素材對 agent 有用的全部資訊。"""
     out: dict[str, Any] = {
@@ -100,6 +111,7 @@ def item_summary(item: Item, root: Path, *, with_description: bool = False) -> d
         "author": item.author,
         "author_url": item.author_url,
         "webpage_url": item.webpage_url or item.url,
+        "thumbnail": thumbnail_url(item.thumbnail),
         "duration": item.duration,
         "width": item.width,
         "height": item.height,

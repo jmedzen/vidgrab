@@ -475,9 +475,33 @@ def get_source(platform: str, http: _Http | None = None):
         return BilibiliSource(http)
     if platform in ("youtube", "yt", "y"):
         return YoutubeSource()
-    if platform in ("both", "all"):
-        raise ValueError("both 請用 get_sources()")
+    if platform == "pexels":
+        from .stock import PexelsSource
+
+        return PexelsSource()
+    if platform == "pixabay":
+        from .stock import PixabaySource
+
+        return PixabaySource()
+    if platform == "openverse":
+        from .music import OpenverseSource
+
+        return OpenverseSource()
+    if platform == "jamendo":
+        from .music import JamendoSource
+
+        return JamendoSource()
+    if platform in ("both", "all", "stock", "free", "music"):
+        raise ValueError(f"{platform} 請用 get_sources()")
     raise ValueError(f"不認識的平台：{platform}")
+
+
+def source_for(platform: str):
+    """依 item.platform 取回對應來源（給 refresh 用）；建不起來（缺 key、缺套件）就回 None。"""
+    try:
+        return get_source(platform)
+    except (SourceError, ValueError):
+        return None
 
 
 def get_sources(platform: str, http: _Http | None = None) -> list:
@@ -488,6 +512,26 @@ def get_sources(platform: str, http: _Http | None = None) -> list:
                 out.append(get_source(name, http))
             except SourceError as exc:
                 log(f"! {name} 不可用：{exc}")
+        return out
+    if platform in ("stock", "free"):
+        # 素材站：哪個有 key 就搜哪個；全都沒有才算失敗，並把每個缺什麼講清楚
+        out, reasons = [], []
+        for name in ("pexels", "pixabay"):
+            try:
+                out.append(get_source(name))
+            except SourceError as exc:
+                reasons.append(f"{name}：{exc}")
+                log(f"! {name} 不可用：{exc}")
+        if not out:
+            raise SourceError("素材站都不能用。" + "；".join(reasons))
+        return out
+    if platform == "music":
+        # 音樂庫：Openverse 免 key 一定可用；Jamendo 有 client id 才加
+        out = [get_source("openverse")]
+        try:
+            out.append(get_source("jamendo"))
+        except SourceError as exc:
+            log(f"· jamendo 略過：{exc}")
         return out
     return [get_source(platform, http)]
 

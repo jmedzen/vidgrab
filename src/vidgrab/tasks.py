@@ -34,8 +34,10 @@ def _timeout(key: str, fallback: float) -> float:
         return fallback
 
 from .models import (
+    BadInput,
     VidgrabError,
     Item,
+    STOCK_PLATFORMS,
     fmt_duration,
     fmt_ts,
     human_size,
@@ -54,11 +56,13 @@ Emit = Callable[[str], None]
 
 def _apply_filters(items: list[Item], *, fresh_days: int, min_duration: float,
                    max_duration: float, min_views: int, only_free: bool,
-                   drop_reposts: bool, drop_tutorials: bool = True) -> list[Item]:
+                   drop_reposts: bool, drop_tutorials: bool = True,
+                   orientation: str = "any") -> list[Item]:
     fresh_after = ""
     if fresh_days:
         fresh_after = time.strftime("%Y%m%d", time.localtime(time.time() - fresh_days * 86400))
     from .models import looks_like_tutorial
+    from .stock import orientation_ok
 
     out = []
     for item in items:
@@ -66,18 +70,37 @@ def _apply_filters(items: list[Item], *, fresh_days: int, min_duration: float,
             continue
         if fresh_after and item.pubdate and item.pubdate < fresh_after:
             continue
-        if min_duration and (item.duration or 0) < min_duration * 60:
+        if item.is_stock() and not orientation_ok(item, orientation):
             continue
-        if max_duration and item.duration and item.duration > max_duration * 60:
-            continue
-        if min_views and (item.views or 0) < min_views:
-            continue
+        # 素材站的片子本來就短、也沒有觀看數；長度與熱度篩選是為長片設計的
+        if not item.is_stock():
+            if min_duration and (item.duration or 0) < min_duration * 60:
+                continue
+            if max_duration and item.duration and item.duration > max_duration * 60:
+                continue
+            if min_views and (item.views or 0) < min_views:
+                continue
         if only_free and item.license_kind not in ("free", "free-attribution"):
             continue
         if drop_reposts and item.repost:
             continue
         out.append(item)
     return out
+
+
+def _source_kwargs(src, min_duration: float, max_duration: float,
+                   orientation: str = "any") -> dict[str, Any]:
+    """各來源專屬的搜尋參數。
+
+    長度篩選的單位是「分鐘」，為長片設計；素材站的片子只有幾十秒，不套用。
+    orientation 只有素材站看得懂（B 站／YouTube 搜尋結果沒有尺寸）。
+    """
+    if getattr(src, "name", "") in STOCK_PLATFORMS:
+        return {"orientation": orientation} if orientation and orientation != "any" else {}
+    return {
+        "min_seconds": min_duration * 60 if min_duration else 0,
+        "max_seconds": max_duration * 60 if max_duration else 0,
+    }
 
 
 def run_search(
@@ -99,8 +122,14 @@ def run_search(
     name: str | None = None,
     out: str | None = None,
     replace: bool = False,
+    orientation: str = "any",
     emit: Emit = log,
 ) -> dict[str, Any]:
+    from .stock import ORIENTATIONS
+
+    if orientation not in ORIENTATIONS:
+        raise BadInput(f"orientation 不認得：{orientation}",
+                       hint="可用 any / portrait / landscape / square")
     queries = [q.strip() for q in queries if q and q.strip()]
     if not queries:
         raise SystemExit("要至少一個關鍵字。")
@@ -128,8 +157,7 @@ def run_search(
                         order=order,
                         duration=duration,
                         exclude=exclude,
-                        min_seconds=min_duration * 60 if min_duration else 0,
-                        max_seconds=max_duration * 60 if max_duration else 0,
+                        **_source_kwargs(src, min_duration, max_duration, orientation),
                     )
                 except SourceError as exc:
                     # 搜尋失敗多半是網路抽動或對方暫時限流 —— 這種重試有用。
@@ -149,8 +177,7 @@ def run_search(
                                 order=order,
                                 duration=duration,
                                 exclude=exclude,
-                                min_seconds=min_duration * 60 if min_duration else 0,
-                                max_seconds=max_duration * 60 if max_duration else 0,
+                                **_source_kwargs(src, min_duration, max_duration, orientation),
                             )
                             last = None
                             break
@@ -180,6 +207,7 @@ def run_search(
         min_views=min_views,
         only_free=only_free,
         drop_reposts=drop_reposts,
+        orientation=orientation,
     )
     emit(f"· 篩選後 {len(items)} 支（原始 {len(collected)} 支）")
 
@@ -302,10 +330,6 @@ def run_pick(
         cookies_from_browser=cookies_from_browser,
         extra_format=fmt,
     )
-    sources = {}
-    for src in get_sources("both"):
-        sources[src.name] = src
-
     clips_dir = project / "clips"
     frames_dir = project / "frames"
     thumb_dir = project / "thumbs"
@@ -323,7 +347,7 @@ def run_pick(
         if item.license_kind in ("unknown", "none"):
             emit("     ⚠ 沒有授權資訊：公開使用前請自行確認")
 
-        if frames:
+        if frames and not item.is_music():  # 音樂沒有畫面可抽
             # 抽畫面只是輔助：抓不到就算了，不能讓它把整個作業帶走。
             # 真的發生過：YouTube 長片抽幀逾時 → 整批 batch 回 internal，
             # 明明片段已經下載成功，使用者卻收到失敗。
@@ -355,7 +379,7 @@ def run_pick(
         if dry_run or frame_only:
             continue
 
-        if not item.duration:
+        if not item.duration and not item.media_url:
             try:
                 info = media.probe_video(item.url, opts,
                                                timeout=_timeout("probe_timeout", 180.0))
