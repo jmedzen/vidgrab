@@ -57,6 +57,11 @@ docker run --rm -p 127.0.0.1:8310:8310 -e VIDGRAB_NO_AUTH=1 -v vidgrab-data:/dat
 # 要對外發佈 port 的話改用 token：-p 8310:8310 -e VIDGRAB_API_TOKEN=<token>
 ```
 
+**預建映像**：`ghcr.io/jmedzen/vidgrab`（amd64＋arm64）由 `.github/workflows/publish.yml` 在 push 到 `main` 時發佈
+（也可在 Actions 頁手動執行），給 NAS 之類不想在本機 build 的環境直接 `docker pull`。套件預設私有：
+要免登入 pull 就在 GitHub 的 Packages 頁設成 Public，否則先 `docker login ghcr.io`（token 要有 `read:packages`）。
+跟 vidpipe 一起部署到 Synology 見 vidpipe 的 `docker-compose.dsm.yml`。
+
 ### 本機 Python
 
 ```bash
