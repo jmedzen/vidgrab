@@ -26,3 +26,8 @@ docs
 # 這些不需要進映像
 web/node_modules/
 web/.vite/
+
+# 金鑰不進映像
+.env
+.env.*
+!.env.example

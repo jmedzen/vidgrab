@@ -7,8 +7,8 @@ services:
     image: vidgrab:latest
     container_name: vidgrab
     ports:
-      # 只對本機發佈。要讓別台機器的 agent 連，改成 "8310:8310" 並務必設 VIDGRAB_API_TOKEN
-      - "127.0.0.1:8310:8310"
+      # 預設只對本機發佈。要讓別台機器的 agent 連，.env 設 VIDGRAB_BIND=0.0.0.0 並務必設 VIDGRAB_API_TOKEN
+      - "${VIDGRAB_BIND:-127.0.0.1}:${VIDGRAB_PUBLISH_PORT:-8310}:8310"
     volumes:
       # 專案、下載的素材、B 站 cookie 都在這裡
       - vidgrab-data:/data
@@ -19,6 +19,10 @@ services:
       VIDGRAB_API_TOKEN: ${VIDGRAB_API_TOKEN:-}
       # 沒設 token 時容器內綁 0.0.0.0 需要這個；port 只對 127.0.0.1 發佈所以安全
       VIDGRAB_NO_AUTH: ${VIDGRAB_NO_AUTH:-1}
+      # 素材站金鑰（沒填的來源會自己略過；見 .env.example）
+      PIXABAY_API_KEY: ${PIXABAY_API_KEY:-}
+      JAMENDO_CLIENT_ID: ${JAMENDO_CLIENT_ID:-}
+      PEXELS_API_KEY: ${PEXELS_API_KEY:-}
     restart: unless-stopped
     # 下載大檔需要時間，健康檢查放寬一點
     stop_grace_period: 30s
