@@ -370,6 +370,18 @@ curl -H "$H" -X POST http://127.0.0.1:8310/api/batch -d '{
 - `/api/pick` 的 job 結果也帶 `new_clips[]`
 - **所有 HTTP 錯誤**都是 `{"ok": false, "error": {"code", "message", "retryable", "hint"}}`，code 跟 CLI 同一套
 
+### 單格畫面（封面、縮圖、分鏡）
+
+```bash
+curl -H "$H" -X POST http://127.0.0.1:8310/api/frame \
+  -d '{"id": "bilibili:BV1xx#60-75", "at": 65, "width": 720, "format": "jpg"}'
+```
+
+- `id` 是**片段 id**：從那個已下載的片段抽（本機 ffmpeg，很快）。`at` 是**原影片的秒數**，跟片段 id 裡的 `60-75` 同一條時間軸；不給就取片段正中間。
+- `id` 是 **asset id**：一定要給 `at`。已下載的片段涵蓋它就從片段抽，否則只下載那一秒再抽（要網路，成本低）。
+- 圖存在 `projects/<專案>/frames/`，回 `path` 與 `/file/...` 的 `url`；同一個（素材、秒數、寬度、格式）只做一次，之後吃快取。
+- 回傳帶 `license` 與 `credit_hint`，封面用了別人的畫面也要標。
+
 ### MCP server（Claude Code 等 MCP client 直接用）
 
 兩種接法，工具一樣：
@@ -389,6 +401,7 @@ claude mcp add --transport http vidgrab http://127.0.0.1:8310/mcp \
 | `list_assets` | 查素材庫：概況、單一專案、或用關鍵字在已下載的素材裡搜 |
 | `find_asset` | 用 asset id／片段 id 找回素材 |
 | `grab_clip` | 下載整支或切片（冪等、可設期限；`frames` 順便抓畫面），回新片段的 id、path、url、授權 |
+| `grab_frame` | 單格畫面，回圖檔 `url`／`path`（封面、縮圖、分鏡） |
 | `get_job` | 搜尋／下載超過等待時間（預設 90 秒）時，用 job id 回頭查 |
 
 工具**只回 JSON 與網址，不回影片內容**；片段用 `url`（`/file/...`，接在 vidgrab 位址後面）或同機器的 `path` 取用。
@@ -790,6 +803,7 @@ curl -s -X POST http://127.0.0.1:8310/api/config \
 | POST | `/api/pick` | 整支／切片／抓畫面（回 `job`） |
 | GET | `/api/vault` | 素材庫快照，`?project=` 單一專案、`?query=` 在已下載素材裡搜尋（同 CLI `vault`） |
 | GET | `/api/find/{id}` | 用 asset id 或片段 id 找回素材（`/api/clip/{id}` 同義，`#` 要編成 `%23`） |
+| POST | `/api/frame` | 單格畫面（封面／縮圖／分鏡）→ 圖檔網址；片段 id 從已下載的片段抽，asset id＋`at` 沒下載過就只抓那一秒 |
 | POST | `/api/batch` | 批次抓片（同 CLI `batch`）：冪等、部分成功、`timeout`、`wait:true` 同步等結果 |
 | GET | `/api/job/{id}` | 工作狀態與完整訊息 |
 | GET | `/api/stream/{id}` | SSE 即時進度（`log` / `done` / `error`） |

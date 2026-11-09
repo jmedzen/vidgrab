@@ -96,6 +96,20 @@ TOOLS: list[dict[str, Any]] = [
         }, ["project"]),
     },
     {
+        "name": "grab_frame",
+        "description": (
+            "單格畫面（封面、縮圖、分鏡），回圖檔 url／path。id 給片段 id（bilibili:BV1xx#60-75）就從已下載的片段抽，"
+            "很快；給 asset id 則一定要 at，沒下載過那一段會只抓那一秒去抽。at 是原影片的秒數。"
+        ),
+        "inputSchema": _obj({
+            "id": {"type": "string", "description": "片段 id 或 asset id"},
+            "at": {"type": "number", "description": "原影片的秒數；片段 id 可省略（取正中間）"},
+            "width": {"type": "integer", "description": "預設 640"},
+            "format": {"type": "string", "enum": ["jpg", "png"]},
+            "project": {"type": "string"},
+        }, ["id"]),
+    },
+    {
         "name": "get_job",
         "description": "查背景工作（search_footage／grab_clip 沒在時限內做完時回的 job id）。done 為 true 時 result 就是完成結果。",
         "inputSchema": _obj({"job_id": {"type": "string"}}, ["job_id"]),
@@ -169,6 +183,13 @@ def _tool_grab_clip(args: dict[str, Any]) -> Any:
     return out["result"] if out["done"] else out
 
 
+def _tool_grab_frame(args: dict[str, Any]) -> Any:
+    from . import agent
+
+    return agent.grab_frame(str(args.get("id") or ""), args.get("at"), width=args.get("width") or 640,
+                            fmt=args.get("format") or "jpg", project=str(args.get("project") or ""))
+
+
 def _tool_get_job(args: dict[str, Any]) -> Any:
     from .models import NotFound
     from .web import JOBS
@@ -184,6 +205,7 @@ HANDLERS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "list_assets": _tool_list_assets,
     "find_asset": _tool_find_asset,
     "grab_clip": _tool_grab_clip,
+    "grab_frame": _tool_grab_frame,
     "get_job": _tool_get_job,
 }
 
