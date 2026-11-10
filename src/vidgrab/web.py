@@ -1999,7 +1999,11 @@ class Handler(BaseHTTPRequestHandler):
             if not key:
                 self._json({"error": "缺少 key"}, 400)
                 return
-            res = auth.poll(key)
+            try:
+                res = auth.poll(key)
+            except Exception as exc:  # noqa: BLE001
+                # 例如手機確認了但沒拿到 SESSDATA：回可讀的狀態讓前端停下來顯示，不要 500
+                res = {"status": "error", "message": f"登入沒成功：{exc}", "code": None}
             self._json(res)
             return
 

@@ -1885,6 +1885,129 @@ def _post_as(base: str, path: str, *, host: str, origin: str | None = None,
     return out
 
 
+def test_login_start_payload_matches_frontend(web, monkeypatch):
+    """B 站 QR 登入：前端從 /api/login/start 讀的欄位，必須是後端真的有回的欄位。
+
+    以前前端讀 `qr`、後端回 `image`，QR 圖就永遠是空的（對話框只剩「等待掃碼…」），
+    而 HTTP 全是 200、TypeScript 型別也過得了關，單看哪一邊都不會失敗。
+    這裡把兩邊對起來：後端回的欄位 ⊇ 前端打包檔裡 loginStart() 解構出的欄位，
+    而且 image 指到的網址真的是 PNG。
+    """
+    import glob
+    import re
+    from pathlib import Path
+
+    from vidgrab import auth
+
+    monkeypatch.setattr(auth, "logged_in", lambda: False)
+    monkeypatch.setattr(auth, "generate", lambda: {"key": "k", "png": b"\x89PNG\r\n\x1a\n"})
+
+    req = urllib.request.Request(web + "/api/login/start", data=b"{}", method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        payload = json.loads(resp.read().decode())
+    assert {"key", "image"} <= set(payload), payload
+
+    with urllib.request.urlopen(web + payload["image"], timeout=5) as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "image/png"
+        assert resp.read().startswith(b"\x89PNG")
+
+    root = Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "static" / "assets"
+    bundles = sorted(glob.glob(str(root / "*.js")))
+    assert bundles, "找不到打包後的 JS（要先跑 cd web && npm run build）"
+    js = Path(bundles[0]).read_text(encoding="utf-8")
+    m = re.search(r"const\{([^}]*)\}=await [\w$.]+\.loginStart\(\)", js)
+    assert m, "前端打包檔裡找不到 loginStart() 的解構，這個檢查需要跟著改"
+    wanted = {part.split(":")[0].strip() for part in m.group(1).split(",") if part.strip()}
+    # already 是「已登入」時才有的欄位，登入中的回應不會帶
+    unknown = wanted - set(payload) - {"already"}
+    assert not unknown, f"前端讀了後端沒回的欄位：{sorted(unknown)}（後端回 {sorted(payload)}）"
+
+
+class _FakeBiliResp:
+    """假的 passport.bilibili.com 回應：json() 與 Set-Cookie。"""
+
+    def __init__(self, code, cookies=None):
+        from types import SimpleNamespace
+
+        self._code = code
+        self.cookies = [SimpleNamespace(name=k, value=v) for k, v in (cookies or {}).items()]
+        self.raw = SimpleNamespace(headers=SimpleNamespace(getlist=lambda _name: []))
+
+    def json(self):
+        return {"code": 0, "data": {"code": self._code}}
+
+
+def _poll(web, key="k"):
+    req = urllib.request.Request(web + "/api/login/poll", data=json.dumps({"key": key}).encode(),
+                                 method="POST", headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+        return json.loads(resp.read().decode())
+
+
+@pytest.mark.parametrize("code,status", [(86101, "waiting"), (86090, "scanned"), (86038, "expired")])
+def test_login_poll_states(web, monkeypatch, code, status):
+    """掃碼輪詢的每個中間狀態都回 200 + status，前端靠 status 決定顯示什麼、何時停。"""
+    from vidgrab import auth
+
+    seen = {}
+
+    def fake_get(url, params=None, **_kw):
+        seen["key"] = (params or {}).get("qrcode_key")
+        return _FakeBiliResp(code)
+
+    monkeypatch.setattr(auth.requests, "get", fake_get)
+    res = _poll(web, key="abc")
+    assert res["status"] == status
+    assert res["message"]
+    assert seen["key"] == "abc"
+
+
+def test_login_poll_ok_saves_cookie(web, monkeypatch):
+    """手機按確認後：status=ok、cookie 寫進 auth 目錄、回帶 who。"""
+    from vidgrab import auth
+
+    monkeypatch.setattr(auth.requests, "get",
+                        lambda *a, **k: _FakeBiliResp(0, {"SESSDATA": "s", "bili_jct": "j", "DedeUserID": "1"}))
+    monkeypatch.setattr(auth, "whoami", lambda: {"logged_in": True, "name": "測試", "mid": 1, "vip": False})
+    res = _poll(web)
+    assert res["status"] == "ok"
+    assert res["who"]["logged_in"] is True
+    assert "SESSDATA" in auth.cookie_file().read_text(encoding="utf-8")
+
+
+def test_login_poll_failure_is_readable_not_500(web, monkeypatch):
+    """確認了卻沒拿到 SESSDATA：要回 status=error 讓前端停下來顯示原因，不是 500。"""
+    from vidgrab import auth
+
+    monkeypatch.setattr(auth.requests, "get", lambda *a, **k: _FakeBiliResp(0, {}))
+    res = _poll(web)
+    assert res["status"] == "error"
+    assert "SESSDATA" in res["message"]
+
+
+def test_login_poll_frontend_matches_backend():
+    """前端輪詢要用後端真的接受的方式：POST /api/login/poll、body 帶 key、看 status==="ok"。
+
+    以前前端用 GET ?key=…（後端只有 POST 路由，回 404），第一次輪詢就丟例外、
+    計時器被默默清掉，掃碼確認後畫面永遠沒反應；而且它看的是不存在的 ok 欄位。
+    """
+    import glob
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "vidgrab" / "static" / "assets"
+    bundles = sorted(glob.glob(str(root / "*.js")))
+    assert bundles, "找不到打包後的 JS（要先跑 cd web && npm run build）"
+    js = Path(bundles[0]).read_text(encoding="utf-8")
+    m = re.search(r'loginPoll:([\w$]+)=>[\w$]+\("/api/login/poll",\{method:"POST",body:JSON\.stringify\(\{key:\1\}\)\}\)', js)
+    assert m, "前端 loginPoll 不是 POST /api/login/poll + body {key}"
+    m = re.search(r'=await [\w$.]+\.loginPoll\([\w$]+\);.{0,40}?([\w$]+)\.status==="ok"', js)
+    assert m, "前端沒有用 status===\"ok\" 判斷登入成功"
+
+
 def test_lan_origin_post_allowed_when_token_set(web, monkeypatch):
     """區網模式（有 token）：從 http://192.168.2.66:8310 開的頁面，Origin 就是那個位址。
 
