@@ -99,6 +99,11 @@ export default function App() {
   const [loginOpen, setLoginOpen] = useState(false)
   const [loginQr, setLoginQr] = useState('')
   const [loginStat, setLoginStat] = useState('等待掃碼…')
+  const loginTimer = useRef<number | null>(null)
+  const stopLoginPoll = useCallback(() => {
+    if (loginTimer.current !== null) window.clearInterval(loginTimer.current)
+    loginTimer.current = null
+  }, [])
 
   const openedOnBoot = useRef(false)
   const lbVideoRef = useRef<HTMLVideoElement>(null)
@@ -253,11 +258,11 @@ export default function App() {
       if (e.key !== 'Escape') return
       if (lightbox) { setLightbox(null); return }
       if (playing) { setPlaying(null); return }
-      if (loginOpen) { setLoginOpen(false); return }
+      if (loginOpen) { stopLoginPoll(); setLoginOpen(false); return }
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [lightbox, playing, loginOpen])
+  }, [lightbox, playing, loginOpen, stopLoginPoll])
 
   // 放大預覽自動播放：先試「有聲音」，被瀏覽器擋下才退成靜音。
   // 不寫死在 <video muted> 上，因為使用者預設要聽得到聲音。
@@ -660,28 +665,50 @@ export default function App() {
 
   const doLogin = useCallback(async () => {
     try {
-      const { key, qr } = await api.loginStart()
-      setLoginQr(qr)
+      const { key, image, already } = await api.loginStart()
+      if (already) {
+        // 後端認為已經登入，不會再產生 QR
+        toast('B 站已登入')
+        await refreshAuth()
+        return
+      }
+      if (!key || !image) throw new Error('沒有拿到登入 QR')
+      // 同一個網址每次都換新圖，加時間戳避免 <img> 沿用上一張
+      setLoginQr(`${image}?t=${Date.now()}`)
       setLoginStat('等待掃碼…')
       setLoginOpen(true)
+      stopLoginPoll()
+      let misses = 0
       const timer = window.setInterval(async () => {
         try {
           const st = await api.loginPoll(key)
-          if (st.ok === true) {
+          misses = 0
+          if (st.status === 'ok') {
             window.clearInterval(timer)
             setLoginOpen(false)
             setLoginStat('登入成功')
             toast('登入成功')
             await refreshAuth()
-          } else if (st.status) {
-            setLoginStat(String(st.status))
+          } else if (st.status === 'expired' || st.status === 'error') {
+            window.clearInterval(timer)
+            setLoginStat(st.message || 'QR 過期了，重新產生一次')
+          } else {
+            setLoginStat(st.message || String(st.status || '等待掃碼…'))
           }
-        } catch { window.clearInterval(timer) }
+        } catch (e) {
+          // 偶發網路錯誤不要直接放棄；連續失敗才停，並把原因顯示出來
+          misses += 1
+          if (misses >= 3) {
+            window.clearInterval(timer)
+            setLoginStat(`查詢掃碼結果失敗：${e instanceof Error ? e.message : String(e)}`)
+          }
+        }
       }, 2000)
+      loginTimer.current = timer
     } catch (e) {
       toast(e instanceof Error ? e.message : '登入啟動失敗', 3000)
     }
-  }, [refreshAuth, toast])
+  }, [refreshAuth, toast, stopLoginPoll])
 
   const doOpenAdmin = useCallback(async () => {
     try {
@@ -828,7 +855,7 @@ export default function App() {
       />
       <Toast message={toastMsg} />
       <LoginModal open={loginOpen} qr={loginQr} status={loginStat}
-                  onClose={() => setLoginOpen(false)} />
+                  onClose={() => { stopLoginPoll(); setLoginOpen(false) }} />
       <LibraryPanel
         open={libOpen}
         projects={library}

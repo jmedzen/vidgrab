@@ -106,9 +106,18 @@ export const api = {
   }>('/api/library/scan'),
 
   loginStatus: () => request<Record<string, unknown>>('/api/login/status'),
-  loginStart: () => request<{ key: string; qr: string }>('/api/login/start', { method: 'POST' }),
+  // 後端回 {key, image, expires_in}；已登入時回 {already}，沒有 key／image
+  loginStart: () => request<{
+    key?: string
+    image?: string
+    expires_in?: number
+    already?: Record<string, unknown>
+  }>('/api/login/start', { method: 'POST' }),
+  // 後端是 POST /api/login/poll，body {key}；回 {status, message, code[, who]}
+  // status：waiting／scanned／ok／expired／unknown／error
   loginPoll: (key: string) =>
-    request<Record<string, unknown>>(`/api/login/poll?key=${encodeURIComponent(key)}`),
+    request<{ status?: string; message?: string; code?: number; who?: Record<string, unknown> }>(
+      '/api/login/poll', { method: 'POST', body: JSON.stringify({ key }) }),
 }
 
 /**
