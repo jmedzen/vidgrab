@@ -1862,6 +1862,201 @@ def test_cross_origin_post_is_rejected(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def _post_as(base: str, path: str, *, host: str, origin: str | None = None,
+             headers: dict | None = None, payload: dict | None = None):
+    """像瀏覽器一樣送 POST：Host 與 Origin 都自己指定（模擬從 LAN IP 開的頁面）。"""
+    import http.client
+
+    ip, port = base.replace("http://", "").split(":")
+    c = http.client.HTTPConnection(ip, int(port), timeout=5)
+    body = json.dumps(payload or {}).encode()
+    c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+    c.putheader("Host", host)
+    c.putheader("Content-Type", "application/json")
+    c.putheader("Content-Length", str(len(body)))
+    if origin:
+        c.putheader("Origin", origin)
+    for k, v in (headers or {}).items():
+        c.putheader(k, v)
+    c.endheaders(body)
+    r = c.getresponse()
+    out = (r.status, r.read().decode("utf-8", "replace"))
+    c.close()
+    return out
+
+
+def test_lan_origin_post_allowed_when_token_set(web, monkeypatch):
+    """區網模式（有 token）：從 http://192.168.2.66:8310 開的頁面，Origin 就是那個位址。
+
+    以前 _origin_ok 只認 loopback，LAN 來源的所有 POST（含 B 站 QR 登入）都回
+    「跨站請求已被拒絕」。現在 Origin 跟 Host 同源就放行；真正的跨站來源照擋。
+    """
+    from vidgrab import auth
+
+    monkeypatch.setenv("VIDGRAB_API_TOKEN", "s3cret")
+    monkeypatch.setattr(auth, "logged_in", lambda: False)
+    monkeypatch.setattr(auth, "generate", lambda: {"key": "k", "png": b"\x89PNG"})
+    lan = "192.168.2.66:8310"
+    ok = {"Authorization": "Bearer s3cret"}
+
+    # 使用者回報的情境：同源 + 已登入 → QR 能產生
+    code, body = _post_as(web, "/api/login/start", host=lan, origin=f"http://{lan}", headers=ok)
+    assert code == 200, body
+    assert json.loads(body)["key"] == "k"
+
+    # Referer（沒有 Origin 的情況）同樣算
+    code, _ = _post_as(web, "/api/login/start", host=lan, headers={**ok, "Referer": f"http://{lan}/"})
+    assert code == 200
+
+    # 跨站：Origin 是別的網站 → 擋
+    code, body = _post_as(web, "/api/login/start", host=lan, origin="http://evil.example", headers=ok)
+    assert code == 403 and "跨站請求已被拒絕" in body
+
+    # 同一台機器、不同 port（例如 vidpipe 8320）不是同源 → 擋
+    code, _ = _post_as(web, "/api/login/start", host=lan, origin="http://192.168.2.66:8320", headers=ok)
+    assert code == 403
+
+    # 同主機、不同 scheme 的預設 port 也不算
+    code, _ = _post_as(web, "/api/login/start", host=lan, origin="https://192.168.2.66", headers=ok)
+    assert code == 403
+
+    # Origin 是 "null"（沙盒 iframe 等）→ 擋
+    code, _ = _post_as(web, "/api/login/start", host=lan, origin="null", headers=ok)
+    assert code == 403
+
+    # 同源但沒帶 token → 照樣 401，同源不等於已登入
+    code, _ = _post_as(web, "/api/login/start", host=lan, origin=f"http://{lan}")
+    assert code == 401
+
+    # 本機來源與沒有 Origin 的呼叫端行為不變
+    code, _ = _post_as(web, "/api/login/start", host=lan, origin="http://127.0.0.1:8310", headers=ok)
+    assert code == 200
+    code, _ = _post_as(web, "/api/login/start", host=lan, headers=ok)
+    assert code == 200
+
+
+def test_no_token_same_origin_only_for_ip_or_allowed_hosts(web, monkeypatch):
+    """沒設 token（Docker 發佈到區網、--no-auth）時，同源不能無條件信。
+
+    DNS rebinding 會讓 evil.example 解析到內網位址，Origin 與 Host 剛好都是 evil.example，
+    單看同源擋不住。所以只信 Host 是 IP 字面值（攻擊者換不出 IP 形式的 Host）
+    或列在 VIDGRAB_ALLOWED_HOSTS 的主機名。192.168.2.7:8310 的 Docker 就是這個情境：
+    沒設 token，使用者用 IP 開頁面，QR 登入的 POST 必須能過。
+    """
+    from vidgrab import auth
+
+    monkeypatch.delenv("VIDGRAB_API_TOKEN", raising=False)
+    monkeypatch.delenv("VIDGRAB_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setattr(auth, "logged_in", lambda: False)
+    monkeypatch.setattr(auth, "generate", lambda: {"key": "k", "png": b"\x89PNG"})
+    start = "/api/login/start"
+
+    # 域名型 rebinding：Host 與 Origin 一致但是網域名稱 → 擋
+    code, body = _post_as(web, start, host="evil.example:8310", origin="http://evil.example:8310")
+    assert code == 403 and "跨站請求已被拒絕" in body
+    code, _ = _post_as(web, start, host="evil.example:8310",
+                       headers={"Referer": "http://evil.example:8310/page"})
+    assert code == 403
+
+    # 使用者的情境：IP 開頁面、同源 → 放行（Origin 或 Referer）
+    code, body = _post_as(web, start, host="192.168.2.7:8310", origin="http://192.168.2.7:8310")
+    assert code == 200, body
+    code, _ = _post_as(web, start, host="192.168.2.7:8310",
+                       headers={"Referer": "http://192.168.2.7:8310/"})
+    assert code == 200
+    code, _ = _post_as(web, start, host="[fd00::7]:8310", origin="http://[fd00::7]:8310")  # IPv6
+    assert code == 200
+
+    # IP 型 Host 也不能放行跨站／跨 port／別台機器的來源
+    code, _ = _post_as(web, start, host="192.168.2.7:8310", origin="http://evil.example")
+    assert code == 403
+    code, _ = _post_as(web, start, host="192.168.2.7:8310", origin="http://192.168.2.7:8320")
+    assert code == 403
+    code, _ = _post_as(web, start, host="192.168.2.7:8310", origin="http://192.168.2.99:8310")
+    assert code == 403
+    code, _ = _post_as(web, start, host="192.168.2.7:8310", origin="null")
+    assert code == 403
+
+    # 想用網域名稱（http://mac.local:8310）要明確列入 VIDGRAB_ALLOWED_HOSTS
+    code, _ = _post_as(web, start, host="mac.local:8310", origin="http://mac.local:8310")
+    assert code == 403
+    monkeypatch.setenv("VIDGRAB_ALLOWED_HOSTS", " Mac.local , nas.lan ")
+    code, _ = _post_as(web, start, host="mac.local:8310", origin="http://mac.local:8310")
+    assert code == 200
+    code, _ = _post_as(web, start, host="evil.example:8310", origin="http://evil.example:8310")
+    assert code == 403  # 白名單只放行列出的名稱
+    code, _ = _post_as(web, start, host="mac.local:8310", origin="http://nas.lan:8310")
+    assert code == 403  # 白名單不等於互信
+
+
+def test_token_set_trusts_hostname_same_origin(web, monkeypatch):
+    """有 token 時 cookie／Bearer 把關，rebinding 的頁面過不了認證，所以主機名的同源也放行。"""
+    from vidgrab import auth
+
+    monkeypatch.setenv("VIDGRAB_API_TOKEN", "s3cret")
+    monkeypatch.delenv("VIDGRAB_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setattr(auth, "logged_in", lambda: False)
+    monkeypatch.setattr(auth, "generate", lambda: {"key": "k", "png": b"\x89PNG"})
+    ok = {"Authorization": "Bearer s3cret"}
+
+    code, _ = _post_as(web, "/api/login/start", host="nas.lan:8310",
+                       origin="http://nas.lan:8310", headers=ok)
+    assert code == 200
+    # rebinding 頁面沒有 token：先被 401 擋下，同源也救不了
+    code, _ = _post_as(web, "/api/login/start", host="evil.example:8310",
+                       origin="http://evil.example:8310")
+    assert code == 401
+    # 有 token 也不放行跨站
+    code, _ = _post_as(web, "/api/login/start", host="nas.lan:8310",
+                       origin="http://evil.example", headers=ok)
+    assert code == 403
+
+
+def test_host_trusted_helper(monkeypatch):
+    from vidgrab.web import _host_trusted
+
+    monkeypatch.delenv("VIDGRAB_ALLOWED_HOSTS", raising=False)
+    assert _host_trusted("192.168.2.7:8310")
+    assert _host_trusted("192.168.2.7")
+    assert _host_trusted("[fd00::7]:8310")
+    assert _host_trusted("[::1]:8310")
+    assert _host_trusted("localhost:8310")
+    assert _host_trusted("127.0.0.1")
+    assert not _host_trusted("evil.example:8310")
+    assert not _host_trusted("mac.local")
+    assert not _host_trusted("192.168.2.7.evil.example:8310")  # 長得像 IP 的網域
+    assert not _host_trusted("999.1.1.1:8310")
+    assert not _host_trusted("")
+    assert not _host_trusted("192.168.2.7:abc")  # port 不合法
+
+    monkeypatch.setenv("VIDGRAB_ALLOWED_HOSTS", "Mac.LOCAL, ,nas.lan")
+    assert _host_trusted("mac.local:8310")
+    assert _host_trusted("NAS.lan")
+    assert not _host_trusted("evil.example")
+    assert not _host_trusted("")  # 清單裡的空字串不能讓空 Host 過關
+
+
+def test_same_origin_helper():
+    from vidgrab.web import _same_origin
+
+    assert _same_origin("http://192.168.2.66:8310", "192.168.2.66:8310")
+    assert _same_origin("http://192.168.2.66:8310/some/page?x=1", "192.168.2.66:8310")  # Referer
+    assert _same_origin("http://Mac.local:8310", "mac.LOCAL:8310")  # 主機名不分大小寫
+    assert _same_origin("http://[fe80::1]:8310", "[fe80::1]:8310")  # IPv6
+    assert _same_origin("http://example.com", "example.com:80")
+    assert _same_origin("https://example.com", "example.com")  # 反向代理：Host 沒寫 port
+    assert _same_origin("https://example.com:443", "example.com")
+
+    assert not _same_origin("http://192.168.2.66:8320", "192.168.2.66:8310")  # port 不同
+    assert not _same_origin("http://192.168.2.67:8310", "192.168.2.66:8310")  # 主機不同
+    assert not _same_origin("https://example.com", "example.com:80")  # scheme/port 不一致
+    assert not _same_origin("http://192.168.2.66:8310", "")  # 沒有 Host
+    assert not _same_origin("null", "192.168.2.66:8310")
+    assert not _same_origin("ftp://192.168.2.66:8310", "192.168.2.66:8310")
+    assert not _same_origin("http://192.168.2.66:99999", "192.168.2.66:99999")  # port 不合法
+    assert not _same_origin("http://192.168.2.66:8310", "192.168.2.66:abc")
+
+
 def test_web_refuses_to_bind_publicly_without_optin(tmp_path, monkeypatch):
     """綁到非本機位址要明確同意：這個介面沒有登入機制。"""
     import os

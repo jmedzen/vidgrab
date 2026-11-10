@@ -127,6 +127,58 @@ TOKEN_COOKIE = "vidgrab_token"
 PUBLIC_ROUTES = ("/", "/index.html", "/api/version", "/api/openapi.json", "/docs", "/docs/")
 
 
+ALLOWED_HOSTS_ENV = "VIDGRAB_ALLOWED_HOSTS"
+
+
+def _host_trusted(host_header: str) -> bool:
+    """Host 標頭是不是「不可能被 DNS rebinding 偽造」的名稱：loopback、IP 字面值，
+    或 VIDGRAB_ALLOWED_HOSTS（逗號分隔的主機名）列出的。
+
+    rebinding 靠的是攻擊者網域（evil.example）解析到內網位址，瀏覽器送出的 Host 是網域名稱；
+    用 IP 位址（http://192.168.2.7:8310）開頁面的人，Host 就是 IP，攻擊者換不出來。
+    """
+    import ipaddress
+    import os
+
+    try:
+        parts = urllib.parse.urlsplit("//" + host_header.strip())
+        name = parts.hostname or ""
+        parts.port  # noqa: B018  壞掉的 port 到這裡才會丟 ValueError，Host 寫壞了就不信
+    except ValueError:
+        return False
+    if not name:
+        return False
+    if name == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    extra = {x.strip().lower() for x in (os.environ.get(ALLOWED_HOSTS_ENV) or "").split(",")}
+    return name in extra
+
+
+def _same_origin(origin: str, host_header: str) -> bool:
+    """Origin／Referer 的主機＋port 是否跟請求的 Host 標頭一樣。
+
+    port 要比：SameSite cookie 不分 port，同機器上別的服務（例如 vidpipe 的 8320）
+    送來的 Origin 主機相同、port 不同，不能算同源。Host 沒寫 port 就是該 scheme 的預設 port。
+    """
+    if not host_header.strip():
+        return False
+    try:
+        o = urllib.parse.urlsplit(origin.strip())
+        h = urllib.parse.urlsplit("//" + host_header.strip())
+        o_host, o_port, h_host, h_port = o.hostname, o.port, h.hostname, h.port
+    except ValueError:
+        return False
+    if o.scheme not in ("http", "https") or not o_host or not h_host:
+        return False
+    default = 443 if o.scheme == "https" else 80
+    return o_host == h_host and (o_port or default) == (h_port or default)
+
+
 def api_token() -> str:
     """設定的 API token；空字串＝不啟用認證（只適合綁本機時）。只讀環境變數，
     不放 config.json，因為 /api/config 會把設定回給呼叫端。"""
@@ -1706,10 +1758,20 @@ class Handler(BaseHTTPRequestHandler):
     def _origin_ok(self) -> bool:
         """擋掉跨站請求（CSRF）。
 
-        這個服務沒有登入機制，所以「瀏覽器幫你送出的請求」跟「你自己按的」
-        分不出來。做法是只認本機來源：
         - 沒有 Origin／Referer（curl、本機程式）→ 放行
-        - 有，就必須是 127.0.0.1 / localhost / ::1 的位址
+        - 來源是 127.0.0.1 / localhost / ::1 → 放行
+        - 來源跟 Host 標頭同源（主機＋port 都一樣）→ 放行，但 Host 必須可信：
+          有設 token，或 Host 是 IP 字面值／loopback／VIDGRAB_ALLOWED_HOSTS 列的名稱。
+          從 http://192.168.2.7:8310 開的頁面，送出的 Origin 就是這個位址而不是
+          loopback；不放行的話，整個網頁介面的 POST（含 B 站 QR 登入）都會被擋。
+        - 其餘一律拒絕。
+
+        為什麼同源要加條件：攻擊者可以用 DNS rebinding 讓 evil.example 解析到內網位址，
+        這時 Origin 跟 Host 剛好都是 evil.example，單看同源擋不住。
+        - 有 token：cookie 綁在使用者實際開的主機名上，rebinding 的頁面帶不到 cookie，
+          過不了 _authorized，所以任何主機名的同源都安全。
+        - 沒 token（例如 Docker 發佈到區網、--no-auth）：只信 IP 字面值／白名單主機名，
+          rebinding 用的網域名稱一律拒絕。
         """
         for header in ("Origin", "Referer"):
             value = self.headers.get(header)
@@ -1721,7 +1783,10 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             if host in ("127.0.0.1", "localhost", "::1", "[::1]"):
                 return True
-            return False
+            host_header = self.headers.get("Host") or ""
+            if not _same_origin(value, host_header):
+                return False
+            return bool(api_token()) or _host_trusted(host_header)
         return True
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1731,7 +1796,11 @@ class Handler(BaseHTTPRequestHandler):
             self._deny()
             return
         if not self._origin_ok():
-            self._json({"error": "跨站請求已被拒絕"}, 403)
+            self._json({
+                "error": "跨站請求已被拒絕",
+                "hint": "請求來源（Origin／Referer）不是本機，也跟 Host 不同源（或 Host 是網域名稱"
+                        f"而沒設 token）。區網使用請用 IP 位址開網頁，或設 VIDGRAB_API_TOKEN／{ALLOWED_HOSTS_ENV}。",
+            }, 403)
             return
 
         if route == "/mcp":

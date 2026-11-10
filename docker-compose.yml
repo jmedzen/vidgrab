@@ -19,6 +19,8 @@ services:
       VIDGRAB_API_TOKEN: ${VIDGRAB_API_TOKEN:-}
       # 沒設 token 時容器內綁 0.0.0.0 需要這個；port 只對 127.0.0.1 發佈所以安全
       VIDGRAB_NO_AUTH: ${VIDGRAB_NO_AUTH:-1}
+      # 沒設 token、又想用網域名稱（不是 IP）開網頁時，把主機名列在這裡（逗號分隔），否則 POST 會被當成 DNS rebinding 擋掉
+      VIDGRAB_ALLOWED_HOSTS: ${VIDGRAB_ALLOWED_HOSTS:-}
       # 素材站金鑰（沒填的來源會自己略過；見 .env.example）
       PIXABAY_API_KEY: ${PIXABAY_API_KEY:-}
       JAMENDO_CLIENT_ID: ${JAMENDO_CLIENT_ID:-}

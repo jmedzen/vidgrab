@@ -219,6 +219,11 @@ export VIDGRAB_API_TOKEN=$(openssl rand -hex 24)
 **綁非本機位址又沒設 token → 拒絕啟動**（`--allow-lan` 也一樣）。外層已經有保護、確定要裸奔時才加 `--no-auth`（或 `VIDGRAB_NO_AUTH=1`）。
 `docker-compose.yml` 預設只對 `127.0.0.1` 發佈 port；要對外請同時設 token。
 
+**瀏覽器的 POST（改設定、B 站 QR 登入…）會檢查 `Origin`／`Referer`**，擋 CSRF：本機來源、或跟請求的 `Host` 同源（主機＋port 都一樣）才放行；
+沒帶這兩個標頭的 curl／agent 不受影響。從區網位址（`http://192.168.2.7:8310`）開網頁沒問題。
+同源只在「Host 是 IP 位址」、「有設 token」或「主機名列在 `VIDGRAB_ALLOWED_HOSTS`（逗號分隔）」時才信，
+用來擋 DNS rebinding（攻擊者網域解析到你的內網位址）。想用 `http://mac.local:8310` 這類網域名稱開、又沒設 token，把它加進 `VIDGRAB_ALLOWED_HOSTS`。
+
 ### 這件事沒有登入機制，所以不預設對外開放
 
 `vidgrab web` 預設綁 `127.0.0.1`。**這個介面本身沒有任何認證**，
@@ -734,7 +739,7 @@ CLI 和 API 共用。重開容器也還在。
 環境變數的優先序比設定檔高：`VIDGRAB_HOST`、`VIDGRAB_PORT`、`VIDGRAB_BUILD`、
 `VIDGRAB_HOME`、`VIDGRAB_AUTH_DIR`、`VIDGRAB_CONFIG`、`VIDGRAB_YTDLP`
 （最後一個是指定 yt-dlp 執行檔路徑，路徑不存在就退回內建的）。
-認證與素材站金鑰也走環境變數：`VIDGRAB_API_TOKEN`、`VIDGRAB_NO_AUTH`，以及
+認證與素材站金鑰也走環境變數：`VIDGRAB_API_TOKEN`、`VIDGRAB_NO_AUTH`、`VIDGRAB_ALLOWED_HOSTS`，以及
 `PIXABAY_API_KEY`／`PEXELS_API_KEY`／`JAMENDO_CLIENT_ID`（也認 `VIDGRAB_PIXABAY_KEY`、`VIDGRAB_PEXELS_KEY`、`VIDGRAB_JAMENDO_KEY`，
 或 `auth/` 底下的 `pixabay.key`、`pexels.key`、`jamendo.key`）。
 
